@@ -1,3 +1,4 @@
+import ImageIO
 import Foundation
 import CoreImage
 import CoreGraphics
@@ -9,12 +10,14 @@ public enum ImageNormalizer {
     /// Decode ảnh upright theo EXIF orientation (ImageIO transform).
     public static func uprightImage(data: Data) -> CGImage? {
         guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
+        let w = props?[kCGImagePropertyPixelWidth] as? Int ?? 0
+        let h = props?[kCGImagePropertyPixelHeight] as? Int ?? 0
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceShouldCacheImmediately: true,
-            kCGImageSourceThumbnailMaxPixelSize: max(CGImageSourceGetPropertiesAtIndex(src, 0, nil)?[kCGImagePropertyPixelWidth] as? Int ?? 0,
-                                                     CGImageSourceGetPropertiesAtIndex(src, 0, nil)?[kCGImagePropertyPixelHeight] as? Int ?? 0)
+            kCGImageSourceThumbnailMaxPixelSize: max(w, h)
         ]
         return CGImageSourceCreateThumbnailAtIndex(src, 0, options as CFDictionary)
     }

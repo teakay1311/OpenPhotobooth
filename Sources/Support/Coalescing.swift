@@ -60,6 +60,7 @@ public final class LatestValueRunner: @unchecked Sendable {
         switch d {
         case .seconds(let s): return UInt64(max(s, 0)) * 1_000_000_000
         case .milliseconds(let ms): return UInt64(max(ms, 0)) * 1_000_000
+        case .never: return 0
         case .microseconds(let us): return UInt64(max(us, 0)) * 1_000
         case .nanoseconds(let ns): return UInt64(max(ns, 0))
         @unknown default: return 0
@@ -76,7 +77,7 @@ public final class Debouncer: @unchecked Sendable {
     private let queue: DispatchQueue
     private let delay: DispatchTimeInterval
 
-    public init(delay: DispatchTimeInterval = .milliseconds(400), queue: DispatchQueue = DispatchQueue(label: "vn.openphotobooth.debounce", qos: .utility")) {
+    public init(delay: DispatchTimeInterval = .milliseconds(400), queue: DispatchQueue = DispatchQueue(label: "vn.openphotobooth.debounce", qos: .utility)) {
         self.delay = delay
         self.queue = queue
     }

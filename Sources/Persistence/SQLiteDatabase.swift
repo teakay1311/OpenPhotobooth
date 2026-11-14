@@ -26,6 +26,7 @@ public typealias SQLiteRow = [String: SQLiteValue]
 extension Optional where Wrapped == SQLiteValue {
     public var stringValue: String { self?.stringValue ?? "" }
     public var intValue: Int? { self?.intValue }
+    public var int64Value: Int64? { self?.int64Value }
     public var doubleValue: Double? { self?.doubleValue }
     public var boolValue: Bool { self?.boolValue ?? false }
 }
@@ -74,7 +75,7 @@ public final class SQLiteDatabase: @unchecked Sendable {
 
     public func integrityCheck() -> String? {
         queue.sync {
-            guard let rows = try? self._query("PRAGMA integrity_check") else { return nil }
+            guard let rows = try? self._query("PRAGMA integrity_check", []) else { return nil }
             if let first = rows.first, case .text(let v) = first["integrity_check"] ?? .text("") {
                 return v == "ok" ? nil : v
             }
@@ -84,7 +85,7 @@ public final class SQLiteDatabase: @unchecked Sendable {
 
     public func foreignKeyCheck() -> [String] {
         queue.sync {
-            let rows = (try? self._query("PRAGMA foreign_key_check")) ?? []
+            let rows = (try? self._query("PRAGMA foreign_key_check", [])) ?? []
             return rows.map { row in
                 (row["table"].flatMap { if case .text(let t) = $0 { return t } else { return nil } } ?? "?") + ":violation"
             }

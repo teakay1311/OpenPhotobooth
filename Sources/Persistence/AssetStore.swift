@@ -184,6 +184,13 @@ extension SQLiteValue {
         if case .text(let t) = self { return t }
         return ""
     }
+    var int64Value: Int64? {
+        switch self {
+        case .int(let v): return v
+        case .real(let v): return Int64(v)
+        default: return nil
+        }
+    }
     var intValue: Int? {
         switch self {
         case .int(let v): return Int(v)

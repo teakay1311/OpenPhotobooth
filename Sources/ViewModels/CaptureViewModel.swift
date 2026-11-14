@@ -320,7 +320,7 @@ public final class CaptureViewModel: ObservableObject {
         env.engine.adoptSession(record: detail.session, snapshot: detail.snapshot, committed: committed)
         selectedFrameID = detail.snapshot.sourceFrameID
         regeneratePreview()
-        _ = try? env.camera.startPreview()
+        _ = try? await env.camera.startPreview()
     }
 
     public func viewBannerSession() {
@@ -348,8 +348,8 @@ public final class SampleImageFactory: @unchecked Sendable {
         guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
                                   space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
         let hue = (0.55 + 0.11 * Double(index)).truncatingRemainder(dividingBy: 1)
-        let colors = [CGColor(hue: hue, saturation: 0.45, brightness: 0.92, alpha: 1),
-                      CGColor(hue: (hue + 0.08).truncatingRemainder(dividingBy: 1), saturation: 0.35, brightness: 0.75, alpha: 1)] as CFArray
+        let colors = [NSColor(hue: CGFloat(hue), saturation: 0.45, brightness: 0.92, alpha: 1).cgColor,
+                      NSColor(hue: CGFloat((hue + 0.08).truncatingRemainder(dividingBy: 1)), saturation: 0.35, brightness: 0.75, alpha: 1).cgColor] as CFArray
         if let grad = CGGradient(colorsSpace: colorSpace, colors: colors, locations: [0, 1]) {
             ctx.drawLinearGradient(grad, start: .zero, end: CGPoint(x: w, y: h), options: [])
         }
@@ -359,7 +359,7 @@ public final class SampleImageFactory: @unchecked Sendable {
         let text = "Ảnh mẫu \(index)"
         let font = CTFontCreateWithName("Helvetica" as CFString, CGFloat(w) / 12, nil)
         let attrs: [CFString: Any] = [kCTFontAttributeName: font,
-                                      kCTForegroundColorAttributeName: CGColor(white: 1, alpha: 0.95)]
+                                      kCTForegroundColorAttributeName: NSColor(white: 1, alpha: 0.95).cgColor]
         if let attrStr = CFAttributedStringCreate(nil, text as CFString, attrs as CFDictionary) {
             let line = CTLineCreateWithAttributedString(attrStr)
             let bounds = CTLineGetBoundsWithOptions(line, .useOpticalBounds)

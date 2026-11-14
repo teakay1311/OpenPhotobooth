@@ -69,7 +69,7 @@ public final class LibraryViewModel: ObservableObject {
               let data = CIContextHolder.shared.context.pngRepresentation(
                 of: CIImage(cgImage: img), format: .RGBA8,
                 colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!) else { return nil }
-        env.thumbnails.store(data: data, key: "session-\(card.id)-\(card.session.revisionNo)")
+        env.thumbnails.store(data: data, key: "session-\(card.id)-\(card.card.session.revisionNo)")
         return data
     }
 

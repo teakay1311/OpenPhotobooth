@@ -60,8 +60,8 @@ public final class FrameRepository: @unchecked Sendable {
             isBuiltIn: row["is_built_in"].boolValue,
             validationStatus: FrameValidationStatus(rawValue: row["validation_status"].stringValue) ?? .unconfigured,
             lifecycle: FrameLifecycle(rawValue: row["lifecycle"].stringValue) ?? .active,
-            createdAtMs: row["created_at_ms"]?.intValue ?? 0,
-            updatedAtMs: row["updated_at_ms"]?.intValue ?? 0)
+            createdAtMs: row["created_at_ms"]?.int64Value ?? 0,
+            updatedAtMs: row["updated_at_ms"]?.int64Value ?? 0)
     }
 
     // MARK: - Revision & slots
@@ -79,7 +79,7 @@ public final class FrameRepository: @unchecked Sendable {
             backgroundPlacement: PlacementKind(rawValue: r["background_placement"].stringValue) ?? .aspectFill,
             foregroundPlacement: PlacementKind(rawValue: r["foreground_placement"].stringValue) ?? .aspectFit,
             geometryVersion: r["geometry_version"]?.intValue ?? 1,
-            createdAtMs: r["created_at_ms"]?.intValue ?? 0)
+            createdAtMs: r["created_at_ms"]?.int64Value ?? 0)
     }
 
     public func getSlots(revisionID: String) throws -> [FrameSlot] {
@@ -282,14 +282,19 @@ public final class FrameRepository: @unchecked Sendable {
         snapshot.snapshotHash = snapshot.hashForContent()
         let data = try Self.jsonEncoder.encode(snapshot)
         do {
-            try db.run("""
+            let sql = """
                 INSERT INTO frame_snapshots(id, source_frame_id, source_frame_revision_id, snapshot_json, snapshot_hash, created_at_ms)
                 VALUES(?,?,?,?,?,?)
-                """, [.text(snapshot.id),
-                      frameID.map { .text($0) } ?? .null,
-                      revID.map { .text($0) } ?? .null,
-                      .text(String(data: data, encoding: .utf8) ?? "{}"),
-                      .text(snapshot.snapshotHash), .int(snapshot.createdAtMs)])
+                """
+            let params: [SQLiteValue] = [
+                .text(snapshot.id),
+                .text(frameID),
+                .text(revID),
+                .text(String(data: data, encoding: .utf8) ?? "{}"),
+                .text(snapshot.snapshotHash),
+                .int(snapshot.createdAtMs)
+            ]
+            try db.run(sql, params)
             if let bg = snapshot.background?.assetID {
                 try assets.addReference(assetID: bg, ownerType: "frame_snapshot", ownerID: snapshot.id, purpose: "background")
             }
@@ -323,8 +328,8 @@ public final class FrameRepository: @unchecked Sendable {
         try db.query("SELECT * FROM categories WHERE lifecycle='active' ORDER BY sort_order, name").map { r in
             Category(id: r["id"].stringValue, name: r["name"].stringValue,
                      sortOrder: r["sort_order"]?.intValue ?? 0,
-                     createdAtMs: r["created_at_ms"]?.intValue ?? 0,
-                     updatedAtMs: r["updated_at_ms"]?.intValue ?? 0,
+                     createdAtMs: r["created_at_ms"]?.int64Value ?? 0,
+                     updatedAtMs: r["updated_at_ms"]?.int64Value ?? 0,
                      lifecycle: FrameLifecycle(rawValue: r["lifecycle"].stringValue) ?? .active)
         }
     }

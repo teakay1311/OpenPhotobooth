@@ -81,9 +81,9 @@ public final class SessionRepository: @unchecked Sendable {
             cameraID: row["camera_id"].stringValue.isEmpty ? nil : row["camera_id"].stringValue,
             defaults: defaults,
             revisionNo: row["revision_no"]?.intValue ?? 1,
-            createdAtMs: row["created_at_ms"]?.intValue ?? 0,
-            updatedAtMs: row["updated_at_ms"]?.intValue ?? 0,
-            completedAtMs: row["completed_at_ms"]?.intValue)
+            createdAtMs: row["created_at_ms"]?.int64Value ?? 0,
+            updatedAtMs: row["updated_at_ms"]?.int64Value ?? 0,
+            completedAtMs: row["completed_at_ms"]?.int64Value)
     }
 
     public struct SessionCard: Identifiable, Equatable {
@@ -149,7 +149,7 @@ public final class SessionRepository: @unchecked Sendable {
                               codec: r["codec"].stringValue,
                               colorProfile: r["color_profile"].stringValue.isEmpty ? nil : r["color_profile"].stringValue,
                               captureRequestID: r["capture_request_id"].stringValue,
-                              capturedAtMs: r["captured_at_ms"]?.intValue ?? 0,
+                              capturedAtMs: r["captured_at_ms"]?.int64Value ?? 0,
                               state: PhotoRevisionState(rawValue: r["state"].stringValue) ?? .available)
             }
             revisions[shot.id] = revs
@@ -176,7 +176,7 @@ public final class SessionRepository: @unchecked Sendable {
                           offsetX: r["offset_x"]?.doubleValue ?? 0,
                           offsetY: r["offset_y"]?.doubleValue ?? 0,
                           manualOverride: r["manual_override"].boolValue,
-                          updatedAtMs: r["updated_at_ms"]?.intValue ?? 0)
+                          updatedAtMs: r["updated_at_ms"]?.int64Value ?? 0)
         }
         var placementMap: [String: SlotPlacement] = [:]
         for p in placements { placementMap[p.snapshotSlotID] = p }
@@ -205,7 +205,7 @@ public final class SessionRepository: @unchecked Sendable {
                           codec: row["codec"].stringValue,
                           colorProfile: row["color_profile"].stringValue.isEmpty ? nil : row["color_profile"].stringValue,
                           captureRequestID: row["capture_request_id"].stringValue,
-                          capturedAtMs: row["captured_at_ms"]?.intValue ?? 0,
+                          capturedAtMs: row["captured_at_ms"]?.int64Value ?? 0,
                           state: PhotoRevisionState(rawValue: row["state"].stringValue) ?? .available)
         }
     }
@@ -221,7 +221,7 @@ public final class SessionRepository: @unchecked Sendable {
                           codec: row["codec"].stringValue,
                           colorProfile: nil,
                           captureRequestID: row["capture_request_id"].stringValue,
-                          capturedAtMs: row["captured_at_ms"]?.intValue ?? 0,
+                          capturedAtMs: row["captured_at_ms"]?.int64Value ?? 0,
                           state: PhotoRevisionState(rawValue: row["state"].stringValue) ?? .available)
         }
     }
@@ -251,7 +251,7 @@ public final class SessionRepository: @unchecked Sendable {
                                      codec: r["codec"].stringValue,
                                      colorProfile: storedProfile.isEmpty ? nil : storedProfile,
                                      captureRequestID: requestID,
-                                     capturedAtMs: r["captured_at_ms"]?.intValue ?? 0)
+                                     capturedAtMs: r["captured_at_ms"]?.int64Value ?? 0)
             }
             let sessionRows = try tx.query("SELECT status, required_capture_count, revision_no FROM sessions WHERE id=?", [.text(sessionID)])
             guard let sRow = sessionRows.first else { throw AppError.notFound("session \(sessionID)") }
@@ -411,7 +411,7 @@ public final class SessionRepository: @unchecked Sendable {
                     UPDATE slot_placements SET crop_mode=?, scale=?, offset_x=?, offset_y=?, manual_override=?, updated_at_ms=?
                     WHERE id=?
                     """, [.text(cropMode.rawValue), .real(placement.scale), .real(placement.offsetX),
-                          .real(placement.offsetY), .int(manualOverride ? 1 : 0), .int(Time.nowMs()), r["id"].stringValue])
+                          .real(placement.offsetY), .int(manualOverride ? 1 : 0), .int(Time.nowMs()), .text(r["id"].stringValue)])
             } else {
                 let snapID = try tx.query("SELECT active_frame_snapshot_id FROM sessions WHERE id=?", [.text(sessionID)]).first?["active_frame_snapshot_id"].stringValue ?? ""
                 try tx.run("""
@@ -494,8 +494,8 @@ public final class SessionRepository: @unchecked Sendable {
                               width: r["width"]?.intValue ?? 0, height: r["height"]?.intValue ?? 0,
                               quality: r["quality"]?.intValue, sha256: r["sha256"].stringValue.isEmpty ? nil : r["sha256"].stringValue,
                               status: ExportStatus(rawValue: r["status"].stringValue) ?? .failed,
-                              createdAtMs: r["created_at_ms"]?.intValue ?? 0,
-                              completedAtMs: r["completed_at_ms"]?.intValue)
+                              createdAtMs: r["created_at_ms"]?.int64Value ?? 0,
+                              completedAtMs: r["completed_at_ms"]?.int64Value)
         }
     }
 }

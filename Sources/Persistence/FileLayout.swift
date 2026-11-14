@@ -85,7 +85,7 @@ public final class FileLayout: @unchecked Sendable {
     }
 
     public func formattedSize() -> String {
-        Self.formattedBytes(directorySize(rootURL))
+        Self.formattedBytes(Self.directorySize(rootURL))
     }
 
     public static func formattedBytes(_ bytes: Int64) -> String {

@@ -38,10 +38,10 @@ public final class TrashRepository: @unchecked Sendable {
                   rootType: TrashRootType(rawValue: row["root_type"].stringValue) ?? .frame,
                   rootID: row["root_id"].stringValue,
                   displayName: row["display_name"].stringValue,
-                  deletedAtMs: row["deleted_at_ms"]?.intValue ?? 0,
-                  expiresAtMs: row["expires_at_ms"]?.intValue ?? 0,
+                  deletedAtMs: row["deleted_at_ms"]?.int64Value ?? 0,
+                  expiresAtMs: row["expires_at_ms"]?.int64Value ?? 0,
                   originalParentID: row["original_parent_id"].stringValue.isEmpty ? nil : row["original_parent_id"].stringValue,
-                  estimatedBytes: row["estimated_bytes"]?.intValue ?? 0,
+                  estimatedBytes: row["estimated_bytes"]?.int64Value ?? 0,
                   status: TrashStatus(rawValue: row["status"].stringValue) ?? .trashed,
                   lastError: row["last_error"].stringValue.isEmpty ? nil : row["last_error"].stringValue)
     }
@@ -107,8 +107,8 @@ public final class TrashRepository: @unchecked Sendable {
             OperationIntentRecord(id: r["id"].stringValue, opType: r["op_type"].stringValue,
                                   rootID: r["root_id"].stringValue, payloadJSON: r["payload_json"].stringValue,
                                   status: OperationStatus(rawValue: r["status"].stringValue) ?? .prepared,
-                                  createdAtMs: r["created_at_ms"]?.intValue ?? 0,
-                                  updatedAtMs: r["updated_at_ms"]?.intValue ?? 0,
+                                  createdAtMs: r["created_at_ms"]?.int64Value ?? 0,
+                                  updatedAtMs: r["updated_at_ms"]?.int64Value ?? 0,
                                   lastError: r["last_error"].stringValue.isEmpty ? nil : r["last_error"].stringValue)
         }
     }
@@ -119,8 +119,8 @@ public final class TrashRepository: @unchecked Sendable {
         return OperationIntentRecord(id: r["id"].stringValue, opType: r["op_type"].stringValue,
                                      rootID: r["root_id"].stringValue, payloadJSON: r["payload_json"].stringValue,
                                      status: OperationStatus(rawValue: r["status"].stringValue) ?? .prepared,
-                                     createdAtMs: r["created_at_ms"]?.intValue ?? 0,
-                                     updatedAtMs: r["updated_at_ms"]?.intValue ?? 0,
+                                     createdAtMs: r["created_at_ms"]?.int64Value ?? 0,
+                                     updatedAtMs: r["updated_at_ms"]?.int64Value ?? 0,
                                      lastError: r["last_error"].stringValue.isEmpty ? nil : r["last_error"].stringValue)
     }
 

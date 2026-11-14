@@ -141,11 +141,10 @@ public struct FullscreenView: View {
                         .font(.title3).foregroundStyle(.white)
                 }
             }
-            // Auto chuyển sang review khi engine.state == reviewing
-            .onChange(of: env.engine.state) { newState in
-                if case .reviewing = newState {
-                    vm.openReview()
-                }
+        }
+        .onChange(of: env.engine.state) { newState in
+            if case .reviewing = newState {
+                vm.openReview()
             }
         }
     }

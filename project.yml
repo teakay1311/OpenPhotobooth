@@ -12,6 +12,7 @@ settings:
     MACOSX_DEPLOYMENT_TARGET: "14.0"
     CODE_SIGN_STYLE: Automatic
     CODE_SIGNING_ALLOWED: "YES"
+    CODE_SIGN_IDENTITY: "-"
     ENABLE_USER_SCRIPT_SANDBOXING: "YES"
     SWIFT_STRICT_CONCURRENCY: minimal
     OTHER_LDFLAGS: "$(inherited) -lsqlite3"
@@ -22,6 +23,7 @@ targets:
     platform: macOS
     sources:
       - path: Sources
+      - path: Resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: vn.openphotobooth.app
@@ -47,6 +49,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: vn.openphotobooth.tests
         GENERATE_INFOPLIST_FILE: "YES"
+        OTHER_LDFLAGS: "$(inherited) -lsqlite3"
 
 schemes:
   OpenPhotobooth:

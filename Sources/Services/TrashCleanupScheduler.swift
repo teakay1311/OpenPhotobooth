@@ -54,7 +54,7 @@ public final class TrashCleanupScheduler: @unchecked Sendable {
             Log.trash.warning("Tự động dọn rác bị đóng băng do đồng hồ bất thường (E-TRS-04)")
             return nil
         }
-        let now = Time.nowMs(clock: clock)
+        let now = Time.nowMs(clock)
         guard let expired = try? trashRepo.expired(nowMs: now, limit: 20) else { return nil }
         guard !expired.isEmpty else { return TrashService.PurgeReport() }
         // Batch nhỏ + yield cho CameraService (§12.5)

@@ -121,3 +121,5 @@ public enum AppError: Error, Equatable {
         }
     }
 }
+
+extension String: @retroactive Error {}

@@ -25,9 +25,9 @@ public struct FramesView: View {
                 HStack(spacing: 0) {
                     gridArea
                     .frame(maxWidth: .infinity)
-                    if let inspector = inspectorView {
+                    if vm.selection.count == 1 {
                         Divider()
-                        inspector
+                        inspectorView
                             .frame(width: 300)
                     } else if !vm.selection.isEmpty {
                         Divider()
@@ -40,9 +40,11 @@ public struct FramesView: View {
         .onChange(of: env.route) { r in
             if r == .frames { vm.reload() }
         }
-        .onReceive(EventBus.shared.stream) { event in
-            if case .frameLibraryChanged = event { vm.reload() }
-            if case .categoryChanged = event { vm.reload() }
+        .task {
+            for await event in EventBus.shared.stream {
+                if case .frameLibraryChanged = event { vm.reload() }
+                if case .categoryChanged = event { vm.reload() }
+            }
         }
         .sheet(isPresented: $showPackExport) { packExportSheet }
     }
@@ -249,8 +251,7 @@ public struct FramesView: View {
                     infoRow("Danh mục", categoryName(card.frame.categoryID))
                     infoRow("Trạng thái", card.frame.validationStatus == .ready ? "Sẵn sàng" :
                             card.frame.validationStatus == .invalid ? "Không hợp lệ" : "Chưa thiết lập")
-                    let df = DateFormatter(); df.dateStyle = .medium; df.timeStyle = .short
-                    infoRow("Cập nhật", df.string(from: Time.date(ms: card.frame.updatedAtMs)))
+                    infoRow("Cập nhật", formatDate(card.frame.updatedAtMs))
                     Divider()
                     VStack(alignment: .leading, spacing: 8) {
                         PrimaryButton(title: "Sử dụng", systemImage: "checkmark.circle",
@@ -291,6 +292,23 @@ public struct FramesView: View {
     private func canvasSizeText(_ card: FrameCardModel) -> String {
         guard let revID = card.frame.currentRevisionID, let rev = try? env.frames.getRevision(id: revID) else { return "—" }
         return "\(rev.canvasWidth) × \(rev.canvasHeight) px"
+    }
+
+        @ViewBuilder
+    private func infoRow(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label).foregroundStyle(.secondary)
+            Spacer()
+            Text(value)
+        }
+        .font(.caption)
+    }
+
+        private func formatDate(_ ms: Int64) -> String {
+        let df = DateFormatter()
+        df.dateStyle = .medium
+        df.timeStyle = .short
+        return df.string(from: Time.date(ms: ms))
     }
 
     private func categoryName(_ id: String?) -> String {

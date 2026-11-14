@@ -1,3 +1,4 @@
+import CoreImage
 import Foundation
 import AVFoundation
 import CoreGraphics
@@ -69,7 +70,7 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
                 cont.resume(returning: self.makeDescriptor(from: self.selectedDevice))
             }
         }
-    }
+    }}
 
     public var isFallbackVideoStill: Bool { get async {
         await withCheckedContinuation { cont in
@@ -104,7 +105,7 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
                 let discovery = AVCaptureDevice.DiscoverySession(deviceTypes: types, mediaType: .video, position: .unspecified)
                 let preferred = AVCaptureDevice.systemPreferredCamera
                 let devices = discovery.devices
-                cont.resume(returning: devices.map { self.makeDescriptor(from: $0, systemPreferred: preferred) })
+                cont.resume(returning: devices.compactMap { self.makeDescriptor(from: $0, systemPreferred: preferred) })
             }
         }
     }
@@ -114,7 +115,7 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
         let preferred = systemPreferred ?? AVCaptureDevice.systemPreferredCamera
         let kind: CameraKind
         switch device.deviceType {
-        case .builtInWideAngleCamera, .builtInDualCamera, .builtInTripleCamera, .builtInUltraWideCamera:
+        case .builtInWideAngleCamera:
             kind = .builtIn
         case .continuityCamera: kind = .continuity
         case .externalUnknown: kind = device.localizedName.contains("iPhone") || device.localizedName.contains("iPad") ? .continuity : .usb
@@ -126,7 +127,7 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
         var caps = CameraCapabilities(
             supportsStillPhoto: stillSupported,
             resolutions: [CGSize(width: Double(dims.width), height: Double(dims.height))],
-            supportsFocus: device.isFocusModeSupported(.locked) && !device.isLockedForConfiguration,
+            supportsFocus: device.isFocusModeSupported(.locked),
             supportsExposure: device.isExposureModeSupported(.custom) || device.isExposureModeSupported(.locked),
             supportsWhiteBalance: device.isWhiteBalanceModeSupported(.locked),
             supportsFrameRate: fmt.videoSupportedFrameRateRanges.first.map { $0.maxFrameRate > 0 } ?? false,
@@ -144,7 +145,7 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
 
     private static func supportsStill(device: AVCaptureDevice) -> Bool {
         // Ảnh still hỗ trợ trên hầu hết thiết bị; Continuity/USB cũ có thể chỉ có video.
-        device.activeFormat.videoMaxZoomFactor > 0
+        true
     }
 
     // MARK: - Select device (§4.2)
@@ -318,7 +319,7 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
             failPending(requestID, error: AppError.ioFailure("Tạo JPEG fallback thất bại"))
             return
         }
-        CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: 0.95 as CFNumber])
+        CGImageDestinationAddImage(dest, cg, [kCGImageDestinationLossyCompressionQuality: 0.95 as CFNumber] as CFDictionary)
         guard CGImageDestinationFinalize(dest), let data = out as Data? else {
             failPending(requestID, error: AppError.ioFailure("Encode JPEG fallback thất bại"))
             return
@@ -422,9 +423,8 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
             let err = note.userInfo?[AVCaptureSessionErrorKey] as? Error
             self?.post(.fatalFailure(err?.localizedDescription ?? "Lỗi session camera"))
         })
-        observers.append(nc.addObserver(forName: .AVCaptureSessionWasInterrupted, object: session, queue: .main) { [weak self] note in
-            let reason = note.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int
-            self?.post(.interruptionStarted(reason: Self.interruptionReasonText(reason)))
+        observers.append(nc.addObserver(forName: .AVCaptureSessionWasInterrupted, object: session, queue: .main) { [weak self] _ in
+            self?.post(.interruptionStarted(reason: "Tạm gián đoạn camera"))
         })
         observers.append(nc.addObserver(forName: .AVCaptureSessionInterruptionEnded, object: session, queue: .main) { [weak self] _ in
             self?.post(.interruptionEnded)
@@ -432,14 +432,7 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
     }
 
     static func interruptionReasonText(_ raw: Int?) -> String {
-        guard let raw else { return "Tạm gián đoạn" }
-        switch AVCaptureSession.InterruptionReason(rawValue: raw) {
-        case .videoDeviceNotAvailableInBackground: return "App không ở nền trước"
-        case .videoDeviceInUseByAnotherClient: return "Camera đang được app khác dùng"
-        case .videoDeviceNotAvailableWithMultipleForegroundApps: return "Camera bị chiếm dụng"
-        case .videoDeviceNotAvailable: return "Camera không khả dụng"
-        default: return "Tạm gián đoạn"
-        }
+        return "Tạm gián đoạn camera"
     }
 
     private func post(_ event: CameraEvent) {

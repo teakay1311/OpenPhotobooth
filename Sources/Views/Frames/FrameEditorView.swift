@@ -361,7 +361,7 @@ public struct EditorCanvasView: View {
     @State private var dragMode: DragMode = .none
     @State private var lastDragLocation: CGPoint = .zero
 
-    enum DragMode { case none, move, resize(Int), rotate }
+    enum DragMode: Equatable { case none, move, resize(Int), rotate }
 
     public init(vm: FrameEditorViewModel) { self.vm = vm }
 

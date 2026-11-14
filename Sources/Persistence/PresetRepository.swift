@@ -26,8 +26,8 @@ public final class PresetRepository: @unchecked Sendable {
                             parameters: params,
                             parameterVersion: row["parameter_version"]?.intValue ?? 1,
                             lifecycle: FrameLifecycle(rawValue: row["lifecycle"].stringValue) ?? .active,
-                            createdAtMs: row["created_at_ms"]?.intValue ?? 0,
-                            updatedAtMs: row["updated_at_ms"]?.intValue ?? 0)
+                            createdAtMs: row["created_at_ms"]?.int64Value ?? 0,
+                            updatedAtMs: row["updated_at_ms"]?.int64Value ?? 0)
     }
 
     /// Tạo preset user với tên duy nhất trong nhóm active (§8.2).

@@ -29,6 +29,7 @@ public struct SettingsView: View {
             case .data: return "externaldrive.badge.timemachine"
             }
         }
+        public var id: String { rawValue }
     }
 
     public init(env: AppEnvironment) { self.env = env }
@@ -578,7 +579,7 @@ struct DataPane: View {
                         let frames = (try? env.frames.listFrames().map(\.id)) ?? []
                         let packService = env.packService
                         let target = url
-                        let ok = (try? await Task.detached(priority: .userInitiated) {
+                        let ok = (try? await Task.detached(priority: .userInitiated) { () -> Void in
                             let data = try packService.buildPack(name: "Khung backup", frameIDs: frames)
                             try data.write(to: target, options: .atomic)
                         }.value) != nil

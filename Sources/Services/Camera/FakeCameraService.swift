@@ -1,3 +1,4 @@
+import CoreText
 import Foundation
 import CoreGraphics
 import CoreVideo
@@ -175,10 +176,16 @@ public final class FakeCameraService: CameraServing, @unchecked Sendable {
         ctx.fillEllipse(in: CGRect(x: faceRect.midX - faceRect.width * 0.18, y: faceRect.midY + faceRect.height * 0.05, width: faceRect.width * 0.12, height: faceRect.height * 0.12))
         ctx.fillEllipse(in: CGRect(x: faceRect.midX + faceRect.width * 0.06, y: faceRect.midY + faceRect.height * 0.05, width: faceRect.width * 0.12, height: faceRect.height * 0.12))
         // Số frame để thấy mirror
-        ctx.setFillColor(CGColor(white: 1, alpha: 1))
-        ctx.setFont(.boldSystemFont(ofSize: 64))
-        ctx.textPosition = CGPoint(x: 24, y: h - 40)
-        ctx.show("F\(frameNo)")
+        let text = "F\(frameNo)"
+        let attrs: [CFString: Any] = [
+            kCTFontAttributeName: CTFontCreateWithName("Helvetica" as CFString, 48, nil),
+            kCTForegroundColorAttributeName: CGColor(gray: 1, alpha: 1)
+        ]
+        if let attrStr = CFAttributedStringCreate(nil, text as CFString, attrs as CFDictionary) {
+            let line = CTLineCreateWithAttributedString(attrStr)
+            ctx.textPosition = CGPoint(x: 24, y: CGFloat(h) - 60)
+            CTLineDraw(line, ctx)
+        }
         return ctx.makeImage()
     }
 }

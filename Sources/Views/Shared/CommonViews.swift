@@ -161,14 +161,14 @@ public struct ImageDataView: View {
     public var contentMode: ContentMode = .fit
     @State private var nsImage: NSImage?
 
-    public init(data: Data?, image: CGImage? = nil, contentMode: ContentMode = .fit) {
+    public init(data: Data? = nil, image: CGImage? = nil, contentMode: ContentMode = .fit) {
         self.data = data; self.image = image; self.contentMode = contentMode
     }
 
     public var body: some View {
         ZStack {
-            if let img = image ?? decoded {
-                Image(nsImage: img.asNSImage)
+            if let img = image?.asNSImage ?? decoded {
+                Image(nsImage: img)
                     .resizable()
                     .aspectRatio(contentMode: contentMode)
             } else {
@@ -203,7 +203,7 @@ public struct CheckeredBackground: View {
                 for r in 0...max(rows, 1) {
                     for c in 0...max(cols, 1) {
                         let rect = CGRect(x: CGFloat(c) * side, y: CGFloat(r) * side, width: side, height: side)
-                        ctx.fill(rect, with: .color((r + c) % 2 == 0 ? Color(white: 0.92) : Color(white: 0.82)))
+                        ctx.fill(Path(rect), with: .color((r + c) % 2 == 0 ? Color(white: 0.92) : Color(white: 0.82)))
                     }
                 }
             }
@@ -241,7 +241,8 @@ public struct AsyncThumbView: View {
             guard let url else { image = nil; return }
             let key = url.absoluteString as NSString
             if let cached = AsyncThumbView.cache.object(forKey: key) { image = cached; return }
-            if let img = await Task.detached(priority: .utility) { NSImage(contentsOf: url) }.value {
+            let img = await Task.detached(priority: .utility, operation: { NSImage(contentsOf: url) }).value
+            if let img {
                 AsyncThumbView.cache.setObject(img, forKey: key)
                 image = img
             }
@@ -263,7 +264,7 @@ public struct ShareSheet: NSViewRepresentable {
         return button
     }
 
-    public func updateNSView(_ nsView: NSView, context: Context) {
+    public func updateNSView(_ nsView: NSButton, context: Context) {
         context.coordinator.items = items
     }
 
@@ -339,7 +340,7 @@ public final class MetalPreviewNSView: NSView, MTKViewDelegate {
         v.isPaused = false
         v.preferredFramesPerSecond = 30
         v.autoresizingMask = [.width, .height]
-        v clearColor = MTLClearColor(red: 0.05, green: 0.05, blue: 0.07, alpha: 1)
+        v.clearColor = MTLClearColor(red: 0.05, green: 0.05, blue: 0.07, alpha: 1)
         addSubview(v)
         mtkView = v
     }
@@ -366,17 +367,8 @@ public final class MetalPreviewNSView: NSView, MTKViewDelegate {
                 .transformed(by: CGAffineTransform(translationX: tx, y: ty))
         }
         guard let commandBuffer = commandQueue?.makeCommandBuffer() else { return }
-        let dest = CIRenderDestination(width: Int(viewSize.width), height: Int(viewSize.height),
-                                       pixelFormat: view.colorPixelFormat, commandBuffer: commandBuffer,
-                                       mtlTexturesProvider: { [weak drawable] in
-                                           if let t = drawable?.texture { return [t] }
-                                           return []
-                                       })
-        do {
-            try ciContext.render(target, to: dest)
-        } catch {
-            Log.render.error("Preview render lỗi: \(error.localizedDescription, privacy: .public)")
-        }
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        ciContext.render(target, to: drawable.texture, commandBuffer: commandBuffer, bounds: target.extent, colorSpace: colorSpace)
         commandBuffer.present(drawable)
         commandBuffer.commit()
     }
@@ -394,8 +386,8 @@ public final class MetalPreviewNSView: NSView, MTKViewDelegate {
         for rectN in spec.slotRects {
             let w = rectN.width * base.extent.width * scale
             let h = rectN.height * base.extent.height * scale
-            let x = tx + rectN.x * base.extent.width * scale
-            let y = canvasTop - (rectN.y * base.extent.height * scale) - h
+            let x = tx + rectN.origin.x * base.extent.width * scale
+            let y = canvasTop - (rectN.origin.y * base.extent.height * scale) - h
             let slotRect = CGRect(x: x, y: y, width: w, height: h)
             // Fill video vào slot
             let vScale = max(w / video.extent.width, h / video.extent.height)

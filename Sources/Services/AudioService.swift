@@ -24,12 +24,12 @@ public final class AudioService: ObservableObject {
     private func play(_ name: String) {
         guard settings.soundEnabled else { return }
         if let s = sounds[name] {
-            s.volume = settings.soundVolume / 100.0
+            s.volume = Float(settings.soundVolume) / 100.0
             s.play()
             return
         }
         guard let sound = NSSound(named: NSSound.Name(name)) else { return }
-        sound.volume = settings.soundVolume / 100.0
+        sound.volume = Float(settings.soundVolume) / 100.0
         sounds[name] = sound
         sound.play()
     }

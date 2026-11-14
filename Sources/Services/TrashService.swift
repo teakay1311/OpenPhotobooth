@@ -56,7 +56,7 @@ public final class TrashService: @unchecked Sendable {
             do {
                 try db.withTransaction { tx in
                     try tx.run("UPDATE sessions SET status='trashed', updated_at_ms=? WHERE id=?", [.int(Time.nowMs()), .text(sessionID)])
-                    let now = Time.nowMs(clock: clock)
+                    let now = Time.nowMs(clock)
                     try tx.run("""
                         INSERT INTO trash_items(id, root_type, root_id, display_name, deleted_at_ms, expires_at_ms,
                             original_parent_id, estimated_bytes, status, last_error)
@@ -101,7 +101,7 @@ public final class TrashService: @unchecked Sendable {
             do {
                 try db.withTransaction { tx in
                     try tx.run("UPDATE frames SET lifecycle='trashed', updated_at_ms=? WHERE id=?", [.int(Time.nowMs()), .text(frameID)])
-                    let now = Time.nowMs(clock: clock)
+                    let now = Time.nowMs(clock)
                     let bytes = try tx.query("""
                         SELECT COALESCE(SUM(a.byte_size),0) s FROM frame_revisions r
                         LEFT JOIN assets a ON a.id IN (r.background_asset_id, r.foreground_asset_id)
@@ -118,7 +118,7 @@ public final class TrashService: @unchecked Sendable {
                         """, [.text(IDFactory.new()), .text(frameID),
                               .text(frame["name"].stringValue),
                               .int(now), .int(TrashPolicy.expiresAt(deletedAtMs: now)),
-                              frame["category_id"].stringValue.isEmpty ? .null : frame["category_id"],
+                              frame["category_id"].stringValue.isEmpty ? .null : (frame["category_id"] ?? .null),
                               .int(Int64(bytes))])
                 }
                 try trashRepo.updateIntent(id: intent.id, status: .committed)
@@ -145,11 +145,11 @@ public final class TrashService: @unchecked Sendable {
                     // Không chuyển frame vào Trash (§6.3) — chỉ gỡ category
                     let frames = try tx.query("SELECT id FROM frames WHERE category_id=?", [.text(categoryID)])
                     for f in frames {
-                        try tx.run("UPDATE frames SET category_id=NULL, updated_at_ms=? WHERE id=?", [.int(Time.nowMs()), f["id"].stringValue])
+                        try tx.run("UPDATE frames SET category_id=NULL, updated_at_ms=? WHERE id=?", [.int(Time.nowMs()), .text(f["id"].stringValue)])
                         try tx.run("INSERT OR REPLACE INTO category_restore_links(category_id, frame_id, detached_at_ms) VALUES(?,?,?)",
-                                   [.text(categoryID), f["id"].stringValue, .int(Time.nowMs())])
+                                   [.text(categoryID), .text(f["id"].stringValue), .int(Time.nowMs())])
                     }
-                    let now = Time.nowMs(clock: clock)
+                    let now = Time.nowMs(clock)
                     try tx.run("""
                         INSERT INTO trash_items(id, root_type, root_id, display_name, deleted_at_ms, expires_at_ms,
                             original_parent_id, estimated_bytes, status, last_error)
@@ -179,7 +179,7 @@ public final class TrashService: @unchecked Sendable {
             do {
                 try db.withTransaction { tx in
                     try tx.run("UPDATE presets SET lifecycle='trashed', updated_at_ms=? WHERE id=?", [.int(Time.nowMs()), .text(presetID)])
-                    let now = Time.nowMs(clock: clock)
+                    let now = Time.nowMs(clock)
                     try tx.run("""
                         INSERT INTO trash_items(id, root_type, root_id, display_name, deleted_at_ms, expires_at_ms,
                             original_parent_id, estimated_bytes, status, last_error)
