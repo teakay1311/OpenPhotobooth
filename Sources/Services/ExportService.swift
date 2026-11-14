@@ -191,7 +191,7 @@ public final class ExportService: @unchecked Sendable {
             throw AppError.exportFailed(error.localizedDescription)
         }
 
-        // Bước 5: .partial + verify + atomic rename; trùng tên → đổi hậu tố mặc định (STO-06)
+        // Bước 5: .partial + verify + atomic swap/rename; an toàn với crash và không xóa đích trước verify
         let fm = FileManager.default
         var finalName = "\(filenameBase).\(request.format.fileExtension)"
         var finalURL = request.destinationFolder.appendingPathComponent(finalName)
@@ -206,16 +206,20 @@ public final class ExportService: @unchecked Sendable {
             finalName = "\(filenameBase) (\(n)).\(request.format.fileExtension)"
             finalURL = request.destinationFolder.appendingPathComponent(finalName)
         }
-        if fm.fileExists(atPath: finalURL.path) && request.replaceExisting {
-            try? fm.removeItem(at: finalURL)
-        }
-        let partialURL = request.destinationFolder.appendingPathComponent(finalName + ".partial")
+
+        // Tên .partial mang ID của thao tác xuất để tránh xung đột đa tiến trình/luồng
+        let partialURL = request.destinationFolder.appendingPathComponent("\(finalName).\(record.id).partial")
         do {
             try encoded.write(to: partialURL, options: .atomic)
             guard encoded.count > 0, Hashing.sha256Hex(encoded) == Hashing.sha256Hex(fileURL: partialURL) else {
                 throw AppError.ioFailure("Verify export thất bại")
             }
-            try fm.moveItem(at: partialURL, to: finalURL)
+            if fm.fileExists(atPath: finalURL.path) && request.replaceExisting {
+                // Thay thế nguyên tử an toàn: chỉ hoán đổi sau khi .partial đã xác thực, file cũ không bị xóa trước
+                _ = try fm.replaceItemAt(finalURL, withItemAt: partialURL, backupItemName: nil, options: [])
+            } else {
+                try fm.moveItem(at: partialURL, to: finalURL)
+            }
         } catch {
             try? fm.removeItem(at: partialURL)
             record.status = .failed

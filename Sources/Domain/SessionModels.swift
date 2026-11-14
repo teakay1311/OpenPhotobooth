@@ -15,13 +15,18 @@ public struct CaptureSessionRecord: Identifiable, Equatable, Codable, Sendable {
     public var createdAtMs: Int64
     public var updatedAtMs: Int64
     public var completedAtMs: Int64?
+    public var frameNameAtCapture: String?
+    public var countdownSeconds: Int
+    public var intermissionSeconds: Int
 
     public init(id: String = IDFactory.new(), status: SessionStatus = .inProgress,
                 activeFrameSnapshotID: String, requiredCaptureCount: Int,
                 currentCaptureIndex: Int = 1, captureMode: CaptureMode,
                 cameraID: String? = nil, defaults: SessionDefaultsSnapshot,
                 revisionNo: Int = 1, createdAtMs: Int64 = Time.nowMs(),
-                updatedAtMs: Int64 = Time.nowMs(), completedAtMs: Int64? = nil) {
+                updatedAtMs: Int64 = Time.nowMs(), completedAtMs: Int64? = nil,
+                frameNameAtCapture: String? = nil,
+                countdownSeconds: Int = 3, intermissionSeconds: Int = 2) {
         self.id = id; self.status = status
         self.activeFrameSnapshotID = activeFrameSnapshotID
         self.requiredCaptureCount = requiredCaptureCount
@@ -32,6 +37,9 @@ public struct CaptureSessionRecord: Identifiable, Equatable, Codable, Sendable {
         self.revisionNo = revisionNo
         self.createdAtMs = createdAtMs; self.updatedAtMs = updatedAtMs
         self.completedAtMs = completedAtMs
+        self.frameNameAtCapture = frameNameAtCapture
+        self.countdownSeconds = countdownSeconds
+        self.intermissionSeconds = intermissionSeconds
     }
 }
 

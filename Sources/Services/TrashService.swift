@@ -203,6 +203,10 @@ public final class TrashService: @unchecked Sendable {
     // MARK: - Restore (§12.4)
 
     public func restore(_ item: TrashItem) throws {
+        let now = Time.nowMs(clock)
+        guard now < item.deletedAtMs + TrashPolicy.retentionMs else {
+            throw AppError.trashExpired("Mục đã quá hạn 30 ngày trong Thùng rác")
+        }
         try withRootLock("\(item.rootType.rawValue):\(item.rootID)") {
             try trashRepo.setStatus(id: item.id, status: .restoring)
             do {

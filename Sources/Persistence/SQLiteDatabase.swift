@@ -67,6 +67,29 @@ public final class SQLiteDatabase: @unchecked Sendable {
 
     public var databasePath: String { path }
 
+    /// Sao lưu trực tuyến nhất quán (WAL-safe backup) qua SQLite Backup API (§3.1).
+    public func backup(to destinationPath: String) throws {
+        try queue.sync {
+            guard let src = handle else { throw AppError.databaseCorrupt("connection closed") }
+            var destDb: OpaquePointer?
+            let rc = sqlite3_open(destinationPath, &destDb)
+            guard rc == SQLITE_OK, let dest = destDb else {
+                if let d = destDb { sqlite3_close(d) }
+                throw AppError.ioFailure("Không tạo được file sao lưu SQLite: rc=\(rc)")
+            }
+            defer { sqlite3_close(dest) }
+            guard let backupHandle = sqlite3_backup_init(dest, "main", src, "main") else {
+                let msg = String(cString: sqlite3_errmsg(dest))
+                throw AppError.ioFailure("sqlite3_backup_init thất bại: \(msg)")
+            }
+            let stepRc = sqlite3_backup_step(backupHandle, -1)
+            let finishRc = sqlite3_backup_finish(backupHandle)
+            guard (stepRc == SQLITE_DONE || stepRc == SQLITE_OK) && finishRc == SQLITE_OK else {
+                throw AppError.ioFailure("Sao lưu SQLite thất bại: step=\(stepRc), finish=\(finishRc)")
+            }
+        }
+    }
+
     @discardableResult
     private func exec(_ sql: String) -> Bool {
         guard let h = handle else { return false }

@@ -3,7 +3,7 @@ import Foundation
 /// Schema v1 — DDL chuyển ngữ trực tiếp từ đặc tả §16.2 + §16.3 (asset_references),
 /// bổ sung bảng app_state cho seedVersion/clock-marker (§6.4 idempotent seeding).
 public enum Schema {
-    public static let currentVersion: Int64 = 1
+    public static let currentVersion: Int64 = 2
 
     static let v1Statements: [String] = [
         """
@@ -276,7 +276,7 @@ public enum Schema {
         "CREATE INDEX IF NOT EXISTS ix_asset_ref_owner ON asset_references(owner_type,owner_id);"
     ]
 
-    public static func migrate(_ db: SQLiteDatabase) throws {
+    public static func migrate(_ db: SQLiteDatabase, backupFolder: URL? = nil) throws {
         let now = Time.nowMs()
         try db.run("""
             CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -289,12 +289,70 @@ public enum Schema {
             if case .int(let v) = row["version"] ?? .int(0) { return v }
             return nil
         }
+
+        // Kiểm tra phiên bản kho mới hơn app (§3.1.1 — chặn ghi để tránh hỏng dữ liệu)
+        if let maxApplied = applied.max(), maxApplied > currentVersion {
+            throw AppError.databaseCorrupt(
+                "Kho dữ liệu có phiên bản schema v\(maxApplied) mới hơn phiên bản ứng dụng hiện tại (v\(currentVersion)). Vui lòng cập nhật Open Photobooth để mở kho này."
+            )
+        }
+
         if applied.isEmpty {
-            // Cài đặt schema v1 hoàn chỉnh (idempotent: IF NOT EXISTS).
+            // Cài đặt schema ban đầu v1 + v2 hoàn chỉnh (mới hoàn toàn)
             try db.withTransaction { tx in
                 for stmt in v1Statements { try tx.run(stmt) }
                 try tx.run("INSERT INTO schema_migrations(version, applied_at_ms) VALUES(?, ?)",
                            [.int(1), .int(now)])
+                // Áp dụng v2 vào bảng sessions
+                try tx.run("ALTER TABLE sessions ADD COLUMN frame_name_at_capture TEXT")
+                try tx.run("ALTER TABLE sessions ADD COLUMN countdown_seconds INTEGER NOT NULL DEFAULT 3")
+                try tx.run("ALTER TABLE sessions ADD COLUMN intermission_seconds INTEGER NOT NULL DEFAULT 2")
+                try tx.run("INSERT INTO schema_migrations(version, applied_at_ms) VALUES(?, ?)",
+                           [.int(2), .int(now)])
+            }
+            return
+        }
+
+        // Migration v1 -> v2 (§3.1.2)
+        if !applied.contains(2) {
+            // Tạo bản sao an toàn trước migration nếu DB nằm trên đĩa
+            if db.databasePath != ":memory:" {
+                let dbURL = URL(fileURLWithPath: db.databasePath)
+                let backupDir = backupFolder ?? dbURL.deletingLastPathComponent().appendingPathComponent("backups")
+                try? FileManager.default.createDirectory(at: backupDir, withIntermediateDirectories: true)
+                let backupURL = backupDir.appendingPathComponent("openphotobooth-pre-migration-v2-\(now).sqlite")
+                do {
+                    try db.backup(to: backupURL.path)
+                    Log.store.info("Đã sao lưu an toàn trước migration v1->v2: \(backupURL.path, privacy: .public)")
+                } catch {
+                    throw AppError.ioFailure("Không tạo được bản sao lưu an toàn trước migration v1->v2: \(error.localizedDescription)")
+                }
+            }
+
+            try db.withTransaction { tx in
+                // Bổ sung các cột mới v2
+                try tx.run("ALTER TABLE sessions ADD COLUMN frame_name_at_capture TEXT")
+                try tx.run("ALTER TABLE sessions ADD COLUMN countdown_seconds INTEGER NOT NULL DEFAULT 3")
+                try tx.run("ALTER TABLE sessions ADD COLUMN intermission_seconds INTEGER NOT NULL DEFAULT 2")
+
+                // Điền tên khung lúc chụp từ frame_snapshots -> frames
+                let sessionRows = try tx.query("SELECT id, active_frame_snapshot_id FROM sessions")
+                for sRow in sessionRows {
+                    let sID = sRow["id"].stringValue
+                    let snapshotID = sRow["active_frame_snapshot_id"].stringValue
+                    let snapRows = try tx.query("SELECT source_frame_id FROM frame_snapshots WHERE id=?", [.text(snapshotID)])
+                    var resolvedName = ""
+                    if let fID = snapRows.first?["source_frame_id"].stringValue, !fID.isEmpty {
+                        let fRows = try tx.query("SELECT name FROM frames WHERE id=?", [.text(fID)])
+                        if let name = fRows.first?["name"].stringValue, !name.isEmpty {
+                            resolvedName = name
+                        }
+                    }
+                    try tx.run("UPDATE sessions SET frame_name_at_capture=? WHERE id=?", [.text(resolvedName), .text(sID)])
+                }
+
+                try tx.run("INSERT INTO schema_migrations(version, applied_at_ms) VALUES(?, ?)",
+                           [.int(2), .int(now)])
             }
         }
     }

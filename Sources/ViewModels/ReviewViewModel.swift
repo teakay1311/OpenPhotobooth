@@ -361,11 +361,13 @@ public final class ReviewViewModel: ObservableObject {
         guard let frameID = detail.snapshot.sourceFrameID else { return }
         do {
             let snapshot = try env.frames.createSnapshot(frameID: frameID)
+            let frameName = detail.session.frameNameAtCapture ?? (try? env.frames.getFrame(id: frameID)?.name)
             _ = try engine.beginSession(snapshot: snapshot, mode: detail.session.captureMode,
                                         cameraID: detail.session.cameraID,
                                         defaults: detail.session.defaults,
                                         countdown: env.settings.countdown,
-                                        interval: env.settings.interval)
+                                        interval: env.settings.interval,
+                                        frameName: frameName)
             try engine.startOrContinue()
             env.route = .capture
         } catch {

@@ -116,13 +116,17 @@ public final class CaptureEngine: ObservableObject {
 
     public func beginSession(snapshot: FrameSnapshot, mode: CaptureMode, cameraID: String?,
                              defaults: SessionDefaultsSnapshot,
-                             countdown: Int, interval: Int) throws -> CaptureSessionRecord {
+                             countdown: Int, interval: Int,
+                             frameName: String? = nil) throws -> CaptureSessionRecord {
         guard state == .idle || state == .completed else {
             throw AppError.invalidState("Đang có phiên hoạt động")
         }
         guard snapshot.requiredCaptureCount >= 1 else { throw AppError.frameUnconfigured }
         let record = try sessions.createSession(snapshot: snapshot, mode: mode,
-                                                cameraID: cameraID, defaults: defaults)
+                                                cameraID: cameraID, defaults: defaults,
+                                                frameNameAtCapture: frameName,
+                                                countdownSeconds: countdown,
+                                                intermissionSeconds: interval)
         session = record
         self.snapshot = snapshot
         committedShots = [:]
@@ -139,8 +143,8 @@ public final class CaptureEngine: ObservableObject {
         self.snapshot = snapshot
         committedShots = committed
         state = .ready
-        countdownSeconds = 3
-        intervalSeconds = 2
+        countdownSeconds = record.countdownSeconds
+        intervalSeconds = record.intermissionSeconds
     }
 
     public func resetToIdle() {

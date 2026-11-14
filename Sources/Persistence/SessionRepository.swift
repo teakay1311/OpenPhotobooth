@@ -17,23 +17,31 @@ public final class SessionRepository: @unchecked Sendable {
 
     @discardableResult
     public func createSession(snapshot: FrameSnapshot, mode: CaptureMode, cameraID: String?,
-                              defaults: SessionDefaultsSnapshot) throws -> CaptureSessionRecord {
+                              defaults: SessionDefaultsSnapshot,
+                              frameNameAtCapture: String? = nil,
+                              countdownSeconds: Int = 3,
+                              intermissionSeconds: Int = 2) throws -> CaptureSessionRecord {
         let session = CaptureSessionRecord(
             status: .inProgress,
             activeFrameSnapshotID: snapshot.id,
             requiredCaptureCount: snapshot.requiredCaptureCount,
-            captureMode: mode, cameraID: cameraID, defaults: defaults)
+            captureMode: mode, cameraID: cameraID, defaults: defaults,
+            frameNameAtCapture: frameNameAtCapture,
+            countdownSeconds: countdownSeconds,
+            intermissionSeconds: intermissionSeconds)
         let defaultsJSON = String(data: try Self.jsonEncoder.encode(defaults), encoding: .utf8) ?? "{}"
         try db.withTransaction { tx in
             try tx.run("""
                 INSERT INTO sessions(id, status, active_frame_snapshot_id, required_capture_count,
                     current_capture_index, capture_mode, camera_id, session_defaults_json, revision_no,
-                    created_at_ms, updated_at_ms)
-                VALUES(?,?,?,?,?,?,?,?,1,?,?)
+                    created_at_ms, updated_at_ms, frame_name_at_capture, countdown_seconds, intermission_seconds)
+                VALUES(?,?,?,?,?,?,?,?,1,?,?,?,?,?)
                 """, [.text(session.id), .text(session.status.rawValue), .text(snapshot.id),
                       .int(Int64(session.requiredCaptureCount)), .int(1),
                       .text(mode.rawValue), cameraID.map { .text($0) } ?? .null,
-                      .text(defaultsJSON), .int(session.createdAtMs), .int(session.updatedAtMs)])
+                      .text(defaultsJSON), .int(session.createdAtMs), .int(session.updatedAtMs),
+                      frameNameAtCapture.map { .text($0) } ?? .null,
+                      .int(Int64(countdownSeconds)), .int(Int64(intermissionSeconds))])
             // Shots 1..N với index distinct theo snapshot (CAP-02: nhiều slot dùng chung index)
             for index in 1...snapshot.requiredCaptureCount {
                 try tx.run("""
@@ -71,6 +79,10 @@ public final class SessionRepository: @unchecked Sendable {
             ?? SessionDefaultsSnapshot(presetID: "natural", presetName: "Tự nhiên",
                                        presetResolvedParameters: .natural, presetIntensity: 1,
                                        color: .neutral, skinSmooth: 0.25, outputMirror: false)
+        let rawFrameName = row["frame_name_at_capture"].stringValue
+        let frameNameAtCapture: String? = rawFrameName.isEmpty ? nil : rawFrameName
+        let countdownSeconds = row["countdown_seconds"]?.intValue ?? 3
+        let intermissionSeconds = row["intermission_seconds"]?.intValue ?? 2
         return CaptureSessionRecord(
             id: id,
             status: SessionStatus(rawValue: row["status"].stringValue) ?? .paused,
@@ -83,7 +95,10 @@ public final class SessionRepository: @unchecked Sendable {
             revisionNo: row["revision_no"]?.intValue ?? 1,
             createdAtMs: row["created_at_ms"]?.int64Value ?? 0,
             updatedAtMs: row["updated_at_ms"]?.int64Value ?? 0,
-            completedAtMs: row["completed_at_ms"]?.int64Value)
+            completedAtMs: row["completed_at_ms"]?.int64Value,
+            frameNameAtCapture: frameNameAtCapture,
+            countdownSeconds: countdownSeconds,
+            intermissionSeconds: intermissionSeconds)
     }
 
     public struct SessionCard: Identifiable, Equatable {

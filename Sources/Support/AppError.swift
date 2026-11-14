@@ -39,6 +39,9 @@ public enum AppError: Error, Equatable {
     case restoreMissingBytes                // E-TRS-02
     case purgeFailed(String)                // E-TRS-03
     case clockChangedAnomaly                // E-TRS-04
+    case trashExpired(String)               // E-TRS-05
+    // Concurrency / Coordination
+    case busy(String)                       // E-COR-01
     // DB
     case databaseCorrupt(String)            // E-DB-01
     case conflict(expected: Int, actual: Int)
@@ -76,6 +79,8 @@ public enum AppError: Error, Equatable {
         case .restoreMissingBytes: return "Không thể khôi phục đầy đủ."
         case .purgeFailed(let d): return "Có mục chưa xóa được: \(d)"
         case .clockChangedAnomaly: return "Đồng hồ hệ thống thay đổi bất thường — tạm dừng tự dọn rác."
+        case .trashExpired(let d): return "Mục đã quá hạn lưu trữ: \(d)"
+        case .busy(let d): return "Tài nguyên đang bận: \(d)"
         case .databaseCorrupt(let d): return "Không thể mở thư viện an toàn. (\(d))"
         case .conflict: return "Dữ liệu đã thay đổi ở nơi khác. Vui lòng tải lại và thử lại."
         case .invalidState(let d): return "Trạng thái không hợp lệ: \(d)"
@@ -114,6 +119,8 @@ public enum AppError: Error, Equatable {
         case .restoreMissingBytes: return "E-TRS-02"
         case .purgeFailed: return "E-TRS-03"
         case .clockChangedAnomaly: return "E-TRS-04"
+        case .trashExpired: return "E-TRS-05"
+        case .busy: return "E-COR-01"
         case .databaseCorrupt: return "E-DB-01"
         case .conflict: return "E-GEN-01"
         case .invalidState: return "E-GEN-02"

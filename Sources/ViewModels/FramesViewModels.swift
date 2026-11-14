@@ -83,9 +83,13 @@ public final class FramesViewModel: ObservableObject {
             do {
                 let data = try Data(contentsOf: url)
                 guard Self.validateMagicBytes(data) else { throw AppError.frameFileCorrupt }
-                let mediaType = url.pathExtension.lowercased() == "png" ? "image/png" : "image/jpeg"
+                // Xác định định dạng thật qua byte nội dung (§5.1, P1-03)
+                let isPNG = data.starts(with: Data([0x89, 0x50, 0x4E, 0x47]))
+                let mediaType = isPNG ? "image/png" : "image/jpeg"
                 let name = url.deletingPathExtension().lastPathComponent
-                let role: AssetKind = mediaType == "image/png" ? .frameForeground : .frameBackground
+                let hasAlpha = isPNG && Self.hasAlphaChannel(data: data)
+                // PNG có alpha mặc định làm lớp phủ, PNG không alpha/JPG làm nền (§5.1)
+                let role: AssetKind = hasAlpha ? .frameForeground : .frameBackground
                 _ = try env.frames.createFrame(name: name, imageData: data, mediaType: mediaType,
                                                role: role, categoryID: selectedCategoryID == "unclassified" ? nil : selectedCategoryID)
                 ok += 1
@@ -104,10 +108,18 @@ public final class FramesViewModel: ObservableObject {
     }
 
     /// Kiểm tra content type + magic bytes (§6.2).
-    static func validateMagicBytes(_ data: Data) -> Bool {
+    nonisolated public static func validateMagicBytes(_ data: Data) -> Bool {
         if data.starts(with: Data([0x89, 0x50, 0x4E, 0x47])) { return true }           // PNG
         if data.count > 2, data[data.startIndex] == 0xFF, data[data.startIndex + 1] == 0xD8 { return true } // JPEG
         return false
+    }
+
+    /// Kiểm tra xem ảnh có kênh alpha trong suốt hay không (§5.1, DEV-P1-01)
+    nonisolated public static func hasAlphaChannel(data: Data) -> Bool {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil),
+              let cg = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return false }
+        let alpha = cg.alphaInfo
+        return alpha == .first || alpha == .last || alpha == .premultipliedFirst || alpha == .premultipliedLast
     }
 
     public func importViaOpenPanel() {
@@ -409,12 +421,30 @@ public final class FrameEditorViewModel: ObservableObject {
     // MARK: - Validator (§7.5)
 
     public func validate() {
-        validationIssues = FrameValidator.validate(
+        var issues = FrameValidator.validate(
             canvasWidth: canvasWidth, canvasHeight: canvasHeight,
             slots: slots,
             hasBackground: backgroundAssetID != nil,
             hasForeground: foregroundAssetID != nil,
             backgroundColorHex: backgroundColorHex)
+
+        // Cảnh báo và chặn lưu nếu lớp phủ kín che toàn bộ vùng ảnh của ô (DEV-P1-01, P1-03)
+        if let fgID = foregroundAssetID {
+            let isOpaque: Bool = {
+                if let data = try? env.assets.loadData(assetID: fgID) {
+                    return !FramesViewModel.hasAlphaChannel(data: data)
+                }
+                return false
+            }()
+            if isOpaque {
+                issues.append(ValidationIssue(
+                    code: "F-VAL-09",
+                    slotID: nil,
+                    message: "Lớp phủ kín (không có vùng trong suốt) sẽ che toàn bộ vùng ảnh của các ô — hãy đổi vai trò sang Lớp nền hoặc chọn ảnh có alpha"
+                ))
+            }
+        }
+        validationIssues = issues
     }
 
     public var canSave: Bool {

@@ -26,6 +26,7 @@ public final class AppEnvironment: ObservableObject {
     public let shareService: ShareService
     public let packService: FramePackService
     public let clockSanity: ClockSanityMonitor
+    public let coordinator: OperationCoordinator
 
     public var camera: CameraServing
     public let engine: CaptureEngine
@@ -68,7 +69,11 @@ public final class AppEnvironment: ObservableObject {
         } catch {
             fatalError("Không mở được database: \(error) — không tự xóa DB (E-DB-01)")
         }
-        try? Schema.migrate(db)
+        do {
+            try Schema.migrate(db, backupFolder: layout.rootURL.appendingPathComponent("backups"))
+        } catch {
+            fatalError("Lỗi khởi tạo hoặc migration schema: \(error.localizedDescription) — không tự ý xóa database.")
+        }
 
         assets = AssetStore(db: db, layout: layout)
         frames = FrameRepository(db: db, assets: assets, layout: layout)
@@ -88,6 +93,7 @@ public final class AppEnvironment: ObservableObject {
         exportService = ExportService(sessions: sessions, builder: renderBuilder, trashRepo: trashRepo, layout: layout)
         shareService = ShareService(layout: layout, sessions: sessions, builder: renderBuilder)
         packService = FramePackService(frames: frames, assets: assets, layout: layout, db: db)
+        coordinator = OperationCoordinator.shared
 
         camera = CameraService()
         engine = CaptureEngine(camera: camera, safetySave: safetySave, sessions: sessions, audio: audio)

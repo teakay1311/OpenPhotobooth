@@ -92,23 +92,23 @@ public enum FrameSeeder {
                           x: 0.10, y: 0.06 + Double(i) * 0.32,
                           width: 0.80, height: 0.24,
                           zOrder: i, maskType: .roundedRectangle, cornerRadius: 0.02,
-                          defaultCropMode: .autoFace)
+                          defaultCropMode: .fill)
             }
         case .grid4:
-            return [0, 1].flatMap { row in
-                [0, 1].map { col in
+            return (0..<2).flatMap { row in
+                (0..<2).map { col in
                     let idx = row * 2 + col
                     return FrameSlot(captureIndex: idx + 1,
                                      x: 0.06 + Double(col) * 0.46, y: 0.06 + Double(row) * 0.46,
                                      width: 0.42, height: 0.42,
                                      zOrder: idx, maskType: .roundedRectangle, cornerRadius: 0.02,
-                                     defaultCropMode: .autoFace)
+                                     defaultCropMode: .fill)
                 }
             }
         case .single:
             return [FrameSlot(captureIndex: 1, x: 0.08, y: 0.08, width: 0.84, height: 0.64,
                               zOrder: 0, maskType: .roundedRectangle, cornerRadius: 0.015,
-                              defaultCropMode: .autoFace)]
+                              defaultCropMode: .fill)]
         }
     }
 

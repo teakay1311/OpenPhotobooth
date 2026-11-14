@@ -45,10 +45,13 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     func frameName(for card: SessionRepository.SessionCard) -> String {
+        if let atCapture = card.session.frameNameAtCapture, !atCapture.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return atCapture
+        }
         guard let snapshot = try? (env.db.query("SELECT source_frame_id FROM frame_snapshots WHERE id=?", [.text(card.session.activeFrameSnapshotID)]).first?["source_frame_id"].stringValue),
               !snapshot.isEmpty,
               let frame = try? env.frames.getFrame(id: snapshot) else {
-            return "Khung đã xóa"
+            return "Không rõ tên khung lúc chụp"
         }
         return frame.name
     }

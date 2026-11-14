@@ -278,7 +278,8 @@ public final class CaptureViewModel: ObservableObject {
             _ = try engine.beginSession(snapshot: snapshot, mode: mode,
                                         cameraID: selectedDeviceID == "auto" ? await env.camera.currentDevice?.uniqueID : selectedDeviceID,
                                         defaults: defaults,
-                                        countdown: countdown, interval: interval)
+                                        countdown: countdown, interval: interval,
+                                        frameName: frame.name)
             try engine.startOrContinue()
         } catch let e as AppError {
             lastError = e
