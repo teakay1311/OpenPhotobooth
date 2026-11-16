@@ -159,8 +159,59 @@ public final class TrashRepository: @unchecked Sendable {
         return (data, r["display_path"].stringValue.isEmpty ? nil : r["display_path"].stringValue)
     }
 
-    /// Xóa row bookmark mồ côi (đổi thư mục xuất / reset cài đặt — không tích lũy vô hạn).
+    private let bookmarkLock = NSLock()
+    private var bookmarkUsers: [String: Int] = [:]
+    private var retiredBookmarks: Set<String> = []
+
+    final class BookmarkUse: Sendable {
+        let id: String
+        private let repository: TrashRepository
+
+        fileprivate init(id: String, repository: TrashRepository) {
+            self.id = id
+            self.repository = repository
+        }
+
+        deinit { repository.releaseBookmark(id) }
+    }
+
+    func useBookmark(id: String) throws -> BookmarkUse {
+        try bookmarkLock.withLock {
+            guard try bookmark(id: id) != nil else { throw AppError.externalFolderPermissionLost }
+            bookmarkUsers[id, default: 0] += 1
+            return BookmarkUse(id: id, repository: self)
+        }
+    }
+
+    /// Caller đã thay hoặc xóa bookmark mặc định trước khi gọi.
     public func deleteBookmark(id: String) throws {
-        try db.run("DELETE FROM app_bookmarks WHERE id=?", [.text(id)])
+        try bookmarkLock.withLock {
+            retiredBookmarks.insert(id)
+            try reapBookmark(id)
+        }
+    }
+
+    private func releaseBookmark(_ id: String) {
+        bookmarkLock.withLock {
+            if bookmarkUsers[id] == 1 {
+                bookmarkUsers.removeValue(forKey: id)
+            } else {
+                bookmarkUsers[id, default: 1] -= 1
+            }
+            do {
+                try reapBookmark(id)
+            } catch {
+                Log.export.error("Không thể dọn bookmark cũ: \(error.localizedDescription, privacy: .private)")
+            }
+        }
+    }
+
+    private func reapBookmark(_ id: String) throws {
+        guard retiredBookmarks.contains(id), bookmarkUsers[id] == nil else { return }
+        try db.run("""
+            DELETE FROM app_bookmarks WHERE id=? AND NOT EXISTS
+                (SELECT 1 FROM export_records WHERE destination_bookmark_id=app_bookmarks.id)
+            """, [.text(id)])
+        retiredBookmarks.remove(id)
     }
 }

@@ -38,7 +38,9 @@ public struct ExportSheet: View {
                                 Image(systemName: "photo")
                                     .font(.system(size: 32))
                                     .foregroundStyle(.secondary)
-                                Text("Xem trước ảnh xuất")
+                                Text(vm.previewUnavailable ? "Không tạo được xem trước. Hãy kiểm tra ảnh và khung." : "Xem trước ảnh xuất")
+                                    .multilineTextAlignment(.center)
+                                    .padding(.horizontal, 8)
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
                             }
@@ -70,6 +72,7 @@ public struct ExportSheet: View {
                                 set: { vm.quality = Int($0) }), in: 1...100)
                             Text("\(vm.quality)%").monospacedDigit().foregroundStyle(.secondary)
                         }
+                        .onChange(of: vm.quality) { vm.updatePreview() }
                     }
                     HStack {
                         Stepper("Rộng: \(vm.width)", value: Binding(
@@ -97,6 +100,7 @@ public struct ExportSheet: View {
                     Toggle("Ghi đè file trùng", isOn: $vm.replaceExisting)
                 }
                 .formStyle(.grouped)
+                .disabled(vm.isExporting)
                 .padding(.trailing, 16)
             }
 
@@ -105,8 +109,9 @@ public struct ExportSheet: View {
             }
             if let url = vm.lastResultURL {
                 HStack {
-                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                    Text("Đã xuất: \(url.lastPathComponent)")
+                    Image(systemName: vm.historySaveFailed ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                        .foregroundStyle(vm.historySaveFailed ? .orange : .green)
+                    Text("Đã lưu tệp: \(url.lastPathComponent)")
                     Spacer()
                     Button("Hiện trong Finder") { vm.revealResult() }
                 }
@@ -122,7 +127,7 @@ public struct ExportSheet: View {
                     Button("Xong") { dismiss() }
                 }
                 PrimaryButton(title: "Xuất", systemImage: "square.and.arrow.down",
-                              disabledReason: vm.folderURL == nil ? "Chọn thư mục xuất" : (vm.isPreviewLoading ? "Đang tạo xem trước" : nil)) {
+                              disabledReason: vm.folderURL == nil ? "Chọn thư mục xuất" : (vm.canExportPreview ? nil : "Chờ xem trước hợp lệ")) {
                     Task {
                         // KHÔNG gọi configure(detail:) lần nữa — nó reset filename/width/height
                         // và xóa sạch dữ liệu người dùng vừa nhập (P1-13). configure chỉ chạy ở onAppear.
@@ -130,12 +135,14 @@ public struct ExportSheet: View {
                         await vm.runExport()
                     }
                 }
-                .disabled(vm.isExporting || vm.isPreviewLoading)
+                .disabled(vm.isExporting || !vm.canExportPreview)
             }
             .padding(.horizontal)
             .padding(.bottom)
         }
         .frame(width: 660, height: 530)
+        .onChange(of: reviewVM.detail?.session.revisionNo) { vm.updatePreview() }
+        .onChange(of: reviewVM.detail?.snapshot.id) { vm.updatePreview() }
         .onAppear {
             vm.review = reviewVM
             if let detail = reviewVM.detail {

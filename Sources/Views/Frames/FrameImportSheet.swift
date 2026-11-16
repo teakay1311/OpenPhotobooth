@@ -528,33 +528,21 @@ public struct FrameImportSheet: View {
             return
         }
 
-        // Kiểm tra magic bytes
-        guard FramesViewModel.validateMagicBytes(data) else {
-            fileError = "Tệp '\(url.lastPathComponent)' bị hỏng hoặc không đúng định dạng PNG/JPEG"
+        let validated: (image: CGImage, mediaType: String)
+        do {
+            validated = try AssetStore.validatedFrameImage(data, minimumDimension: ResourceLimits.canvasMin)
+        } catch {
+            fileError = "\(url.lastPathComponent): \(error.localizedDescription)"
             return
         }
-
-        guard let image = CGImage.createFrom(data: data) else {
-            fileError = "Không thể giải mã hình ảnh từ tệp: \(url.lastPathComponent)"
-            return
-        }
-
+        let image = validated.image
         let w = image.width
         let h = image.height
-
-        // Kiểm tra giới hạn canvas (§4.1)
-        if w < ResourceLimits.canvasMin || w > ResourceLimits.canvasMax ||
-           h < ResourceLimits.canvasMin || h > ResourceLimits.canvasMax ||
-           Double(w) * Double(h) > ResourceLimits.maxMegapixels * 1_000_000 {
-            fileError = "Kích thước canvas (\(w) × \(h) px) vượt giới hạn cho phép (256–8192 px, tối đa 40 MP)"
-            return
-        }
-
         currentData = data
         currentImage = image
         canvasWidth = w
         canvasHeight = h
-        isPNG = data.starts(with: Data([0x89, 0x50, 0x4E, 0x47]))
+        isPNG = validated.mediaType == "image/png"
         if isPNG && FramesViewModel.hasAlphaChannel(data: data) {
             alpha = PNGAutoAlignmentService.AlphaGrid(image: image)
         }

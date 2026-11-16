@@ -101,13 +101,13 @@ public final class SessionRenderBuilder: @unchecked Sendable {
         }
         var assetImages: [String: CGImage] = [:]
         if let bg = detail.snapshot.background {
-            guard let img = try? assets.loadImage(assetID: bg.assetID) else {
+            guard let img = try? assets.loadVerifiedImage(assetID: bg.assetID) else {
                 throw AppError.missingFrameAssets
             }
             assetImages[bg.assetID] = img
         }
         if let fg = detail.snapshot.foreground {
-            guard let img = try? assets.loadImage(assetID: fg.assetID) else {
+            guard let img = try? assets.loadVerifiedImage(assetID: fg.assetID) else {
                 throw AppError.missingFrameAssets
             }
             assetImages[fg.assetID] = img
@@ -121,9 +121,16 @@ public final class SessionRenderBuilder: @unchecked Sendable {
                 throw AppError.notEnoughPhotos(missing: 1)
             }
             guard let url = try? sessions.fileURL(for: revision),
-                  FileManager.default.fileExists(atPath: url.path),
-                  let raw = ImageNormalizer.uprightImage(url: url) else {
-                throw AppError.ioFailure("Tệp ảnh lượt \(index) bị thiếu hoặc hỏng trên ổ đĩa")
+                  let bytes = try? Data(contentsOf: url) else {
+                throw AppError.ioFailure("Không đọc được tệp ảnh lượt \(index)")
+            }
+            if revision.sha256.isEmpty {
+                Log.export.warning("Ảnh cũ lượt \(index) chưa có checksum để đối chiếu")
+            } else if Hashing.sha256Hex(bytes) != revision.sha256 {
+                throw AppError.ioFailure("Tệp ảnh lượt \(index) không khớp checksum của phiên")
+            }
+            guard let raw = ImageNormalizer.uprightImage(data: bytes) else {
+                throw AppError.ioFailure("Tệp ảnh lượt \(index) bị hỏng trên ổ đĩa")
             }
             let resolved = ResolvedPhotoParams.resolve(defaults: detail.session.defaults,
                                                        override: detail.overrides[index])
@@ -167,15 +174,25 @@ public final class SessionRenderBuilder: @unchecked Sendable {
 
     /// Render cache preview (Thư viện / Review / Sheet xuất) — key theo §11.1, D2-A09.
     public func renderPreview(detail: SessionDetail, maxDimension: Int, format: ExportImageFormat = .jpeg,
-                              outputSize: (width: Int, height: Int)? = nil) async -> CGImage? {
+                              outputSize: (width: Int, height: Int)? = nil,
+                              verifiedSources: Bool = false) async -> CGImage? {
         let width = outputSize?.width ?? detail.snapshot.canvasWidth
         let height = outputSize?.height ?? detail.snapshot.canvasHeight
         guard width > 0, height > 0, maxDimension > 0 else { return nil }
         let scale = Double(maxDimension) / Double(max(width, height))
         let previewWidth = max(1, Int((Double(width) * scale).rounded()))
         let previewHeight = max(1, Int((Double(height) * scale).rounded()))
-        let model = await buildModel(detail: detail, targetWidth: previewWidth, targetHeight: previewHeight,
+        let model: CompositionModel
+        if verifiedSources {
+            guard let verified = try? await buildModelStrict(detail: detail, targetWidth: previewWidth,
+                                                             targetHeight: previewHeight, transparentBackground: format == .png) else {
+                return nil
+            }
+            model = verified
+        } else {
+            model = await buildModel(detail: detail, targetWidth: previewWidth, targetHeight: previewHeight,
                                      transparentBackground: format == .png)
+        }
         guard !Task.isCancelled else { return nil }
         return try? CompositeRenderer.render(model: model)
     }
@@ -240,6 +257,26 @@ public final class ExportService: @unchecked Sendable {
         self.layout = layout
     }
 
+    struct PreviewIdentity: Equatable, Sendable {
+        let sessionID: String
+        let snapshotID: String
+        let revisionNo: Int
+        let format: ExportImageFormat
+        let width: Int
+        let height: Int
+        let quality: Int
+
+        init(detail: SessionDetail, format: ExportImageFormat, width: Int, height: Int, quality: Int) {
+            sessionID = detail.session.id
+            snapshotID = detail.snapshot.id
+            revisionNo = detail.session.revisionNo
+            self.format = format
+            self.width = width
+            self.height = height
+            self.quality = quality
+        }
+    }
+
     public struct ExportRequest: Sendable {
         public var sessionID: String
         public var format: ExportImageFormat
@@ -250,6 +287,8 @@ public final class ExportService: @unchecked Sendable {
         public var destinationFolder: URL
         public var securityScoped: Bool   // folder đến từ bookmark cần start/stop access
         public var replaceExisting: Bool
+        var acceptedPreview: PreviewIdentity?
+        var destinationBookmark: TrashRepository.BookmarkUse?
 
         public init(sessionID: String, format: ExportImageFormat, quality: Int,
                     width: Int, height: Int, filenameBase: String,
@@ -283,9 +322,16 @@ public final class ExportService: @unchecked Sendable {
         defer { opToken.release() }
 
         // Xác nhận tính nhất quán với DB dưới khóa (§3.2.1)
-        guard let latestSession = try sessions.getSession(id: request.sessionID),
-              latestSession.status != .trashed else {
+        guard let latestSession = try sessions.activeSession(id: request.sessionID) else {
             throw AppError.notFound("Phiên chụp không tồn tại hoặc đã bị xóa")
+        }
+        if let accepted = request.acceptedPreview {
+            let requested = PreviewIdentity(detail: detail, format: request.format, width: request.width,
+                                            height: request.height, quality: request.quality)
+            guard accepted == requested, latestSession.revisionNo == accepted.revisionNo,
+                  latestSession.activeFrameSnapshotID == accepted.snapshotID else {
+                throw AppError.exportPreviewChanged
+            }
         }
         guard latestSession.revisionNo == detail.session.revisionNo,
               latestSession.activeFrameSnapshotID == detail.snapshot.id else {
@@ -389,6 +435,7 @@ public final class ExportService: @unchecked Sendable {
         // Bước 6: ExportRecord success (file vẫn giữ nếu DB fail — §11.2.6)
         record.filename = finalName
         record.destinationDisplayPath = finalURL.path
+        record.destinationBookmarkID = request.destinationBookmark?.id
         record.sha256 = Hashing.sha256Hex(encoded)
         record.status = .success
         record.completedAtMs = Time.nowMs()
@@ -396,6 +443,8 @@ public final class ExportService: @unchecked Sendable {
             _ = try sessions.insertExportRecord(record)
         } catch {
             Log.export.error("Ảnh đã lưu nhưng chưa ghi lịch sử xuất: \(error.localizedDescription, privacy: .public)")
+            EventBus.shared.post(.exportFinished(sessionID: request.sessionID, recordID: record.id, success: false))
+            throw AppError.exportHistoryNotSaved(finalURL)
         }
         EventBus.shared.post(.exportFinished(sessionID: request.sessionID, recordID: record.id, success: true))
         return (record, finalURL)
@@ -443,16 +492,18 @@ public final class ExportService: @unchecked Sendable {
     public func autoExport(detail: SessionDetail, folderBookmarkID: String?,
                            format: ExportImageFormat = .jpeg, quality: Int = 95,
                            parentToken: OperationCoordinator.OperationToken? = nil) async -> Result<URL, AppError> {
-        guard let folder = try? resolveExportFolder(bookmarkID: folderBookmarkID) else {
+        guard let folderBookmarkID, let use = try? trashRepo.useBookmark(id: folderBookmarkID),
+              let folder = try? resolveExportFolder(bookmarkID: use.id) else {
             return .failure(.externalFolderPermissionLost)
         }
         let base = Self.defaultFilenameBase()
-        let req = ExportRequest(sessionID: detail.session.id, format: format,
+        var req = ExportRequest(sessionID: detail.session.id, format: format,
                                 quality: quality,
                                 width: detail.snapshot.canvasWidth,
                                 height: detail.snapshot.canvasHeight,
                                 filenameBase: base, destinationFolder: folder,
                                 securityScoped: true, replaceExisting: false)
+        req.destinationBookmark = use
         do {
             let (_, url) = try await export(detail: detail, request: req, parentToken: parentToken)
             return .success(url)

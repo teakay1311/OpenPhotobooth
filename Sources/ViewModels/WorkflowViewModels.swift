@@ -16,6 +16,7 @@ public final class ExportViewModel: ObservableObject {
     @Published public var replaceExisting = false
     @Published public private(set) var isExporting = false
     @Published public private(set) var lastResultURL: URL?
+    @Published private(set) var historySaveFailed = false
     @Published public private(set) var errorMessage: String?
     @Published public private(set) var previewImage: CGImage?
     @Published public private(set) var isPreviewLoading = false
@@ -23,6 +24,11 @@ public final class ExportViewModel: ObservableObject {
     public let env: AppEnvironment
     public var review: ReviewViewModel?
     private var previewTask: Task<Void, Never>?
+    private var acceptedPreview: ExportService.PreviewIdentity?
+    private var destinationBookmark: TrashRepository.BookmarkUse?
+    private var resultBookmark: TrashRepository.BookmarkUse?
+    var canExportPreview: Bool { acceptedPreview != nil && !isPreviewLoading }
+    var previewUnavailable: Bool { !isPreviewLoading && previewImage == nil }
 
     public init(env: AppEnvironment) {
         self.env = env
@@ -34,9 +40,11 @@ public final class ExportViewModel: ObservableObject {
         width = detail.snapshot.canvasWidth
         height = detail.snapshot.canvasHeight
         filename = ExportService.defaultFilenameBase()
-        if env.settings.exportFolderBookmarkID != nil {
+        if let bookmarkID = env.settings.exportFolderBookmarkID {
             do {
-                folderURL = try env.exportService.resolveExportFolder(bookmarkID: env.settings.exportFolderBookmarkID)
+                let use = try env.trashRepo.useBookmark(id: bookmarkID)
+                folderURL = try env.exportService.resolveExportFolder(bookmarkID: use.id)
+                destinationBookmark = use
             } catch {
                 folderURL = nil
                 errorMessage = "Không còn quyền truy cập thư mục mặc định. Hãy chọn lại."
@@ -65,23 +73,33 @@ public final class ExportViewModel: ObservableObject {
 
     public func updatePreview() {
         previewTask?.cancel()
+        acceptedPreview = nil
+        previewImage = nil
         guard let detail = currentDetail() else {
             isPreviewLoading = false
-            previewImage = nil
             return
         }
-        let outputSize = (width: width, height: height)
-        let outputFormat = format
+        let identity = previewIdentity(detail)
         isPreviewLoading = true
         previewTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 150_000_000)
+            try? await Task.sleep(for: .milliseconds(150))
             guard !Task.isCancelled, let self else { return }
-            let image = await self.env.renderBuilder.renderPreview(
-                detail: detail, maxDimension: 480, format: outputFormat, outputSize: outputSize)
+            let image = await env.renderBuilder.renderPreview(
+                detail: detail, maxDimension: 480, format: identity.format,
+                outputSize: (identity.width, identity.height), verifiedSources: true)
             guard !Task.isCancelled else { return }
-            self.previewImage = image
-            self.isPreviewLoading = false
+            guard let latest = currentDetail(), previewIdentity(latest) == identity else {
+                updatePreview()
+                return
+            }
+            previewImage = image
+            acceptedPreview = image == nil ? nil : identity
+            isPreviewLoading = false
         }
+    }
+
+    private func previewIdentity(_ detail: SessionDetail) -> ExportService.PreviewIdentity {
+        ExportService.PreviewIdentity(detail: detail, format: format, width: width, height: height, quality: quality)
     }
 
     private func currentDetail() -> SessionDetail? {
@@ -99,8 +117,10 @@ public final class ExportViewModel: ObservableObject {
             guard response == .OK, let url = panel.url else { return }
             Task { @MainActor in
                 self.folderURL = url
+                self.destinationBookmark = nil
                 do {
-                    try self.env.saveDefaultExportFolder(url)
+                    let id = try self.env.saveDefaultExportFolder(url)
+                    self.destinationBookmark = try self.env.trashRepo.useBookmark(id: id)
                     self.errorMessage = nil
                 } catch {
                     self.errorMessage = "Không lưu được thư mục mặc định. Bạn vẫn có thể thử xuất lần này."
@@ -110,7 +130,16 @@ public final class ExportViewModel: ObservableObject {
     }
 
     public func runExport() async {
-        guard let review, let detail = review.detail else { return }
+        guard !isExporting, let review, let detail = currentDetail() else { return }
+        lastResultURL = nil
+        historySaveFailed = false
+        resultBookmark = nil
+        errorMessage = nil
+        guard let acceptedPreview, acceptedPreview == previewIdentity(detail) else {
+            errorMessage = AppError.exportPreviewChanged.message
+            updatePreview()
+            return
+        }
         guard let folder = folderURL else {
             errorMessage = "Chọn thư mục xuất"
             return
@@ -121,15 +150,26 @@ public final class ExportViewModel: ObservableObject {
         env.settings.jpegQuality = quality
         env.settings.exportWidth = width
         env.settings.exportHeight = height
-        let request = ExportService.ExportRequest(
+        var request = ExportService.ExportRequest(
             sessionID: detail.session.id, format: format, quality: quality,
             width: width, height: height, filenameBase: filename,
             destinationFolder: folder, securityScoped: true, replaceExisting: replaceExisting)
+        request.acceptedPreview = acceptedPreview
+        request.destinationBookmark = destinationBookmark
         let result = await review.runExport(request: request)
         isExporting = false
         switch result {
         case .success(let url):
             lastResultURL = url
+            resultBookmark = request.destinationBookmark
+        case .failure(.exportHistoryNotSaved(let url)):
+            historySaveFailed = true
+            lastResultURL = url
+            resultBookmark = request.destinationBookmark
+            errorMessage = AppError.exportHistoryNotSaved(url).message
+        case .failure(.exportPreviewChanged):
+            errorMessage = AppError.exportPreviewChanged.message
+            updatePreview()
         case .failure(let error):
             errorMessage = error.message   // không đóng sheet, không ghi success giả (§2.9)
         }
@@ -137,6 +177,9 @@ public final class ExportViewModel: ObservableObject {
 
     public func revealResult() {
         guard let url = lastResultURL else { return }
+        let folder = resultBookmark.flatMap { try? env.exportService.resolveExportFolder(bookmarkID: $0.id) }
+        let accessing = folder?.startAccessingSecurityScopedResource() == true
+        defer { if accessing { folder?.stopAccessingSecurityScopedResource() } }
         env.shareService.revealInFinder(url)
     }
 }

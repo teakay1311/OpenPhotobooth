@@ -406,7 +406,8 @@ public final class AppEnvironment: ObservableObject {
         EventBus.shared.post(.recoveryCompleted(issues: report.issues.count))
     }
 
-    func saveDefaultExportFolder(_ url: URL) throws {
+    @discardableResult
+    func saveDefaultExportFolder(_ url: URL) throws -> String {
         let accessing = url.startAccessingSecurityScopedResource()
         defer { if accessing { url.stopAccessingSecurityScopedResource() } }
         let blob = try url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil)
@@ -415,12 +416,12 @@ public final class AppEnvironment: ObservableObject {
         settings.exportFolderBookmarkID = newID
         if let oldID {
             do {
-                let references = try db.scalarInt("SELECT COUNT(*) FROM export_records WHERE destination_bookmark_id=?", [.text(oldID)])
-                if references == 0 { try trashRepo.deleteBookmark(id: oldID) }
+                try trashRepo.deleteBookmark(id: oldID)
             } catch {
                 Log.export.error("Không thể dọn bookmark cũ: \(error.localizedDescription, privacy: .private)")
             }
         }
+        return newID
     }
 
     public func showToast(_ text: String, kind: ToastMessage.Kind = .success) {
@@ -746,6 +747,8 @@ public final class AppEnvironment: ObservableObject {
                     switch exportResult {
                     case .success(let url):
                         showToast("Auto Export xong: \(url.lastPathComponent)")
+                    case .failure(.exportHistoryNotSaved(let url)):
+                        showToast("Auto Export đã lưu \(url.lastPathComponent), chưa ghi được lịch sử", kind: .warning)
                     case .failure(let error):
                         showToast("Auto Export lỗi: \(error.message) — phiên vẫn an toàn trong Thư viện", kind: .warning)
                     }

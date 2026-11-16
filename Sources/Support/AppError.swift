@@ -30,6 +30,8 @@ public enum AppError: Error, LocalizedError, Equatable {
     case ioFailure(String)                  // E-STO-03
     // Export
     case exportFailed(String)               // E-EXP-01
+    case exportPreviewChanged
+    case exportHistoryNotSaved(URL)
     case exportFileExists                   // E-EXP-02
     case notEnoughPhotos(missing: Int)      // thiếu ảnh khi đổi khung / xuất
     // Share
@@ -75,6 +77,8 @@ public enum AppError: Error, LocalizedError, Equatable {
         case .externalFolderPermissionLost: return "Không thể lưu vào thư mục đã chọn."
         case .ioFailure(let d): return "Lỗi đọc/ghi tệp: \(d)"
         case .exportFailed(let d): return "Không thể xuất ảnh. Phiên chụp vẫn an toàn. (\(d))"
+        case .exportPreviewChanged: return "Phiên đã thay đổi. Hãy kiểm tra xem trước mới và bấm Xuất lại."
+        case .exportHistoryNotSaved(let url): return "Đã lưu \(url.lastPathComponent), chưa ghi được lịch sử xuất."
         case .exportFileExists: return "Tên file đã tồn tại."
         case .notEnoughPhotos(let missing): return "Thiếu \(missing) ảnh — hãy chụp bổ sung."
         case .shareCancelled: return "Đã hủy chia sẻ."
@@ -117,6 +121,8 @@ public enum AppError: Error, LocalizedError, Equatable {
         case .ioFailure: return "E-STO-03"
         case .exportFailed: return "E-EXP-01"
         case .exportFileExists: return "E-EXP-02"
+        case .exportPreviewChanged: return "E-EXP-03"
+        case .exportHistoryNotSaved: return "E-EXP-04"
         case .notEnoughPhotos: return "E-CAP-05"
         case .shareCancelled: return "E-SHR-01"
         case .restoreConflict: return "E-TRS-01"

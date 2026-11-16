@@ -322,6 +322,10 @@ public final class LibraryViewModel: ObservableObject {
             return
         }
 
+        revealAvailableExport(in: records)
+    }
+
+    private func revealAvailableExport(in records: [ExportRecordModel]) {
         let successRecords = records.filter { $0.status == .success }
         guard !successRecords.isEmpty else {
             env.showToast("Chưa có bản xuất thành công", kind: .info)
@@ -350,9 +354,14 @@ public final class LibraryViewModel: ObservableObject {
                 hasMissingOrInvalid = true
                 continue
             }
-            let fileURL = URL(fileURLWithPath: path)
-
+            let storedURL = URL(fileURLWithPath: path)
             do {
+                let bookmark = try record.destinationBookmarkID.map { try env.trashRepo.useBookmark(id: $0) }
+                defer { withExtendedLifetime(bookmark) {} }
+                let folder = try bookmark.map { try env.exportService.resolveExportFolder(bookmarkID: $0.id) }
+                let accessing = folder?.startAccessingSecurityScopedResource() == true
+                defer { if accessing { folder?.stopAccessingSecurityScopedResource() } }
+                let fileURL = folder?.appendingPathComponent(storedURL.lastPathComponent) ?? storedURL
                 let meta: (isRegularFile: Bool, isDirectory: Bool)
                 if let probe = fileMetadataProbe {
                     meta = try probe(fileURL)
@@ -369,7 +378,8 @@ public final class LibraryViewModel: ObservableObject {
                     continue
                 }
             } catch {
-                let classification = Self.classifyFileError(error)
+                let classification = (error as? AppError) == .externalFolderPermissionLost
+                    ? .inaccessible : Self.classifyFileError(error)
                 switch classification {
                 case .inaccessible:
                     hasInaccessible = true
@@ -390,7 +400,7 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     public func revealExport(record: ExportRecordModel) {
-        revealRecentExport(sessionID: record.sessionID)
+        revealAvailableExport(in: [record])
     }
 
     public func exportRecords(sessionID: String) -> [ExportRecordModel] {

@@ -119,6 +119,18 @@ final class TrashAndSettingsFixTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: env.layout.trashSessionsDir.appendingPathComponent(id).path))
     }
 
+    func testPB12RetiredBookmarkStaysAvailableUntilLastUseEnds() throws {
+        let id = try env.trashRepo.saveBookmark(purpose: "export_folder", blob: Data([1]), displayPath: tempDir.path)
+        do {
+            let use = try env.trashRepo.useBookmark(id: id)
+            try env.trashRepo.deleteBookmark(id: id)
+            withExtendedLifetime(use) {
+                XCTAssertNotNil(try? env.trashRepo.bookmark(id: id))
+            }
+        }
+        XCTAssertNil(try env.trashRepo.bookmark(id: id))
+    }
+
     func testAUD01RecoversInterruptedRestoreAndPreservesRevision() async throws {
         let root = tempDir.appendingPathComponent("recovery-store", isDirectory: true)
         let prefs = try XCTUnwrap(UserDefaults(suiteName: "test-recovery-\(UUID().uuidString)"))

@@ -244,26 +244,7 @@ public final class FramePackService: @unchecked Sendable {
     /// Xác minh toàn pack vào staging (không đụng thư viện) rồi build preview (§13.2, §2.10).
     public func loadPack(data: Data) throws -> PackValidationResult {
         var result = try Self.validate(data: data)
-        let entries = try ZipArchive.read(data: data)
-        var extracted: [String: Data] = [:]
-        var totalUncompressed = 0
-        for entry in entries {
-            if entry.name == "manifest.json" { continue }
-            let d = try ZipArchive.extract(data: data, entry: entry,
-                                           maxUncompressedBytes: ResourceLimits.maxAssetBytes)
-            totalUncompressed += d.count
-            guard totalUncompressed <= ResourceLimits.maxPackUncompressedBytes else {
-                throw AppError.unsafeFramePack("Tổng dung lượng gói vượt 1GB")
-            }
-            // Kiểm tra checksum manifest
-            if let declared = result.manifest.files.first(where: { $0.path == entry.name }) {
-                let actual = Hashing.sha256Hex(d)
-                guard actual == declared.sha256, declared.size == d.count else {
-                    throw AppError.unsafeFramePack("Checksum không khớp: \(entry.name)")
-                }
-            }
-            extracted[entry.name] = d
-        }
+        let extracted = try verifiedAssets(data: data, manifest: result.manifest)
         // Thumbnail + duplicate detection
         var packEntries: [PackEntry] = []
         let existingFrames = try frames.listFrames()
@@ -292,6 +273,31 @@ public final class FramePackService: @unchecked Sendable {
         result = PackValidationResult(manifest: result.manifest, entries: packEntries,
                                       warnings: result.warnings)
         return result
+    }
+
+    private func verifiedAssets(data: Data, manifest: PackManifest) throws -> [String: Data] {
+        let entries = try ZipArchive.read(data: data)
+        var extracted: [String: Data] = [:]
+        var totalUncompressed = 0
+        for entry in entries {
+            if entry.name == "manifest.json" { continue }
+            let d = try ZipArchive.extract(data: data, entry: entry,
+                                           maxUncompressedBytes: ResourceLimits.maxAssetBytes)
+            totalUncompressed += d.count
+            guard totalUncompressed <= ResourceLimits.maxPackUncompressedBytes else {
+                throw AppError.unsafeFramePack("Tổng dung lượng gói vượt 1GB")
+            }
+            // Kiểm tra checksum manifest
+            if let declared = manifest.files.first(where: { $0.path == entry.name }) {
+                let actual = Hashing.sha256Hex(d)
+                guard actual == declared.sha256, declared.size == d.count else {
+                    throw AppError.unsafeFramePack("Checksum không khớp: \(entry.name)")
+                }
+                _ = try AssetStore.validatedFrameImage(d)
+            }
+            extracted[entry.name] = d
+        }
+        return extracted
     }
 
     static func packContentHash(packFrame: PackFrame) -> String {
@@ -386,13 +392,11 @@ public final class FramePackService: @unchecked Sendable {
     public func applyImportDetailed(result: PackValidationResult,
                                     choices: [ImportChoice],
                                     data: Data) throws -> [String: PackItemStatus] {
-        _ = try Self.validate(data: data)
-        let entries = try ZipArchive.read(data: data)
-        var extracted: [String: Data] = [:]
-        for entry in entries where entry.name != "manifest.json" {
-            extracted[entry.name] = try ZipArchive.extract(data: data, entry: entry,
-                                                           maxUncompressedBytes: ResourceLimits.maxAssetBytes)
+        let validated = try Self.validate(data: data)
+        guard validated.manifest == result.manifest else {
+            throw AppError.unsafeFramePack("Gói khung đã thay đổi sau khi xem trước")
         }
+        let extracted = try verifiedAssets(data: data, manifest: validated.manifest)
         var statuses: [String: PackItemStatus] = [:]
         let existingNames = try frames.listFrames().map(\.name)
         for choice in choices {

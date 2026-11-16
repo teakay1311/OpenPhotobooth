@@ -22,8 +22,7 @@ public final class ShareService: @unchecked Sendable {
         let opToken = try OperationCoordinator.shared.acquire(key: "session:\(detail.session.id)", reason: "ShareService: prepare share", parentToken: parentToken)
         defer { opToken.release() }
 
-        guard let latestSession = try sessions.getSession(id: detail.session.id),
-              latestSession.status != .trashed else {
+        guard let latestSession = try sessions.activeSession(id: detail.session.id) else {
             throw AppError.notFound("Phiên chụp không tồn tại hoặc đã bị xóa")
         }
         guard latestSession.revisionNo == detail.session.revisionNo,
@@ -31,11 +30,10 @@ public final class ShareService: @unchecked Sendable {
             throw AppError.invalidState("Dữ liệu phiên đã thay đổi, vui lòng làm mới và thử lại")
         }
 
-        let shareID = IDFactory.new()
-        let dir = layout.sharesTempDir.appendingPathComponent(shareID, isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let cg = try await renderForShare(detail: detail, format: format)
         let data = try ExportService.encode(cg: cg, format: format, quality: quality)
+        let dir = layout.sharesTempDir.appendingPathComponent(IDFactory.new(), isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         // Sanitize tên file — tên frame do người dùng đặt có thể chứa "/" (P2-24)
         let safeBase = ExportService.sanitizedFilenameBase(filenameBase)
         let url = dir.appendingPathComponent("\(safeBase).\(format.fileExtension)")

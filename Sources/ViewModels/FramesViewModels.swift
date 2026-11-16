@@ -87,10 +87,8 @@ public final class FramesViewModel: ObservableObject {
             defer { if accessing { url.stopAccessingSecurityScopedResource() } }
             do {
                 let data = try Data(contentsOf: url)
-                guard Self.validateMagicBytes(data) else { throw AppError.frameFileCorrupt }
-                // Xác định định dạng thật qua byte nội dung (§5.1, P1-03)
-                let isPNG = data.starts(with: Data([0x89, 0x50, 0x4E, 0x47]))
-                let mediaType = isPNG ? "image/png" : "image/jpeg"
+                let mediaType = try AssetStore.validatedFrameImage(data).mediaType
+                let isPNG = mediaType == "image/png"
                 let name = url.deletingPathExtension().lastPathComponent
                 let hasAlpha = isPNG && Self.hasAlphaChannel(data: data)
                 // PNG có alpha mặc định làm lớp phủ, PNG không alpha/JPG làm nền (§5.1)
@@ -603,8 +601,7 @@ public final class FrameEditorViewModel: ObservableObject {
         defer { if accessing { url.stopAccessingSecurityScopedResource() } }
         do {
             let data = try Data(contentsOf: url)
-            guard FramesViewModel.validateMagicBytes(data) else { throw AppError.frameFileCorrupt }
-            let mediaType = url.pathExtension.lowercased() == "png" ? "image/png" : "image/jpeg"
+            let mediaType = try AssetStore.validatedFrameImage(data).mediaType
             // Dùng 1 ownerKey duy nhất cho phiên editor — save() sẽ moveReferences về revision thật.
             let ownerKey = editorStagingOwnerKey
             let asset = try env.assets.store(data: data, mediaType: mediaType,

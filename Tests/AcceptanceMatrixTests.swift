@@ -94,6 +94,100 @@ final class AcceptanceMatrixTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: env.layout.sessionDir(setup.session.id).path))
     }
 
+    @MainActor
+    func testPB02ExplicitAutoFaceCommitsNewPlacementAndCanUndo() async throws {
+        env.settings.smartFace = false
+        let setup = try await createCompleted4PhotoSession()
+        let vm = ReviewViewModel(env: env)
+        _ = await vm.load(sessionID: setup.session.id)
+        let slotID = try XCTUnwrap(vm.selectedSlotID)
+        vm.updatePlacement(scale: 1.4, offsetX: 0.15, isFinal: true)
+        let edited = try XCTUnwrap(env.sessions.getDetail(sessionID: setup.session.id))
+        let before = try XCTUnwrap(edited.placements[slotID])
+
+        vm.recomputeAutoFace()
+        let deadline = ContinuousClock.now + .seconds(4)
+        while vm.detail?.session.revisionNo == edited.session.revisionNo, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let updated = try XCTUnwrap(env.sessions.getDetail(sessionID: setup.session.id))
+        XCTAssertEqual(updated.placements[slotID]?.placement, PhotoPlacement())
+        XCTAssertEqual(updated.session.revisionNo, edited.session.revisionNo + 1)
+        vm.undo()
+        XCTAssertEqual(try env.sessions.getDetail(sessionID: setup.session.id)?.placements[slotID]?.placement, before.placement)
+
+        vm.recomputeAutoFace()
+        vm.updatePlacement(scale: 1.6, isFinal: true)
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(try env.sessions.getDetail(sessionID: setup.session.id)?.placements[slotID]?.scale, 1.6)
+    }
+
+    @MainActor
+    func testPB15ExportRejectsAcceptedPreviewAfterPlacementChanges() async throws {
+        let setup = try await createCompleted4PhotoSession()
+        let detail = try XCTUnwrap(env.sessions.getDetail(sessionID: setup.session.id))
+        var request = ExportService.ExportRequest(sessionID: setup.session.id, format: .png, quality: 95,
+                                                  width: 400, height: 400, filenameBase: "StalePreview",
+                                                  destinationFolder: env.layout.rootURL)
+        request.acceptedPreview = .init(detail: detail, format: .png, width: 400, height: 400, quality: 95)
+        let slot = try XCTUnwrap(setup.snapshot.slots.first)
+        try env.sessions.setPlacement(sessionID: setup.session.id, snapshotSlotID: slot.id,
+                                     placement: PhotoPlacement(scale: 1.2), cropMode: .fill, manualOverride: true)
+
+        do {
+            _ = try await env.exportService.export(detail: detail, request: request)
+            XCTFail("A stale preview must not authorize export")
+        } catch AppError.exportPreviewChanged {}
+        XCTAssertFalse(FileManager.default.fileExists(atPath: env.layout.rootURL.appendingPathComponent("StalePreview.png").path))
+        XCTAssertTrue(try env.sessions.listExportRecords(sessionID: setup.session.id).isEmpty)
+    }
+
+    @MainActor
+    func testPB06ExportKeepsVerifiedFileWhenHistoryInsertFails() async throws {
+        let setup = try await createCompleted4PhotoSession()
+        let detail = try XCTUnwrap(env.sessions.getDetail(sessionID: setup.session.id))
+        let request = ExportService.ExportRequest(sessionID: setup.session.id, format: .png, quality: 95,
+                                                  width: 400, height: 400, filenameBase: "PartialExport",
+                                                  destinationFolder: env.layout.rootURL)
+        try env.db.run("""
+            CREATE TEMP TRIGGER fail_export_history BEFORE INSERT ON export_records
+            BEGIN SELECT RAISE(ABORT, 'QA history failure'); END
+            """)
+        do {
+            _ = try await env.exportService.export(detail: detail, request: request)
+            XCTFail("Export cannot report full success without its history")
+        } catch AppError.exportHistoryNotSaved(let url) {
+            XCTAssertEqual(url.lastPathComponent, "PartialExport.png")
+            XCTAssertNotNil(ImageNormalizer.uprightImage(url: url))
+        }
+        XCTAssertTrue(try env.sessions.listExportRecords(sessionID: setup.session.id).isEmpty)
+    }
+
+    @MainActor
+    func testPB17ExportRejectsDecodableReplacementAndAllowsLegacyEmptyHash() async throws {
+        let setup = try await createCompleted4PhotoSession()
+        let photo = try XCTUnwrap(setup.revisions[1])
+        try createSampleImageData(color: CGColor(red: 0, green: 0, blue: 1, alpha: 1))
+            .write(to: env.sessions.fileURL(for: photo), options: .atomic)
+        let request = ExportService.ExportRequest(sessionID: setup.session.id, format: .png, quality: 95,
+                                                  width: 400, height: 400, filenameBase: "Checksum",
+                                                  destinationFolder: env.layout.rootURL)
+        let detail = try XCTUnwrap(env.sessions.getDetail(sessionID: setup.session.id))
+        do {
+            _ = try await env.exportService.export(detail: detail, request: request)
+            XCTFail("A different image with valid PNG bytes must be rejected")
+        } catch AppError.ioFailure(let reason) {
+            XCTAssertTrue(reason.contains("checksum"))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: env.layout.rootURL.appendingPathComponent("Checksum.png").path))
+
+        try env.db.run("UPDATE photo_revisions SET sha256='' WHERE id=?", [.text(photo.id)])
+        let legacy = try XCTUnwrap(env.sessions.getDetail(sessionID: setup.session.id))
+        let (record, url) = try await env.exportService.export(detail: legacy, request: request)
+        XCTAssertEqual(record.status, .success)
+        XCTAssertNotNil(ImageNormalizer.uprightImage(url: url))
+    }
+
     // MARK: - LIB-01: Xoá riêng ô 2, xoá ô 2 và 4 cùng lúc, giữ phiên
     @MainActor
     func testLIB01_DeleteIndividualAndMultiplePhotos_KeepSession() async throws {

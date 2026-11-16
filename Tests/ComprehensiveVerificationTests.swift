@@ -65,6 +65,15 @@ final class ComprehensiveVerificationTests: XCTestCase {
     }
 
     @MainActor
+    func testPB07FrameValidatorRejectsTruncatedImageWithValidSignature() throws {
+        let bytes = makeSamplePNG(width: 400, height: 400)
+        XCTAssertEqual(try AssetStore.validatedFrameImage(bytes).mediaType, "image/png")
+        XCTAssertThrowsError(try AssetStore.validatedFrameImage(Data(bytes.prefix(40)))) { error in
+            XCTAssertEqual(error as? AppError, .frameFileCorrupt)
+        }
+    }
+
+    @MainActor
     func testPB08SQLiteChecksDistinguishCleanViolationAndFailure() async throws {
         let recovery = RecoveryService(db: env.db, layout: env.layout, sessions: env.sessions, trashRepo: env.trashRepo)
         var report = RecoveryService.Report()

@@ -76,8 +76,15 @@ public final class ReviewViewModel: ObservableObject {
     // Key: photoRevisionID -> (captureIndex, oldOverride, newOverride)
     private typealias PendingOverrideItem = (index: Int, old: PhotoOverride, new: PhotoOverride)
     private var pendingOverrides: [String: PendingOverrideItem] = [:]
-    // Key: snapshotSlotID -> (placement, cropMode, oldPlacement)
-    private var pendingPlacements: [String: (placement: PhotoPlacement, cropMode: CropMode, old: SlotPlacement?)] = [:]
+    private struct PendingPlacement {
+        let placement: PhotoPlacement
+        let cropMode: CropMode
+        let old: SlotPlacement?
+        let snapshotID: String
+        let photoRevisionID: String?
+    }
+    private var pendingPlacements: [String: PendingPlacement] = [:]
+    private var autoFaceRequest = 0
 
     @Published public private(set) var canUndo: Bool = false
     @Published public private(set) var canRedo: Bool = false
@@ -707,24 +714,34 @@ public final class ReviewViewModel: ObservableObject {
     private func recordDraftPlacement() {
         guard let slotID = selectedSlotID, let p = draftPlacement, let mode = draftCropMode, let detail else { return }
         let old = pendingPlacements[slotID]?.old ?? detail.placements[slotID]
-        pendingPlacements[slotID] = (placement: p, cropMode: mode, old: old)
+        let index = detail.snapshot.slots.first { $0.id == slotID }?.captureIndex
+        let photoRevisionID = index.flatMap { detail.currentRevisions()[$0]?.id }
+        pendingPlacements[slotID] = PendingPlacement(placement: p, cropMode: mode, old: old,
+                                                     snapshotID: detail.snapshot.id, photoRevisionID: photoRevisionID)
     }
 
     public func setCropMode(_ mode: CropMode) {
+        guard selectedSlotID != nil else { return }
+        autoFaceRequest += 1
+        if mode == .autoFace {
+            if detail?.session.defaults.smartFace != false {
+                recomputeAutoFace()
+                return
+            }
+            if selectedSlotID.flatMap({ detail?.placements[$0] })?.manualOverride != true {
+                draftPlacement = PhotoPlacement()
+            }
+        }
         draftCropMode = mode
         recordDraftPlacement()
-        guard selectedSlotID != nil else { return }
-        if mode == .autoFace {
-            recomputeAutoFace()
-        } else {
-            persistPlacement()
-        }
+        persistPlacement()
     }
 
     private var placementDebouncer = Debouncer(delay: .milliseconds(150))
     private var dragStartPlacement: SlotPlacement?
 
     public func updatePlacement(scale: Double? = nil, offsetX: Double? = nil, offsetY: Double? = nil, isFinal: Bool = false) {
+        autoFaceRequest += 1
         if previewMode != .inFrame {
             previewMode = .inFrame
         }
@@ -761,8 +778,9 @@ public final class ReviewViewModel: ObservableObject {
         updatePlacement(scale: 1.0, offsetX: 0.0, offsetY: 0.0, isFinal: true)
     }
 
-    private func persistPlacement() {
-        guard let slotID = selectedSlotID, let pending = pendingPlacements[slotID], let detail else { return }
+    @discardableResult
+    private func persistPlacement() -> Bool {
+        guard let slotID = selectedSlotID, let pending = pendingPlacements[slotID], let detail else { return false }
         let p = pending.placement
         let mode = pending.cropMode
         let old = dragStartPlacement ?? pending.old ?? detail.placements[slotID]
@@ -771,7 +789,9 @@ public final class ReviewViewModel: ObservableObject {
         let env = self.env
         do {
             try env.sessions.setPlacement(sessionID: sessionID, snapshotSlotID: slotID,
-                                          placement: p, cropMode: mode, manualOverride: true)
+                                          placement: p, cropMode: mode, manualOverride: true,
+                                          expectedSnapshotID: pending.snapshotID,
+                                          expectedPhotoRevisionID: pending.photoRevisionID)
             pendingPlacements.removeValue(forKey: slotID)
             if let old {
                 undoStack.append(.placement(snapshotSlotID: slotID, old: old,
@@ -786,43 +806,47 @@ public final class ReviewViewModel: ObservableObject {
             if let fresh = try? env.sessions.getDetail(sessionID: sessionID) {
                 self.detail = fresh
             }
+            saveErrorMessage = nil
             Task { await self.regeneratePreview() }
+            return true
         } catch {
-            env.showToast("Không lưu được vị trí: \((error as? AppError)?.message ?? "")", kind: .warning)
+            saveErrorMessage = "Không lưu được vị trí"
+            env.showToast("Không lưu được vị trí: \(error.localizedDescription)", kind: .warning)
+            return false
         }
     }
 
-    /// "Căn lại" theo Vision (§9.1) — user chủ động, không ghi đè manual.
+    /// Căn lại chủ động dùng đúng ảnh đang chọn, kể cả khi Smart Face tự động đã tắt.
     public func recomputeAutoFace() {
         guard let slotID = selectedSlotID, let detail,
               let slot = detail.snapshot.slots.first(where: { $0.id == slotID }),
               let idx = selectedPhotoIndex,
-              let rev = detail.currentRevisions()[idx] else { return }
-        if detail.session.defaults.smartFace == false {
-            draftCropMode = .autoFace
-            draftPlacement = PhotoPlacement(scale: 1, offsetX: 0, offsetY: 0)
-            persistPlacement()
-            Task {
-                await regeneratePreview()
-                env.showToast("Đã căn giữa (Smart Face tắt)", kind: .info)
-            }
+              let revision = detail.currentRevisions()[idx],
+              let image = normalizedImage(for: revision) else {
+            env.showToast("Không đọc được ảnh để căn mặt", kind: .warning)
             return
         }
-        Task {
-            let faces = await env.faceAnalysis.detectFaces(cgImage: normalizedImage(for: rev) ?? placeholder(),
-                                                           cacheKey: rev.id)
+        autoFaceRequest += 1
+        let request = autoFaceRequest
+        let epoch = previewEpoch
+        let params = ResolvedPhotoParams.resolve(defaults: detail.session.defaults, override: detail.overrides[idx])
+        let cacheKey = "\(revision.id)|m\(detail.session.defaults.outputMirror)|rot\(params.photoRotation)"
+        Task { [weak self] in
+            guard let self else { return }
+            let faces = await env.faceAnalysis.detectFaces(cgImage: image, cacheKey: cacheKey)
+            guard request == autoFaceRequest, epoch == previewEpoch, selectedSlotID == slotID,
+                  self.detail?.session.id == detail.session.id, self.detail?.snapshot.id == detail.snapshot.id,
+                  self.detail?.currentRevisions()[idx]?.id == revision.id else { return }
             let proposal = SmartFraming.propose(
-                sourceWidth: Double(rev.width), sourceHeight: Double(rev.height),
-                slotWidth: Double(slot.width * Double(detail.snapshot.canvasWidth)),
-                slotHeight: Double(slot.height * Double(detail.snapshot.canvasHeight)),
-                faces: faces,
-                userManualOverride: false,
-                defaultMode: .autoFace)
+                sourceWidth: Double(image.width), sourceHeight: Double(image.height),
+                slotWidth: slot.width * Double(detail.snapshot.canvasWidth),
+                slotHeight: slot.height * Double(detail.snapshot.canvasHeight),
+                faces: faces, userManualOverride: false, defaultMode: .autoFace)
+            placementDebouncer.cancel()
             draftCropMode = proposal.fitMode
             draftPlacement = PhotoPlacement(scale: proposal.scale, offsetX: proposal.offsetX, offsetY: proposal.offsetY)
-            persistPlacement()
-            await regeneratePreview()
-            env.showToast(proposal.reason, kind: .info)
+            recordDraftPlacement()
+            if persistPlacement() { env.showToast(proposal.reason, kind: .info) }
         }
     }
 
@@ -837,10 +861,6 @@ public final class ReviewViewModel: ObservableObject {
             }
         }
         return img
-    }
-
-    private func placeholder() -> CGImage {
-        SampleImageFactory.shared.sample(index: 1, size: CGSize(width: 64, height: 64)) ?? CGImage.createBlank()
     }
 
     // MARK: - Retake (§3.3, §5.5, D2-A01)
@@ -1158,7 +1178,7 @@ public final class ReviewViewModel: ObservableObject {
             let target = inverted ? new : old
             try env.sessions.setPlacement(sessionID: target.sessionID, snapshotSlotID: slotID,
                                            placement: target.placement, cropMode: target.cropMode,
-                                           manualOverride: target.manualOverride)
+                                           manualOverride: target.manualOverride, expectedSnapshotID: target.frameSnapshotID)
         }
         Task { await reload(); await regeneratePreview() }
     }
@@ -1227,7 +1247,9 @@ public final class ReviewViewModel: ObservableObject {
                         snapshotSlotID: slotID,
                         placement: item.placement,
                         cropMode: item.cropMode,
-                        manualOverride: true
+                        manualOverride: true,
+                        expectedSnapshotID: item.snapshotID,
+                        expectedPhotoRevisionID: item.photoRevisionID
                     )
                 }
                 for (revID, item) in overrides {
