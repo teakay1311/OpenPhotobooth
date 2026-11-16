@@ -170,13 +170,20 @@ public final class RecoveryService: @unchecked Sendable {
     }
 
     func checkDatabase(into report: inout Report) async {
-        if let problem = db.integrityCheck() {
-            report.issues.append("integrity_check: \(problem)")
-            Log.recovery.error("DB integrity: \(problem, privacy: .public)")
+        do {
+            if let problem = try db.integrityCheck() {
+                report.issues.append("integrity_check: \(problem)")
+            }
+        } catch {
+            report.issues.append("Không chạy được integrity_check: \(error.localizedDescription)")
         }
-        let fk = db.foreignKeyCheck()
-        if !fk.isEmpty {
-            report.issues.append("foreign_key_check: \(fk.count) vi phạm")
+        do {
+            let violations = try db.foreignKeyCheck()
+            if !violations.isEmpty {
+                report.issues.append("foreign_key_check: \(violations.count) vi phạm")
+            }
+        } catch {
+            report.issues.append("Không chạy được foreign_key_check: \(error.localizedDescription)")
         }
     }
 

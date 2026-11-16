@@ -175,7 +175,7 @@ public final class SessionRepository: @unchecked Sendable {
     public func latestRecoverableSession() throws -> CaptureSessionRecord? {
         let rows = try db.query("""
             SELECT * FROM sessions
-            WHERE status IN ('draft','in_progress','paused','reviewable')
+            WHERE status IN ('draft','in_progress','paused','reviewable') AND NOT \(Self.hasRootTrashItem)
             ORDER BY updated_at_ms DESC LIMIT 1
             """)
         return rows.first.flatMap(Self.session(from:))
@@ -307,6 +307,9 @@ public final class SessionRepository: @unchecked Sendable {
                             relativePath: String, sha256: String, width: Int, height: Int,
                             orientation: Int, codec: String, colorProfile: String?) throws -> PhotoRevision {
         try db.withTransaction { tx in
+            guard try tx.scalarInt("SELECT COUNT(*) FROM sessions WHERE id=? AND NOT \(Self.hasRootTrashItem)", [.text(sessionID)]) == 1 else {
+                throw AppError.invalidState("Phiên không còn hoạt động")
+            }
             // Idempotency: requestID đã commit thì trả về revision hiện có
             let rows = try tx.query("""
                 SELECT pr.*, sh.session_id, sh.capture_index, s.status AS session_status
@@ -398,6 +401,7 @@ public final class SessionRepository: @unchecked Sendable {
                 JOIN sessions s ON s.id=sh.session_id
                 WHERE pr.id=? AND sh.id=? AND s.id=? AND pr.state='available'
                   AND s.status NOT IN ('trashed','purging')
+                  AND NOT EXISTS (SELECT 1 FROM trash_items WHERE root_type='session' AND root_id=s.id)
                   AND NOT EXISTS (SELECT 1 FROM trash_items WHERE root_type='photo' AND root_id=pr.id)
                 """, [.text(toRevisionID), .text(shotID), .text(sessionID)])
             guard (belongs.first?["c"]?.intValue ?? 0) > 0 else {
@@ -410,13 +414,39 @@ public final class SessionRepository: @unchecked Sendable {
 
     // MARK: - Status & revision bump
 
+    private static let hasRootTrashItem = """
+        EXISTS (SELECT 1 FROM trash_items WHERE root_type='session' AND root_id=sessions.id)
+        """
+
+    func activeSession(id: String) throws -> CaptureSessionRecord? {
+        let row = try db.query("""
+            SELECT * FROM sessions WHERE id=? AND status NOT IN ('trashed','purging')
+              AND NOT \(Self.hasRootTrashItem)
+            """, [.text(id)]).first
+        return row.flatMap(Self.session(from:))
+    }
+
+    func activeCaptureDetail(sessionID: String) throws -> SessionDetail? {
+        guard try activeSession(id: sessionID) != nil else { return nil }
+        return try getDetail(sessionID: sessionID)
+    }
+
     public func setStatus(sessionID: String, status: SessionStatus) throws {
-        if status == .completed {
-            try db.run("UPDATE sessions SET status=?, completed_at_ms=?, updated_at_ms=? WHERE id=?",
-                       [.text(status.rawValue), .int(Time.nowMs()), .int(Time.nowMs()), .text(sessionID)])
-        } else {
-            try db.run("UPDATE sessions SET status=?, updated_at_ms=? WHERE id=?",
-                       [.text(status.rawValue), .int(Time.nowMs()), .text(sessionID)])
+        let now = Time.nowMs()
+        try db.withTransaction { tx in
+            guard try tx.scalarInt("""
+                SELECT COUNT(*) FROM sessions WHERE id=? AND status NOT IN ('trashed','purging')
+                  AND NOT \(Self.hasRootTrashItem)
+                """, [.text(sessionID)]) == 1, status != .trashed, status != .purging else {
+                throw AppError.invalidState("Phiên không còn hoạt động")
+            }
+            if status == .completed {
+                try tx.run("UPDATE sessions SET status=?, completed_at_ms=?, updated_at_ms=? WHERE id=?",
+                           [.text(status.rawValue), .int(now), .int(now), .text(sessionID)])
+            } else {
+                try tx.run("UPDATE sessions SET status=?, updated_at_ms=? WHERE id=?",
+                           [.text(status.rawValue), .int(now), .text(sessionID)])
+            }
         }
     }
 
@@ -427,7 +457,7 @@ public final class SessionRepository: @unchecked Sendable {
 
     /// Sau crash: mọi session `in_progress` chuyển thành `paused` (§5.1 — transient không resume nguyên trạng).
     public func convertTransientToPaused() throws {
-        try db.run("UPDATE sessions SET status='paused', updated_at_ms=? WHERE status='in_progress'", [.int(Time.nowMs())])
+        try db.run("UPDATE sessions SET status='paused', updated_at_ms=? WHERE status='in_progress' AND NOT \(Self.hasRootTrashItem)", [.int(Time.nowMs())])
     }
 
     public func touch(sessionID: String) throws {
@@ -444,6 +474,8 @@ public final class SessionRepository: @unchecked Sendable {
 
     /// Cập nhật override của một photo revision (partial). Bump session revision.
     public func setOverride(sessionID: String, photoRevisionID: String, override: PhotoOverride) throws {
+        let token = try OperationCoordinator.shared.acquire(key: "session:\(sessionID)", reason: "Chỉnh ảnh")
+        defer { token.release() }
         let json = String(data: try Self.jsonEncoder.encode(override), encoding: .utf8) ?? "{}"
         try db.withTransaction { tx in
             let revCheck = try tx.query("""
@@ -451,6 +483,7 @@ public final class SessionRepository: @unchecked Sendable {
                 JOIN session_shots sh ON sh.id = pr.shot_id
                 JOIN sessions s ON s.id = sh.session_id
                 WHERE pr.id = ? AND s.id = ? AND pr.state='available'
+                  AND NOT EXISTS (SELECT 1 FROM trash_items WHERE root_type='session' AND root_id=s.id)
                   AND NOT EXISTS (SELECT 1 FROM trash_items WHERE root_type='photo' AND root_id=pr.id)
                 """, [.text(photoRevisionID), .text(sessionID)])
             guard let row = revCheck.first else {
@@ -478,6 +511,8 @@ public final class SessionRepository: @unchecked Sendable {
     public func applyColorToAll(sessionID: String, color: ColorOverrides?,
                                 presetID: String?, presetParameters: ColorParameterSet?, presetIntensity: Double?,
                                 explicitNoPreset: Bool? = nil) throws {
+        let token = try OperationCoordinator.shared.acquire(key: "session:\(sessionID)", reason: "Chỉnh ảnh")
+        defer { token.release() }
         try db.withTransaction { tx in
             let rows = try tx.query("""
                 SELECT pr.id, sh.capture_index FROM photo_revisions pr
@@ -485,6 +520,7 @@ public final class SessionRepository: @unchecked Sendable {
                 JOIN sessions s ON s.id = sh.session_id
                 WHERE sh.session_id = ? AND sh.current_photo_revision_id = pr.id AND pr.state='available'
                   AND s.status NOT IN ('trashed','purging')
+                  AND NOT EXISTS (SELECT 1 FROM trash_items WHERE root_type='session' AND root_id=s.id)
                   AND NOT EXISTS (SELECT 1 FROM trash_items WHERE root_type='photo' AND root_id=pr.id)
                   AND CASE WHEN json_type(CASE WHEN json_valid(s.session_defaults_json)
                                          THEN s.session_defaults_json ELSE '{}' END, '$.selectedCaptureOrder') = 'array'
@@ -529,8 +565,10 @@ public final class SessionRepository: @unchecked Sendable {
     public func applyPresetToSession(sessionID: String,
                                      presetID: String,
                                      presetParameters: ColorParameterSet) throws -> (before: [String: PhotoOverride?], after: [String: PhotoOverride]) {
-        try db.withTransaction { tx in
-            let sessRows = try tx.query("SELECT status, session_defaults_json FROM sessions WHERE id=?", [.text(sessionID)])
+        let token = try OperationCoordinator.shared.acquire(key: "session:\(sessionID)", reason: "Áp dụng preset")
+        defer { token.release() }
+        return try db.withTransaction { tx in
+            let sessRows = try tx.query("SELECT status, session_defaults_json FROM sessions WHERE id=? AND NOT \(Self.hasRootTrashItem)", [.text(sessionID)])
             guard let sessRow = sessRows.first else {
                 throw AppError.notFound("Không tìm thấy phiên chụp")
             }
@@ -603,13 +641,17 @@ public final class SessionRepository: @unchecked Sendable {
     }
 
     func restorePresetOverrides(sessionID: String, overrides: [String: PhotoOverride?]) throws {
+        let token = try OperationCoordinator.shared.acquire(key: "session:\(sessionID)", reason: "Chỉnh ảnh")
+        defer { token.release() }
         guard !overrides.isEmpty else { return }
         try db.withTransaction { tx in
             let rows = try tx.query("""
                 SELECT pr.id FROM photo_revisions pr
                 JOIN session_shots sh ON sh.current_photo_revision_id=pr.id AND sh.id=pr.shot_id
                 JOIN sessions s ON s.id=sh.session_id
-                WHERE s.id=? AND s.status NOT IN ('trashed','purging') AND pr.state='available'
+                WHERE s.id=? AND s.status NOT IN ('trashed','purging')
+                  AND pr.state='available'
+                  AND NOT EXISTS (SELECT 1 FROM trash_items WHERE root_type='session' AND root_id=s.id)
                   AND NOT EXISTS (SELECT 1 FROM trash_items WHERE root_type='photo' AND root_id=pr.id)
                 """, [.text(sessionID)])
             let current = Set(rows.map { $0["id"].stringValue })
@@ -636,12 +678,15 @@ public final class SessionRepository: @unchecked Sendable {
 
     /// Reset overrides của một ảnh (về SessionDefault §9.3).
     public func clearOverride(sessionID: String, photoRevisionID: String) throws {
+        let token = try OperationCoordinator.shared.acquire(key: "session:\(sessionID)", reason: "Chỉnh ảnh")
+        defer { token.release() }
         try db.withTransaction { tx in
             let revCheck = try tx.query("""
                 SELECT sh.current_photo_revision_id, s.status FROM photo_revisions pr
                 JOIN session_shots sh ON sh.id = pr.shot_id
                 JOIN sessions s ON s.id = sh.session_id
                 WHERE pr.id = ? AND s.id = ? AND pr.state='available'
+                  AND NOT EXISTS (SELECT 1 FROM trash_items WHERE root_type='session' AND root_id=s.id)
                   AND NOT EXISTS (SELECT 1 FROM trash_items WHERE root_type='photo' AND root_id=pr.id)
                 """, [.text(photoRevisionID), .text(sessionID)])
             guard let row = revCheck.first else {
@@ -667,7 +712,7 @@ public final class SessionRepository: @unchecked Sendable {
 
         var createdItems: [TrashItem] = []
         try db.withTransaction { tx in
-            let sessionRows = try tx.query("SELECT * FROM sessions WHERE id=?", [.text(sessionID)])
+            let sessionRows = try tx.query("SELECT * FROM sessions WHERE id=? AND NOT \(Self.hasRootTrashItem)", [.text(sessionID)])
             guard let sRow = sessionRows.first, let session = Self.session(from: sRow) else {
                 throw AppError.notFound("Phiên chụp \(sessionID)")
             }
@@ -761,8 +806,29 @@ public final class SessionRepository: @unchecked Sendable {
     // MARK: - Placements (§9.2)
 
     public func setPlacement(sessionID: String, snapshotSlotID: String, placement: PhotoPlacement,
-                             cropMode: CropMode, manualOverride: Bool) throws {
-        try db.withTransaction { tx in
+                             cropMode: CropMode, manualOverride: Bool,
+                             expectedSnapshotID: String? = nil, expectedPhotoRevisionID: String? = nil,
+                             parentToken: OperationCoordinator.OperationToken? = nil) throws {
+        let token = try OperationCoordinator.shared.acquire(key: "session:\(sessionID)", reason: "Chỉnh vị trí", parentToken: parentToken)
+        defer { token.release() }
+        let revision = try db.withTransaction { tx in
+            let row = try tx.query("""
+                SELECT active_frame_snapshot_id FROM sessions WHERE id=?
+                AND status NOT IN ('trashed','purging') AND NOT \(Self.hasRootTrashItem)
+                """, [.text(sessionID)]).first
+            guard let snapshotID = row?["active_frame_snapshot_id"]?.stringValue,
+                  expectedSnapshotID == nil || expectedSnapshotID == snapshotID,
+                  let slot = try Self.loadSnapshot(snapshotID, tx: tx).slots.first(where: { $0.id == snapshotSlotID }) else {
+                throw AppError.invalidState("Ô hoặc khung của phiên đã thay đổi")
+            }
+            if let expectedPhotoRevisionID {
+                let shot = try tx.query("""
+                    SELECT current_photo_revision_id FROM session_shots WHERE session_id=? AND capture_index=?
+                    """, [.text(sessionID), .int(Int64(slot.captureIndex))]).first
+                guard shot?["current_photo_revision_id"]?.stringValue == expectedPhotoRevisionID else {
+                    throw AppError.invalidState("Phiên bản ảnh của ô đã thay đổi")
+                }
+            }
             let rows = try tx.query("SELECT id FROM slot_placements WHERE session_id=? AND snapshot_slot_id=? AND frame_snapshot_id=(SELECT active_frame_snapshot_id FROM sessions WHERE id=?)", [.text(sessionID), .text(snapshotSlotID), .text(sessionID)])
             if let r = rows.first {
                 try tx.run("""
@@ -771,16 +837,17 @@ public final class SessionRepository: @unchecked Sendable {
                     """, [.text(cropMode.rawValue), .real(placement.scale), .real(placement.offsetX),
                           .real(placement.offsetY), .int(manualOverride ? 1 : 0), .int(Time.nowMs()), .text(r["id"].stringValue)])
             } else {
-                let snapID = try tx.query("SELECT active_frame_snapshot_id FROM sessions WHERE id=?", [.text(sessionID)]).first?["active_frame_snapshot_id"].stringValue ?? ""
                 try tx.run("""
                     INSERT INTO slot_placements(id, session_id, frame_snapshot_id, snapshot_slot_id, crop_mode, scale, offset_x, offset_y, manual_override, updated_at_ms)
                     VALUES(?,?,?,?,?,?,?,?,?,?)
-                    """, [.text(IDFactory.new()), .text(sessionID), .text(snapID), .text(snapshotSlotID),
+                    """, [.text(IDFactory.new()), .text(sessionID), .text(snapshotID), .text(snapshotSlotID),
                           .text(cropMode.rawValue), .real(placement.scale), .real(placement.offsetX),
                           .real(placement.offsetY), .int(manualOverride ? 1 : 0), .int(Time.nowMs())])
             }
             try tx.run("UPDATE sessions SET revision_no=revision_no+1, updated_at_ms=? WHERE id=?", [.int(Time.nowMs()), .text(sessionID)])
+            return try tx.scalarInt("SELECT revision_no FROM sessions WHERE id=?", [.text(sessionID)])
         }
+        EventBus.shared.post(.sessionChanged(sessionID: sessionID, revision: Int(revision)))
     }
 
     /// Đổi khung ở Review (§3.6): snapshot mới + mapping + reset placements theo snapshot mới (transaction, D2-A08, DATA-01, DATA-02).
@@ -797,7 +864,7 @@ public final class SessionRepository: @unchecked Sendable {
         defer { lockToken.release() }
 
         try db.withTransaction { tx in
-            let rows = try tx.query("SELECT * FROM sessions WHERE id=? AND status NOT IN ('trashed','purging')", [.text(sessionID)])
+            let rows = try tx.query("SELECT * FROM sessions WHERE id=? AND status NOT IN ('trashed','purging') AND NOT \(Self.hasRootTrashItem)", [.text(sessionID)])
             guard let row = rows.first, var session = Self.session(from: row) else {
                 throw AppError.notFound("session \(sessionID)")
             }
@@ -936,6 +1003,7 @@ public final class SessionRepository: @unchecked Sendable {
     func repairLegacyFrameAssignments(using frames: FrameRepository) throws -> (updated: Int, unresolved: [String]) {
         let rows = try db.query("""
             SELECT * FROM sessions WHERE status NOT IN ('trashed','purging')
+              AND NOT \(Self.hasRootTrashItem)
               AND json_valid(session_defaults_json)
               AND json_type(session_defaults_json, '$.selectedCaptureOrder')='array'
             """)

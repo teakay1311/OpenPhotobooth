@@ -63,6 +63,7 @@ public final class CaptureEngine: ObservableObject {
     private let coordinator: OperationCoordinator
     private var sessionLockToken: OperationCoordinator.OperationToken?
     private var cameraEventTask: Task<Void, Never>?
+    private var sessionEventTask: Task<Void, Never>?
     private var timerToken = 0
     @Published public private(set) var pauseRequested = false
     private var pendingPauseReason: PauseReason?
@@ -94,11 +95,21 @@ public final class CaptureEngine: ObservableObject {
         self.coordinator = coordinator
         registerLifecycleObservers()
         listenCameraEvents()
+        let sessionEvents = EventBus.shared.stream
+        sessionEventTask = Task { [weak self] in
+            for await event in sessionEvents {
+                guard let self else { return }
+                guard case .sessionChanged(let id, _) = event, self.session?.id == id,
+                      self.canAdoptSession, self.sessionLockToken == nil else { continue }
+                self.refreshSessionAfterChange(id)
+            }
+        }
     }
 
     deinit {
         for o in notificationObservers { NotificationCenter.default.removeObserver(o) }
         cameraEventTask?.cancel()
+        sessionEventTask?.cancel()
     }
 
     // MARK: - Điều kiện/bảng hành động (§5.2)
@@ -178,25 +189,26 @@ public final class CaptureEngine: ObservableObject {
     @discardableResult
     public func adoptSession(record: CaptureSessionRecord, snapshot: FrameSnapshot,
                              committed: [Int: PhotoRevision], forReview: Bool = false) -> Bool {
-        guard canAdoptSession else { return false }
+        guard canAdoptSession,
+              let detail = try? sessions.activeCaptureDetail(sessionID: record.id),
+              detail.snapshot.id == snapshot.id else { return false }
         timerToken += 1
         if session?.id != record.id || self.snapshot?.id != snapshot.id {
             releaseSessionLock()
             lastShotContext = nil
             pendingRetakeKeepCrop = false
         }
-        session = record
-        self.snapshot = snapshot
-        let validIndices = record.captureIndices(in: snapshot)
-        committedShots = committed.filter { validIndices.contains($0.key) }
+        updateCaptureDetail(detail)
         state = forReview ? .reviewing : .ready
-        countdownSeconds = record.countdownSeconds
-        intervalSeconds = record.intermissionSeconds
+        countdownSeconds = detail.session.countdownSeconds
+        intervalSeconds = detail.session.intermissionSeconds
         return true
     }
 
     public func resetToIdle() {
-        guard !hasPhotoToSave else { return }
+        guard !hasPhotoToSave, !isCaptureBusy, !captureInFlight else { return }
+        isNavigationSafePointHold = false
+        pendingRetakeKeepCrop = false
         pauseRequested = false
         pendingPauseReason = nil
         timerToken += 1
@@ -210,9 +222,59 @@ public final class CaptureEngine: ObservableObject {
 
     // MARK: - Lock & Navigation Hold Helpers (DATA-01, NAV-02)
 
-    private func acquireSessionLockIfNeeded(sessionID: String) {
-        guard sessionLockToken == nil else { return }
-        sessionLockToken = try? coordinator.acquire(key: "session:\(sessionID)", reason: "CaptureEngine: capturing")
+    private func refreshSessionAfterChange(_ id: String) {
+        do {
+            guard let detail = try sessions.activeCaptureDetail(sessionID: id) else {
+                resetToIdle()
+                return
+            }
+            if snapshot?.id != detail.snapshot.id {
+                lastShotContext = nil
+                pendingRetakeKeepCrop = false
+                state = .ready
+            }
+            updateCaptureDetail(detail)
+        } catch {
+            lastError = .ioFailure(error.localizedDescription)
+        }
+    }
+
+    private func updateCaptureDetail(_ detail: SessionDetail) {
+        session = detail.session
+        snapshot = detail.snapshot
+        let valid = detail.session.captureIndices(in: detail.snapshot)
+        committedShots = detail.currentRevisions().filter { valid.contains($0.key) }
+    }
+
+    private func prepareCapture() throws {
+        guard let id = session?.id else { throw AppError.invalidState("Không có phiên chụp") }
+        if sessionLockToken == nil {
+            sessionLockToken = try coordinator.acquire(key: "session:\(id)", reason: "CaptureEngine: capturing")
+        }
+        do {
+            guard let detail = try sessions.activeCaptureDetail(sessionID: id) else {
+                resetToIdle()
+                throw AppError.invalidState("Phiên chụp không còn hoạt động")
+            }
+            guard snapshot?.id == detail.snapshot.id else {
+                refreshSessionAfterChange(id)
+                throw AppError.invalidState("Khung của phiên đã thay đổi. Hãy kiểm tra rồi thử lại.")
+            }
+            updateCaptureDetail(detail)
+        } catch {
+            if !hasPhotoToSave { releaseSessionLock() }
+            throw error
+        }
+    }
+
+    private func prepareCaptureOrReport() -> Bool {
+        do {
+            try prepareCapture()
+            return true
+        } catch {
+            lastError = (error as? AppError) ?? .ioFailure(error.localizedDescription)
+            return false
+        }
     }
 
     private func releaseSessionLock() {
@@ -230,9 +292,11 @@ public final class CaptureEngine: ObservableObject {
 
     public func releaseSafePointHold() {
         isNavigationSafePointHold = false
-        if case .ready = state {
+        if case .ready = state, sessionLockToken != nil {
             if session?.captureMode == .automatic, let next = nextPendingIndex {
                 scheduleIntermission(nextIndex: next)
+            } else {
+                releaseSessionLock()
             }
         }
     }
@@ -242,6 +306,7 @@ public final class CaptureEngine: ObservableObject {
             // L1: Pause do mất focus, sleep hoặc mất camera vẫn còn hiệu lực
             return
         }
+        guard prepareCaptureOrReport() else { return }
         if isIntermission {
             scheduleIntermission(nextIndex: captureIndex)
         } else {
@@ -250,10 +315,23 @@ public final class CaptureEngine: ObservableObject {
     }
 
     public func pauseFromNavigationHold(nextIndex: Int, kind: ShotKind) {
+        pauseAtIndex(nextIndex, kind: kind, reason: .user)
+    }
+
+    private func pauseAtIndex(_ index: Int, kind: ShotKind, reason: PauseReason) {
         timerToken += 1
-        state = .paused(reason: .user, nextIndex: nextIndex, kind: kind)
+        isNavigationSafePointHold = false
+        state = .paused(reason: reason, nextIndex: index, kind: kind)
         if let session {
-            try? sessions.setStatus(sessionID: session.id, status: .paused)
+            do {
+                if try sessions.getSession(id: session.id)?.status != .completed {
+                    try sessions.setStatus(sessionID: session.id, status: .paused)
+                }
+            } catch {
+                let failure = (error as? AppError) ?? .ioFailure(error.localizedDescription)
+                lastError = failure
+                state = .recoverableError(message: failure.message, captureIndex: index)
+            }
         }
         releaseSessionLock()
     }
@@ -262,6 +340,7 @@ public final class CaptureEngine: ObservableObject {
 
     public func startOrContinue() throws {
         guard canStart else { throw AppError.invalidState("Không thể bắt đầu ở trạng thái \(state)") }
+        try prepareCapture()
         guard let index = nextPendingIndex else {
             // Đủ ảnh → vào Review
             enterReview()
@@ -278,6 +357,7 @@ public final class CaptureEngine: ObservableObject {
             throw AppError.invalidState("Chế độ không phải thủ công")
         }
         guard case .ready = state else { throw AppError.invalidState("Chưa sẵn sàng") }
+        try prepareCapture()
         guard let index = nextPendingIndex else { enterReview(); return }
         pauseRequested = false
         pendingPauseReason = nil
@@ -300,15 +380,16 @@ public final class CaptureEngine: ObservableObject {
     public func pause(reason: PauseReason = .user) {
         switch state {
         case .countdown(_, let index, let kind):
-            timerToken += 1
-            state = .paused(reason: reason, nextIndex: index, kind: kind)
-            if let session { try? sessions.setStatus(sessionID: session.id, status: .paused) }
-            releaseSessionLock()
+            pauseAtIndex(index, kind: kind, reason: reason)
         case .intermission(let index, _):
-            timerToken += 1
-            state = .paused(reason: reason, nextIndex: index, kind: .normal)
-            if let session { try? sessions.setStatus(sessionID: session.id, status: .paused) }
-            releaseSessionLock()
+            pauseAtIndex(index, kind: .normal, reason: reason)
+        case .ready where isNavigationSafePointHold:
+            if let nextPendingIndex {
+                pauseAtIndex(nextPendingIndex, kind: .normal, reason: reason)
+            } else {
+                isNavigationSafePointHold = false
+                releaseSessionLock()
+            }
         case .capturing, .persisting:
             // Đợi safe point (§5.2 / L1) — sau persist sẽ apply
             pauseRequested = true
@@ -322,10 +403,11 @@ public final class CaptureEngine: ObservableObject {
         guard case .paused(_, let nextIndex, let kind) = state else {
             throw AppError.invalidState("Không ở trạng thái tạm dừng")
         }
+        try prepareCapture()
         pauseRequested = false
         switch kind {
         case .normal:
-            guard let index = nextPendingIndex ?? nextPendingIndexForced(nextIndex) else {
+            guard let index = nextPendingIndex else {
                 enterReview(); return
             }
             scheduleCountdown(seconds: countdownSeconds, index: index, kind: .normal)
@@ -356,19 +438,25 @@ public final class CaptureEngine: ObservableObject {
 
     public func beginRetake(index: Int, keepCrop: Bool = false) throws {
         guard case .reviewing = state else { throw AppError.invalidState("Chỉ retake trong Review") }
-        guard requiredIndices.contains(index) else { throw AppError.invalidState("Index không thuộc khung") }
+        try prepareCapture()
+        guard requiredIndices.contains(index) else {
+            releaseSessionLock()
+            throw AppError.invalidState("Index không thuộc khung")
+        }
         pendingRetakeKeepCrop = keepCrop
         scheduleCountdown(seconds: countdownSeconds, index: index, kind: .retake)
     }
 
     public func beginAdditionalShot(index: Int) throws {
         guard case .reviewing = state else { throw AppError.invalidState("Chỉ chụp bổ sung trong Review") }
+        try prepareCapture()
         scheduleCountdown(seconds: countdownSeconds, index: index, kind: .additional)
     }
 
     public func enterReview() {
+        guard prepareCaptureOrReport() else { return }
+        defer { releaseSessionLock() }
         timerToken += 1
-        releaseSessionLock()
         state = .reviewing
         if let session {
             let currentStatus = (try? sessions.getSession(id: session.id))?.status ?? session.status
@@ -385,9 +473,11 @@ public final class CaptureEngine: ObservableObject {
         guard case .recoverableError(_, let captureIndex) = state else { return }
         releaseSessionLock()
         if let ctx = lastShotContext, ctx.kind == .retake, ctx.captureIndex == captureIndex {
+            guard prepareCaptureOrReport() else { return }
             pendingRetakeKeepCrop = ctx.keepCrop
             scheduleCountdown(seconds: countdownSeconds, index: captureIndex, kind: .retake)
         } else if let ctx = lastShotContext, ctx.kind == .additional, ctx.captureIndex == captureIndex {
+            guard prepareCaptureOrReport() else { return }
             scheduleCountdown(seconds: countdownSeconds, index: captureIndex, kind: .additional)
         } else {
             state = .ready
@@ -435,7 +525,7 @@ public final class CaptureEngine: ObservableObject {
         guard let session, let snap = snapshot else { return }
         let sessionID = session.id
         let snapshotID = snap.id
-        acquireSessionLockIfNeeded(sessionID: session.id)
+        guard sessionLockToken != nil else { return }
         lastShotContext = ShotContext(sessionID: session.id, snapshotID: snap.id,
                                       captureIndex: index, kind: kind,
                                       keepCrop: pendingRetakeKeepCrop)
@@ -469,7 +559,7 @@ public final class CaptureEngine: ObservableObject {
         guard let session, let snap = snapshot else { return }
         let sessionID = session.id
         let snapshotID = snap.id
-        acquireSessionLockIfNeeded(sessionID: session.id)
+        guard sessionLockToken != nil else { return }
         timerToken += 1
         let token = timerToken
         let seconds = intervalSeconds
@@ -527,7 +617,7 @@ public final class CaptureEngine: ObservableObject {
     public func retryPendingSave() async {
         guard let pendingPhoto, pendingPhoto.sessionID == session?.id,
               case .recoverableError = state, !captureInFlight else { return }
-        acquireSessionLockIfNeeded(sessionID: pendingPhoto.sessionID)
+        guard prepareCaptureOrReport() else { return }
         pauseRequested = true
         pendingPauseReason = .user
         await performCapture(index: pendingPhoto.index, kind: pendingPhoto.kind,
@@ -535,7 +625,8 @@ public final class CaptureEngine: ObservableObject {
     }
 
     private func performCapture(index: Int, kind: ShotKind, token: Int, retry: PendingPhoto? = nil, expectedSessionID: String? = nil, expectedSnapshotID: String? = nil) async {
-        guard token == timerToken, !captureInFlight, !hasPhotoToSave || retry != nil else { return }
+        guard token == timerToken, sessionLockToken != nil,
+              !captureInFlight, !hasPhotoToSave || retry != nil else { return }
         guard let session, let snap = snapshot else {
             state = .recoverableError(message: "Không có phiên chụp", captureIndex: index)
             return
@@ -552,6 +643,11 @@ public final class CaptureEngine: ObservableObject {
                 state = .capturing(captureIndex: index, kind: kind)
                 let request = UUID()
                 let payload = try await camera.captureStill(requestID: request)
+                guard token == timerToken, self.session?.id == session.id, snapshot?.id == snap.id,
+                      state == .capturing(captureIndex: index, kind: kind) else { return }
+                guard payload.requestID == request.uuidString else {
+                    throw AppError.ioFailure("Ảnh trả về không khớp lượt chụp")
+                }
                 photo = PendingPhoto(sessionID: session.id, index: index, kind: kind,
                                      requestID: request.uuidString, payload: payload)
                 pendingPhoto = photo
@@ -576,7 +672,8 @@ public final class CaptureEngine: ObservableObject {
                 for slot in snap.slots where slot.captureIndex == index && !pendingRetakeKeepCrop {
                     try? sessions.setPlacement(sessionID: session.id, snapshotSlotID: slot.id,
                                                placement: PhotoPlacement(), cropMode: .autoFace,
-                                               manualOverride: false)
+                                               manualOverride: false, expectedSnapshotID: snap.id,
+                                               parentToken: sessionLockToken)
                 }
                 pendingRetakeKeepCrop = false
             }
@@ -584,6 +681,7 @@ public final class CaptureEngine: ObservableObject {
             // Safe point thoát / tạm dừng (§Bước 2 / L1): kiểm tra trước khi lên lịch lượt kế
             let currentStatus = (try? sessions.getSession(id: session.id))?.status ?? session.status
             if pauseRequested {
+                isNavigationSafePointHold = false
                 let reason = pendingPauseReason ?? .user
                 pauseRequested = false
                 pendingPauseReason = nil
@@ -607,7 +705,6 @@ public final class CaptureEngine: ObservableObject {
             }
 
             if isNavigationSafePointHold {
-                isNavigationSafePointHold = false
                 let required = session.captureIndices(in: snap)
                 if required.isSubset(of: Set(committedShots.keys)) {
                     if currentStatus != .completed {
@@ -616,12 +713,9 @@ public final class CaptureEngine: ObservableObject {
                     }
                     state = .reviewing
                     audio.handle(.completed)
-                    releaseSessionLock()
-                } else if session.captureMode == .manual {
-                    state = .ready
+                    isNavigationSafePointHold = false
                     releaseSessionLock()
                 } else {
-                    // Đợi quyết định từ dialog điều hướng (NAV-02)
                     state = .ready
                 }
                 return
@@ -653,13 +747,13 @@ public final class CaptureEngine: ObservableObject {
             pauseRequested = false
             pendingPauseReason = nil
             isNavigationSafePointHold = false
-            if !hasPhotoToSave { releaseSessionLock() }
             let failure = (error as? AppError) ?? .ioFailure(error.localizedDescription)
             lastError = failure
             state = .recoverableError(message: failure.message, captureIndex: index)
             if kind != .retake, (try? sessions.getSession(id: session.id)?.status) != .completed {
                 try? sessions.setStatus(sessionID: session.id, status: .paused)
             }
+            if !hasPhotoToSave { releaseSessionLock() }
             audio.handle(.warning)
         }
     }
@@ -677,38 +771,25 @@ public final class CaptureEngine: ObservableObject {
         }
     }
 
-    private func handleCameraEvent(_ event: CameraEvent) {
+    private func handleCameraEvent(_ event: CameraEvent) async {
         switch event {
-        case .deviceDisconnected, .interruptionStarted:
-            switch state {
-            case .countdown(_, let index, let kind):
-                // CAM-05/CAP-06: hủy đếm, không tạo photo, giữ ảnh đã chụp
-                timerToken += 1
-                state = .paused(reason: .cameraDisconnected, nextIndex: index, kind: kind)
-                audio.handle(.warning)
-            case .intermission(let index, _):
-                timerToken += 1
-                state = .paused(reason: .cameraDisconnected, nextIndex: index, kind: .normal)
-                audio.handle(.warning)
-            case .capturing, .persisting:
-                break // Capturing: đợi callback trong timeout; Saving: ưu tiên lưu an toàn
-            default:
-                break
-            }
-        case .fatalFailure(let message):
-            switch state {
-            case .capturing, .countdown, .intermission:
-                timerToken += 1
-                if case .capturing = state {
-                    state = .recoverableError(message: message, captureIndex: nextPendingIndex ?? 1)
-                } else {
-                    state = .paused(reason: .cameraDisconnected, nextIndex: nextPendingIndex ?? 1, kind: .normal)
-                }
-                audio.handle(.warning)
-            default:
-                break
-            }
+        case .deviceDisconnected(let id):
+            guard await camera.currentDevice?.uniqueID == id else { return }
+            pauseForCameraInterruption()
+        case .interruptionStarted, .fatalFailure:
+            pauseForCameraInterruption()
         case .pressureWarning:
+            audio.handle(.warning)
+        default:
+            break
+        }
+    }
+
+    private func pauseForCameraInterruption() {
+        guard !pauseRequested else { return }
+        switch state {
+        case .countdown, .intermission, .capturing, .persisting:
+            pause(reason: .cameraDisconnected)
             audio.handle(.warning)
         default:
             break
@@ -735,9 +816,7 @@ public final class CaptureEngine: ObservableObject {
         })
     }
 
-    private func nextPendingIndexForced(_ fallback: Int) -> Int? {
-        nextPendingIndex ?? (requiredIndices.contains(fallback) ? fallback : nil)
-    }
+
 }
 
 #if DEBUG

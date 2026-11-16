@@ -81,6 +81,19 @@ final class AcceptanceMatrixTests: XCTestCase {
         return (fresh, snapshot, revs)
     }
 
+    @MainActor
+    func testPB01StaleCaptureCannotReviveSessionMovedToTrash() async throws {
+        let setup = try await createCompleted4PhotoSession()
+        XCTAssertTrue(env.engine.adoptSession(record: setup.session, snapshot: setup.snapshot,
+                                             committed: setup.revisions))
+        env.engine.setStateForTesting(.paused(reason: .user, nextIndex: 1, kind: .normal))
+        try env.trashService.trashSession(sessionID: setup.session.id)
+        XCTAssertThrowsError(try env.engine.resume())
+        XCTAssertThrowsError(try env.sessions.setStatus(sessionID: setup.session.id, status: .inProgress))
+        XCTAssertEqual(try env.sessions.getSession(id: setup.session.id)?.status, .trashed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: env.layout.sessionDir(setup.session.id).path))
+    }
+
     // MARK: - LIB-01: Xoá riêng ô 2, xoá ô 2 và 4 cùng lúc, giữ phiên
     @MainActor
     func testLIB01_DeleteIndividualAndMultiplePhotos_KeepSession() async throws {

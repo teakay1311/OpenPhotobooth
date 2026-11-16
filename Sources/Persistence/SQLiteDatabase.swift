@@ -96,23 +96,17 @@ public final class SQLiteDatabase: @unchecked Sendable {
         return sqlite3_exec(h, sql, nil, nil, nil) == SQLITE_OK
     }
 
-    public func integrityCheck() -> String? {
-        queue.sync {
-            guard let rows = try? self._query("PRAGMA integrity_check", []) else { return nil }
-            if let first = rows.first, case .text(let v) = first["integrity_check"] ?? .text("") {
-                return v == "ok" ? nil : v
-            }
-            return nil
+    public func integrityCheck() throws -> String? {
+        let rows = try query("PRAGMA integrity_check")
+        let messages = rows.compactMap { $0["integrity_check"]?.stringValue }
+        guard !messages.isEmpty, messages.allSatisfy({ !$0.isEmpty }) else {
+            throw AppError.databaseCorrupt("integrity_check không trả kết quả")
         }
+        return messages == ["ok"] ? nil : messages.joined(separator: "\n")
     }
 
-    public func foreignKeyCheck() -> [String] {
-        queue.sync {
-            let rows = (try? self._query("PRAGMA foreign_key_check", [])) ?? []
-            return rows.map { row in
-                (row["table"].flatMap { if case .text(let t) = $0 { return t } else { return nil } } ?? "?") + ":violation"
-            }
-        }
+    public func foreignKeyCheck() throws -> [String] {
+        try query("PRAGMA foreign_key_check").map { ($0["table"]?.stringValue ?? "?") + ":violation" }
     }
 
     // MARK: public API

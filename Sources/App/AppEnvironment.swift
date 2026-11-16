@@ -259,6 +259,7 @@ public final class AppEnvironment: ObservableObject {
     /// Forward thay đổi state engine sang env để mọi view observe env thấy cập nhật realtime
     /// (countdown từng giây, "Đang chụp…", thumbnail mới — P1-9).
     private var engineChangeCancellable: AnyCancellable?
+    private var captureLeaveCancellable: AnyCancellable?
 
     public struct FrameEditorContext: Equatable {
         public var frameID: String?
@@ -628,6 +629,23 @@ public final class AppEnvironment: ObservableObject {
             engine.pauseFromNavigationHold(nextIndex: hold.captureIndex, kind: hold.kind)
         } else {
             engine.pause(reason: .user)
+            if engine.isCaptureBusy {
+                captureLeaveCancellable = engine.$state.dropFirst().sink { [weak self] _ in
+                    Task { @MainActor [weak self] in self?.finishCaptureLeaveIfReady() }
+                }
+                return
+            }
+        }
+        finishCaptureLeaveIfReady()
+    }
+
+    private func finishCaptureLeaveIfReady() {
+        guard !engine.isCaptureBusy else { return }
+        captureLeaveCancellable = nil
+        if engine.hasPhotoToSave {
+            pendingNavigationRoute = nil
+            pendingSettingsSection = nil
+            return
         }
         if let target = pendingNavigationRoute {
             pendingNavigationRoute = nil
@@ -689,11 +707,8 @@ public final class AppEnvironment: ObservableObject {
         let token = try coordinator.acquire(key: "session:\(sessionID)", reason: "completeSession", parentToken: parentToken)
         defer { token.release() }
 
-        guard let detail = try sessions.getDetail(sessionID: sessionID) else {
-            throw AppError.notFound("Phiên chụp \(sessionID) không tồn tại")
-        }
-        guard detail.session.status != .trashed && detail.session.status != .purging else {
-            throw AppError.invalidState("Phiên chụp đã bị đưa vào Thùng rác")
+        guard let detail = try sessions.activeCaptureDetail(sessionID: sessionID) else {
+            throw AppError.notFound("Phiên chụp không tồn tại hoặc đã bị đưa vào Thùng rác")
         }
         if detail.needsPhotoSelection { throw AppError.invalidState("Chọn ảnh vào khung trước") }
         guard detail.hasEnoughPhotos else {

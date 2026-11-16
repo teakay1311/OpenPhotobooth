@@ -37,6 +37,57 @@ final class ComprehensiveVerificationTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testPB03OnlySelectedCameraDisconnectPausesAndUnlocksSession() async throws {
+        let camera = FakeCameraService()
+        env = AppEnvironment(inMemory: true, camera: camera)
+        try FrameSeeder.seedIfNeeded(db: env.db, frameRepo: env.frames, presetRepo: env.presets, assets: env.assets)
+        _ = try await camera.selectDevice("fake-built-in")
+        let frame = try XCTUnwrap(env.frames.listReadyFrames().first)
+        let snapshot = try env.frames.createSnapshot(frameID: frame.id)
+        let record = try env.engine.beginSession(snapshot: snapshot, mode: .automatic, cameraID: "fake-built-in",
+                                                 defaults: env.settings.sessionDefaultsSnapshot(), countdown: 10, interval: 0)
+        try env.engine.startOrContinue()
+        let key = "session:\(record.id)"
+        camera.post(.deviceDisconnected("fake-usb"))
+        try await Task.sleep(for: .milliseconds(60))
+        XCTAssertTrue(env.coordinator.isBusy(key: key).busy)
+        if case .countdown = env.engine.state {} else { XCTFail("Unrelated camera canceled countdown") }
+
+        camera.simulateDisconnect()
+        let deadline = ContinuousClock.now + .seconds(2)
+        while env.coordinator.isBusy(key: key).busy, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(env.engine.state, .paused(reason: .cameraDisconnected, nextIndex: 1, kind: .normal))
+        XCTAssertFalse(env.coordinator.isBusy(key: key).busy)
+        XCTAssertEqual(try env.sessions.getSession(id: record.id)?.status, .paused)
+    }
+
+    @MainActor
+    func testPB08SQLiteChecksDistinguishCleanViolationAndFailure() async throws {
+        let recovery = RecoveryService(db: env.db, layout: env.layout, sessions: env.sessions, trashRepo: env.trashRepo)
+        var report = RecoveryService.Report()
+        await recovery.checkDatabase(into: &report)
+        XCTAssertTrue(report.issues.isEmpty)
+
+        try env.db.run("CREATE TABLE qa_parent(id INTEGER PRIMARY KEY)")
+        try env.db.run("CREATE TABLE qa_child(parent_id REFERENCES qa_parent(id))")
+        try env.db.run("PRAGMA foreign_keys=OFF")
+        try env.db.run("INSERT INTO qa_child VALUES(123)")
+        try env.db.run("PRAGMA foreign_keys=ON")
+        await recovery.checkDatabase(into: &report)
+        XCTAssertEqual(report.issues, ["foreign_key_check: 1 vi phạm"])
+
+        try env.db.run("CREATE TABLE qa_bad_parent(id INTEGER)")
+        try env.db.run("CREATE TABLE qa_bad_child(parent_id REFERENCES qa_bad_parent(id))")
+        XCTAssertNil(try env.db.integrityCheck())
+        report = RecoveryService.Report()
+        await recovery.checkDatabase(into: &report)
+        XCTAssertEqual(report.issues.count, 1)
+        XCTAssertTrue(report.issues.first?.hasPrefix("Không chạy được foreign_key_check") == true)
+    }
+
     // MARK: - 2.1 E2E-01: Luồng dữ liệu xuyên suốt 1
     @MainActor
     func testE2E01_FullLoop_Capture_Crop_Export_Revision() async throws {
@@ -255,8 +306,8 @@ final class ComprehensiveVerificationTests: XCTestCase {
         let recovery = RecoveryService(db: env.db, layout: env.layout, sessions: env.sessions, trashRepo: env.trashRepo)
         let report = await recovery.runOnLaunch()
         XCTAssertFalse(report.hasProblems)
-        XCTAssertNil(env.db.integrityCheck())
-        XCTAssertTrue(env.db.foreignKeyCheck().isEmpty)
+        XCTAssertNil(try env.db.integrityCheck())
+        XCTAssertTrue(try env.db.foreignKeyCheck().isEmpty)
     }
 
     // MARK: - 2.2 FR-01: Xác thực tệp ảnh nhập khung (Magic bytes & Alpha)
@@ -596,8 +647,8 @@ final class ComprehensiveVerificationTests: XCTestCase {
         XCTAssertFalse(sessionDirExists)
 
         // 5. Kiểm tra toàn vẹn SQLite
-        XCTAssertNil(env.db.integrityCheck(), "Database PRAGMA integrity_check failed")
-        XCTAssertTrue(env.db.foreignKeyCheck().isEmpty, "Database PRAGMA foreign_key_check failed")
+        XCTAssertNil(try env.db.integrityCheck(), "Database PRAGMA integrity_check failed")
+        XCTAssertTrue(try env.db.foreignKeyCheck().isEmpty, "Database PRAGMA foreign_key_check failed")
     }
 
     // MARK: - D2-A02: Khởi tạo kho lỗi và khôi phục

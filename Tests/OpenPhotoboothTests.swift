@@ -30,9 +30,9 @@ final class OpenPhotoboothTests: XCTestCase {
 
     func testSQLiteDatabaseInMemory() throws {
         let db = try SQLiteDatabase(path: ":memory:")
-        let integrity = db.integrityCheck()
+        let integrity = try db.integrityCheck()
         XCTAssertNil(integrity) // nil means "ok"
-        let fk = db.foreignKeyCheck()
+        let fk = try db.foreignKeyCheck()
         XCTAssertTrue(fk.isEmpty)
     }
 

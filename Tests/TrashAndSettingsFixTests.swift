@@ -81,6 +81,44 @@ final class TrashAndSettingsFixTests: XCTestCase {
         try FileManager.default.moveItem(at: source, to: env.layout.sessionDir(id))
     }
 
+    func testPB01LegacySplitIsReportedWithoutMovingOrChangingData() async throws {
+        let (id, item) = try await seedSessionInTrash()
+        try env.db.run("UPDATE sessions SET status='in_progress' WHERE id=?", [.text(id)])
+        let photo = try storedPhoto(id)
+        let original = env.layout.trashSessionsDir.appendingPathComponent(id)
+            .appendingPathComponent("Originals").appendingPathComponent(URL(fileURLWithPath: photo.relativePath).lastPathComponent)
+        let before = try Data(contentsOf: original)
+
+        let report = try env.trashService.recoverOperations()
+        XCTAssertTrue(report.excludedSessions.contains(id))
+        XCTAssertFalse(report.issues.isEmpty)
+        try env.sessions.convertTransientToPaused()
+        XCTAssertNil(try env.sessions.activeCaptureDetail(sessionID: id))
+        XCTAssertNil(try env.sessions.latestRecoverableSession())
+        XCTAssertThrowsError(try env.trashService.restore(item))
+        XCTAssertEqual(try env.sessions.getSession(id: id)?.status, .inProgress)
+        XCTAssertEqual(try env.trashRepo.getItem(id: item.id)?.status, .trashed)
+        XCTAssertEqual(try Data(contentsOf: original), before)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: env.layout.sessionDir(id).path))
+    }
+
+    func testPB11MissingSnapshotLayerBlocksRestoreBeforeMovingFiles() async throws {
+        let (id, item) = try await seedSessionInTrash()
+        let detail = try XCTUnwrap(env.sessions.getDetail(sessionID: id))
+        let layer = try XCTUnwrap(detail.snapshot.foreground ?? detail.snapshot.background)
+        let row = try XCTUnwrap(env.db.query("SELECT relative_path FROM assets WHERE id=?", [.text(layer.assetID)]).first)
+        let layerURL = try env.layout.absoluteURL(forRelativePath: row["relative_path"].stringValue)
+        try FileManager.default.removeItem(at: layerURL)
+
+        XCTAssertThrowsError(try env.trashService.restore(item)) { error in
+            XCTAssertEqual(error as? AppError, .missingFrameAssets)
+        }
+        XCTAssertEqual(try env.sessions.getSession(id: id)?.status, .trashed)
+        XCTAssertEqual(try env.trashRepo.getItem(id: item.id)?.status, .trashed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: env.layout.sessionDir(id).path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: env.layout.trashSessionsDir.appendingPathComponent(id).path))
+    }
+
     func testAUD01RecoversInterruptedRestoreAndPreservesRevision() async throws {
         let root = tempDir.appendingPathComponent("recovery-store", isDirectory: true)
         let prefs = try XCTUnwrap(UserDefaults(suiteName: "test-recovery-\(UUID().uuidString)"))
@@ -105,7 +143,7 @@ final class TrashAndSettingsFixTests: XCTestCase {
         XCTAssertEqual(try storedPhoto(id).id, original.id)
         XCTAssertEqual(Hashing.sha256Hex(fileURL: try env.sessions.fileURL(for: original)), original.sha256)
         XCTAssertNil(try env.trashRepo.getItem(id: item.id))
-        XCTAssertTrue(env.db.foreignKeyCheck().isEmpty)
+        XCTAssertTrue(try env.db.foreignKeyCheck().isEmpty)
     }
 
     func testAUD01LegacyPurgeRequiresRetryAndKeepsBytes() async throws {
@@ -150,8 +188,8 @@ final class TrashAndSettingsFixTests: XCTestCase {
         try env.trashService.restore(otherItem)
         XCTAssertEqual(Hashing.sha256Hex(fileURL: try env.sessions.fileURL(for: otherRevision)), otherRevision.sha256)
         XCTAssertEqual(Hashing.sha256Hex(fileURL: outsideFile), exportHash)
-        XCTAssertNil(env.db.integrityCheck())
-        XCTAssertTrue(env.db.foreignKeyCheck().isEmpty)
+        XCTAssertNil(try env.db.integrityCheck())
+        XCTAssertTrue(try env.db.foreignKeyCheck().isEmpty)
     }
 
     func testAUD01ConflictingDirectoriesAreLeftUntouched() async throws {
@@ -234,7 +272,7 @@ final class TrashAndSettingsFixTests: XCTestCase {
         XCTAssertEqual(env.trashService.purgeResult(item), .processed)
         XCTAssertNil(try env.trashRepo.getItem(id: item.id))
         XCTAssertNil(try env.sessions.getSession(id: id))
-        XCTAssertTrue(env.db.foreignKeyCheck().isEmpty)
+        XCTAssertTrue(try env.db.foreignKeyCheck().isEmpty)
     }
 
     func testAUD01RestoreAndAutomaticPurgeAtExactExpiration() async throws {

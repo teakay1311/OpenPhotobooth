@@ -39,11 +39,8 @@ public final class SafetySaveService: @unchecked Sendable {
         defer { opToken.release() }
 
         // L7: Dưới khóa, tải phiên theo ID. Phiên mất, .trashed hoặc .purging bị từ chối trước intent, tệp tạm hoặc tài nguyên đích.
-        guard let sessionRecord = try sessions.getSession(id: sessionID) else {
-            throw AppError.notFound("session \(sessionID)")
-        }
-        if sessionRecord.status == .trashed || sessionRecord.status == .purging {
-            throw AppError.invalidState("Phiên chụp đã bị đưa vào Thùng rác")
+        guard try sessions.activeSession(id: sessionID) != nil else {
+            throw AppError.invalidState("Phiên chụp không còn hoạt động")
         }
 
         let sha = Hashing.sha256Hex(payloadData)

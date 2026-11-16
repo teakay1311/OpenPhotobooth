@@ -216,7 +216,15 @@ public final class TrashService: @unchecked Sendable {
                 throw AppError.trashExpired("Mục đã quá hạn 30 ngày trong Thùng rác")
             }
             let paths = fresh.rootType == .session ? try sessionPaths(fresh.rootID) : nil
+            let detail = fresh.rootType == .session
+                ? try SessionRepository(db: db, layout: layout).getDetail(sessionID: fresh.rootID) : nil
             if let paths {
+                guard let detail else { throw AppError.notFound("Phiên chụp \(fresh.rootID)") }
+                for layer in [detail.snapshot.background, detail.snapshot.foreground].compactMap({ $0 }) {
+                    guard (try? assets.loadVerifiedImage(assetID: layer.assetID)) != nil else {
+                        throw AppError.missingFrameAssets
+                    }
+                }
                 guard !paths.inActive else { throw AppError.invalidState("Phiên có dữ liệu ở vị trí đang hoạt động") }
                 try validateSessionFiles(fresh.rootID, at: paths.inTrash ? paths.trash : nil, currentOnly: true)
             }
@@ -237,7 +245,6 @@ public final class TrashService: @unchecked Sendable {
                     try FileManager.default.moveItem(at: paths.trash, to: paths.active)
                     moved = true
                 }
-                let detail = fresh.rootType == .session ? try SessionRepository(db: db, layout: layout).getDetail(sessionID: fresh.rootID) : nil
                 try db.withTransaction { tx in
                     switch fresh.rootType {
                     case .session:

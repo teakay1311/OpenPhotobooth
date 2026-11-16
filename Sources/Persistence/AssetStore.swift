@@ -115,6 +115,39 @@ public final class AssetStore: @unchecked Sendable {
         return img
     }
 
+    func loadVerifiedImage(assetID: String) throws -> CGImage {
+        guard let info = assetInfo(assetID: assetID) else { throw AppError.missingFrameAssets }
+        let data = try loadData(assetID: assetID)
+        guard Hashing.sha256Hex(data) == info.sha256,
+              let image = CGImage.createFrom(data: data) else { throw AppError.frameFileCorrupt }
+        return image
+    }
+
+    static func validatedFrameImage(_ data: Data, minimumDimension: Int = 1) throws
+        -> (image: CGImage, mediaType: String) {
+        guard data.count <= ResourceLimits.maxAssetBytes else {
+            throw AppError.resourceLimitExceeded("Tệp ảnh vượt giới hạn dung lượng")
+        }
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let type = CGImageSourceGetType(source) as String?,
+              type == UTType.png.identifier || type == UTType.jpeg.identifier,
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = props[kCGImagePropertyPixelWidth] as? Int,
+              let height = props[kCGImagePropertyPixelHeight] as? Int else {
+            throw AppError.frameFileCorrupt
+        }
+        guard (minimumDimension...ResourceLimits.canvasMax).contains(width),
+              (minimumDimension...ResourceLimits.canvasMax).contains(height),
+              Double(width) * Double(height) <= ResourceLimits.maxMegapixels * 1_000_000 else {
+            throw AppError.resourceLimitExceeded("Kích thước ảnh vượt giới hạn cho phép")
+        }
+        guard CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete,
+              let image = CGImageSourceCreateImageAtIndex(source, 0, [
+                kCGImageSourceShouldCacheImmediately: true
+              ] as CFDictionary) else { throw AppError.frameFileCorrupt }
+        return (image, type == UTType.png.identifier ? "image/png" : "image/jpeg")
+    }
+
     public func assetInfo(assetID: String) -> StoredAsset? {
         let rows = (try? db.query("SELECT id, sha256, relative_path, width, height FROM assets WHERE id=?", [.text(assetID)])) ?? []
         guard let r = rows.first else { return nil }
