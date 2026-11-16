@@ -323,6 +323,7 @@ public final class FullscreenViewModel: ObservableObject {
     @Published public private(set) var idleSecondsLeft: Int?
     @Published public private(set) var isStarting = false
     @Published public private(set) var isFinishing = false
+    @Published public private(set) var exitRequested = false
     @Published public var shareSheetOpen = false
     @Published public private(set) var reviewVM: ReviewViewModel?
 
@@ -374,11 +375,15 @@ public final class FullscreenViewModel: ObservableObject {
     }
 
     public func beginShooting() async {
-        guard !isStarting, !engine.isCaptureBusy, !engine.hasPhotoToSave,
+        guard !exitRequested, !isStarting, !engine.isCaptureBusy, !engine.hasPhotoToSave,
               let selectedFrameID, readyFrames.contains(where: { $0.id == selectedFrameID }),
               captureVM.isCameraReady else { return }
         isStarting = true
-        defer { isStarting = false }
+        defer {
+            isStarting = false
+            finishExitIfReady()
+        }
+        guard await env.capturePreview.confirmVideoFallback(), !exitRequested, !Task.isCancelled else { return }
 
         engine.keepSessionAndExit()
         captureVM.selectFrame(selectedFrameID)
@@ -397,21 +402,24 @@ public final class FullscreenViewModel: ObservableObject {
     }
 
     public func openReview() async {
-        guard reviewVM == nil, let id = engine.session?.id else { return }
+        guard !exitRequested, reviewVM == nil, let id = engine.session?.id else { return }
         let vm = ReviewViewModel(env: env)
         reviewVM = vm
         await vm.load(sessionID: id)
-        guard env.showFullscreen, engine.session?.id == id else { return }
+        guard env.showFullscreen, !exitRequested, engine.session?.id == id else { return }
         step = .review
     }
 
     public func finish() async {
-        guard !isFinishing, let id = reviewVM?.detail?.session.id else { return }
+        guard !exitRequested, !isFinishing, let id = reviewVM?.detail?.session.id else { return }
         isFinishing = true
-        defer { isFinishing = false }
+        defer {
+            isFinishing = false
+            finishExitIfReady()
+        }
         do {
             _ = try await env.completeSession(sessionID: id)
-            if env.showFullscreen { step = .finish }
+            if env.showFullscreen, !exitRequested { step = .finish }
         } catch {
             env.showToast((error as? AppError)?.message ?? "Không thể hoàn thành phiên", kind: .warning)
         }
@@ -457,12 +465,21 @@ public final class FullscreenViewModel: ObservableObject {
     }
 
     public func exitFullscreenRequested() {
-        // Đang capture → tạm dừng và giữ phiên, không tự hủy (§14.1, FS-02)
-        if engine.isCaptureBusy {
-            engine.pause()
-        } else if engine.session != nil {
-            engine.keepSessionAndExit()
-        }
+        guard !exitRequested else { return }
+        exitRequested = true
         pauseIdleTimer()
+        if engine.isCaptureBusy { engine.pause() }
+        finishExitIfReady()
+    }
+
+    func finishExitIfReady() {
+        guard exitRequested, !engine.isCaptureBusy, !isStarting, !isFinishing else { return }
+        if engine.hasPhotoToSave {
+            exitRequested = false
+            env.showToast("Thử lưu lại ảnh trước khi thoát toàn màn hình", kind: .warning)
+            return
+        }
+        if engine.session != nil { engine.keepSessionAndExit() }
+        env.showFullscreen = false
     }
 }

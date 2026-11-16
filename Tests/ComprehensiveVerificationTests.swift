@@ -97,6 +97,26 @@ final class ComprehensiveVerificationTests: XCTestCase {
         XCTAssertTrue(report.issues.first?.hasPrefix("Không chạy được foreign_key_check") == true)
     }
 
+    func testPB14ConfigurationDoesNotUnlockWhenAcquisitionFails() throws {
+        var attempts = 0
+        var unlocks = 0
+        var applies = 0
+        func acquire() throws {
+            attempts += 1
+            if attempts <= 2 { throw AppError.cameraBusy }
+        }
+        for _ in 0..<2 {
+            XCTAssertThrowsError(try CameraService.withDeviceConfigurationLock(
+                lock: acquire, unlock: { unlocks += 1 }, { applies += 1 }))
+        }
+        XCTAssertEqual(applies, 0)
+        XCTAssertEqual(unlocks, 0)
+        try CameraService.withDeviceConfigurationLock(
+            lock: acquire, unlock: { unlocks += 1 }, { applies += 1 })
+        XCTAssertEqual(applies, 1)
+        XCTAssertEqual(unlocks, 1)
+    }
+
     // MARK: - 2.1 E2E-01: Luồng dữ liệu xuyên suốt 1
     @MainActor
     func testE2E01_FullLoop_Capture_Crop_Export_Revision() async throws {

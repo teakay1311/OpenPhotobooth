@@ -39,6 +39,7 @@ public final class AppEnvironment: ObservableObject {
     @Published public var isProcessingBannerAction: Bool = false
     @Published public var toast: ToastMessage?
     @Published public var showFullscreen = false
+    @Published var nativeFullscreenExitRequest = 0
     @Published public var frameEditorDraft: FrameEditorContext?
     @Published public var showPackImport = false
     public var pendingPackURL: URL?

@@ -66,6 +66,42 @@ final class CapturePhotoSelectionTests: XCTestCase {
         await camera.stopPreview()
     }
 
+    func testPB16KioskWaitsForInFlightPhotoBeforeClosing() async throws {
+        let camera = FakeCameraService()
+        let env = AppEnvironment(inMemory: true, camera: camera)
+        await env.boot()
+        let capture = CaptureViewModel(env: env)
+        capture.countdown = 0
+        await capture.retryCamera()
+        env.showFullscreen = true
+        let vm = FullscreenViewModel(env: env, captureVM: capture)
+        vm.enterFullscreen()
+        vm.step = .selectFrame
+        vm.selectedFrameID = try XCTUnwrap(vm.readyFrames.first(where: { $0.frame.name == "Cặp ảnh ngang" })?.id)
+        await vm.beginShooting()
+        let id = try XCTUnwrap(env.engine.session?.id)
+        let deadline = ContinuousClock.now + .seconds(3)
+        while env.engine.state != .capturing(captureIndex: 1, kind: .normal), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(env.engine.state, .capturing(captureIndex: 1, kind: .normal))
+
+        vm.exitFullscreenRequested()
+        vm.exitFullscreenRequested()
+        XCTAssertTrue(env.showFullscreen)
+        XCTAssertTrue(vm.exitRequested)
+        while env.engine.isCaptureBusy, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        vm.finishExitIfReady()
+        XCTAssertFalse(env.showFullscreen)
+        let detail = try XCTUnwrap(env.sessions.getDetail(sessionID: id))
+        XCTAssertEqual(detail.currentRevisions().keys.sorted(), [1])
+        XCTAssertEqual(detail.session.status, .paused)
+        XCTAssertFalse(env.coordinator.isBusy(key: "session:\(id)").busy)
+        await camera.stopPreview()
+    }
+
     func testCaptureSettingsFollowSelectedFrameAndColor() async throws {
         let env = AppEnvironment(inMemory: true)
         await env.boot()

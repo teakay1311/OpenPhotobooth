@@ -70,6 +70,15 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
         }
     }}
 
+    public var activeResolution: String? { get async {
+        await withCheckedContinuation { cont in
+            sessionQueue.async { [self] in
+                let dims = selectedDevice.map { CMVideoFormatDescriptionGetDimensions($0.activeFormat.formatDescription) }
+                cont.resume(returning: dims.map { "\($0.width)x\($0.height)" })
+            }
+        }
+    }}
+
     public var isFallbackVideoStill: Bool { get async {
         await withCheckedContinuation { cont in
             sessionQueue.async { [weak self] in cont.resume(returning: self?.fallbackStill ?? false) }
@@ -132,7 +141,8 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
         }
         let fmt = device.activeFormat
         let dims = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
-        let stillSupported = Self.supportsStill(device: device)
+        let stillSupported = device.uniqueID == selectedDevice?.uniqueID
+            ? !fallbackStill : !fmt.supportedMaxPhotoDimensions.isEmpty
         var allResolutions: [CGSize] = []
         for f in device.formats {
             let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
@@ -165,9 +175,16 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
                                 capabilities: caps)
     }
 
-    private static func supportsStill(device: AVCaptureDevice) -> Bool {
-        // Ảnh still hỗ trợ trên hầu hết thiết bị; Continuity/USB cũ có thể chỉ có video.
-        true
+    private func updatePhotoOutput(for device: AVCaptureDevice) {
+        let dims = device.activeFormat.supportedMaxPhotoDimensions.max {
+            Int64($0.width) * Int64($0.height) < Int64($1.width) * Int64($1.height)
+        }
+        let connection = photoOutput.connection(with: .video)
+        fallbackStill = !session.outputs.contains(photoOutput) || connection == nil || dims == nil
+        if !fallbackStill, let dims {
+            connection?.isEnabled = true
+            photoOutput.maxPhotoDimensions = dims
+        }
     }
 
     // MARK: - Select device (§4.2)
@@ -221,7 +238,13 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
         }
         stopPreviewLocked()
         session.beginConfiguration()
-        defer { session.commitConfiguration() }
+        defer {
+            session.commitConfiguration()
+            if selectedDevice?.uniqueID == device.uniqueID {
+                updatePhotoOutput(for: device)
+                if let desc = makeDescriptor(from: device) { capabilities = desc.capabilities }
+            }
+        }
         if let oldInput = currentInput {
             session.removeInput(oldInput)
             currentInput = nil
@@ -231,23 +254,10 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
         baselineFormat = nil
         guard session.canAddInput(input) else { throw AppError.cameraConfigurationFailed("Không thêm được input") }
         session.addInput(input)
-        if session.canAddOutput(photoOutput) {
-            session.addOutput(photoOutput)
-            // maxPhotoDimensions theo availability (§1.2 — API đời cũ deprecate)
-            if photoOutput.maxPhotoDimensions.width == 0 {
-                let dims = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
-                photoOutput.maxPhotoDimensions = CMVideoDimensions(width: dims.width, height: dims.height)
-            }
-        }
-        let conn = photoOutput.connection(with: .video)
-        conn?.isEnabled = true
+        if session.canAddOutput(photoOutput) { session.addOutput(photoOutput) }
         currentInput = input
         selectedDevice = device
         baselineFormat = device.activeFormat
-        if let desc = makeDescriptor(from: device) {
-            capabilities = desc.capabilities
-            fallbackStill = !desc.capabilities.supportsStillPhoto
-        }
         Log.camera.info("Đã chọn camera: \(device.localizedName, privacy: .public)")
     }
 
@@ -447,6 +457,13 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
 
     // MARK: - Controls (§4.4)
 
+    static func withDeviceConfigurationLock<T>(lock: () throws -> Void, unlock: () -> Void,
+                                               _ body: () -> T) throws -> T {
+        try lock()
+        defer { unlock() }
+        return body()
+    }
+
     public func applyControls(_ controls: CameraControls) async throws -> AppliedControls {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<AppliedControls, Error>) in
             sessionQueue.async { [weak self] in
@@ -454,97 +471,79 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
                     cont.resume(throwing: AppError.noCamera)
                     return
                 }
-                var applied = AppliedControls()
                 do {
-                    try device.lockForConfiguration()
-                    if let focus = controls.focusLocked, device.isFocusModeSupported(focus ? .locked : .continuousAutoFocus) {
-                        device.focusMode = focus ? .locked : .continuousAutoFocus
-                        applied.focusLocked = focus
-                    }
-                    if let exposure = controls.exposureLocked {
-                        if exposure && device.isExposureModeSupported(.custom) {
-                            device.exposureMode = .custom
-                            applied.exposureLocked = true
-                        } else if !exposure && device.isExposureModeSupported(.continuousAutoExposure) {
-                            device.exposureMode = .continuousAutoExposure
-                            applied.exposureLocked = false
+                    let applied = try Self.withDeviceConfigurationLock(
+                        lock: device.lockForConfiguration, unlock: device.unlockForConfiguration
+                    ) {
+                        var applied = AppliedControls()
+                        if let focus = controls.focusLocked, device.isFocusModeSupported(focus ? .locked : .continuousAutoFocus) {
+                            device.focusMode = focus ? .locked : .continuousAutoFocus
+                            applied.focusLocked = focus
                         }
+                        if let exposure = controls.exposureLocked {
+                            if exposure && device.isExposureModeSupported(.custom) {
+                                device.exposureMode = .custom
+                                applied.exposureLocked = true
+                            } else if !exposure && device.isExposureModeSupported(.continuousAutoExposure) {
+                                device.exposureMode = .continuousAutoExposure
+                                applied.exposureLocked = false
+                            }
+                        }
+                        if let wb = controls.whiteBalanceLocked, device.isWhiteBalanceModeSupported(wb ? .locked : .continuousAutoWhiteBalance) {
+                            device.whiteBalanceMode = wb ? .locked : .continuousAutoWhiteBalance
+                            applied.whiteBalanceLocked = wb
+                        }
+                        if let fps = controls.frameRate, device.activeFormat.videoSupportedFrameRateRanges.contains(where: { fps >= $0.minFrameRate && fps <= $0.maxFrameRate }) {
+                            let duration = CMTime(seconds: 1.0 / fps, preferredTimescale: 600)
+                            device.activeVideoMinFrameDuration = duration
+                            device.activeVideoMaxFrameDuration = duration
+                            applied.frameRate = fps
+                        }
+                        return applied
                     }
-                    if let wb = controls.whiteBalanceLocked, device.isWhiteBalanceModeSupported(wb ? .locked : .continuousAutoWhiteBalance) {
-                        device.whiteBalanceMode = wb ? .locked : .continuousAutoWhiteBalance
-                        applied.whiteBalanceLocked = wb
-                    }
-                    if let fps = controls.frameRate, device.activeFormat.videoSupportedFrameRateRanges.contains(where: { fps >= $0.minFrameRate && fps <= $0.maxFrameRate }) {
-                        let duration = CMTime(seconds: 1.0 / fps, preferredTimescale: 600)
-                        device.activeVideoMinFrameDuration = duration
-                        device.activeVideoMaxFrameDuration = duration
-                        applied.frameRate = fps
-                    }
-                    device.unlockForConfiguration()
                     cont.resume(returning: applied)
                 } catch {
-                    // Cấu hình thất bại phải revert hiển thị giá trị cũ (§4.4) — caller đọc lại controls
-                    try? device.lockForConfiguration()
-                    applied = AppliedControls(
-                        focusLocked: device.focusMode == .locked,
-                        exposureLocked: device.exposureMode == .custom,
-                        whiteBalanceLocked: device.whiteBalanceMode == .locked)
-                    device.unlockForConfiguration()
-                    cont.resume(returning: applied)
+                    cont.resume(throwing: AppError.cameraConfigurationFailed(error.localizedDescription))
                 }
             }
         }
     }
 
-    private var configuredResolution: String = "best"
-
     public func setResolution(_ resolution: String) async throws {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            sessionQueue.async { [weak self] in
-                guard let self else { cont.resume(throwing: AppError.cameraBusy); return }
-                self.configuredResolution = resolution
-                guard let device = self.selectedDevice else {
+            sessionQueue.async { [self] in
+                guard let device = selectedDevice else {
                     cont.resume()
                     return
                 }
-                if resolution == "best" {
-                    if let baseline = self.baselineFormat {
-                        do {
-                            try device.lockForConfiguration()
-                            device.activeFormat = baseline
-                            device.unlockForConfiguration()
-                            Log.camera.info("Đã khôi phục Best Stable format: \(device.localizedName, privacy: .public)")
-                        } catch {
-                            Log.camera.warning("Không khôi phục được Best Stable format: \(error.localizedDescription, privacy: .public)")
-                        }
-                    }
-                    cont.resume()
+                guard let baselineFormat else {
+                    cont.resume(throwing: AppError.noCamera)
                     return
                 }
-                let parts = resolution.split(separator: "x")
-                if parts.count == 2, let w = Int32(parts[0]), let h = Int32(parts[1]) {
-                    if let matchingFormat = device.formats.first(where: {
-                        let d = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
-                        return d.width == w && d.height == h
-                    }) {
-                        do {
-                            try device.lockForConfiguration()
-                            device.activeFormat = matchingFormat
-                            device.unlockForConfiguration()
-                            Log.camera.info("Đã áp dụng độ phân giải camera: \(resolution, privacy: .public)")
-                        } catch {
-                            Log.camera.warning("Không áp dụng được độ phân giải \(resolution, privacy: .public): \(error.localizedDescription, privacy: .public)")
-                        }
-                    }
+                let requested = device.formats.first {
+                    let dims = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
+                    return resolution == "\(dims.width)x\(dims.height)"
                 }
-                cont.resume()
+                let format = requested ?? baselineFormat
+                do {
+                    try Self.withDeviceConfigurationLock(
+                        lock: device.lockForConfiguration, unlock: device.unlockForConfiguration
+                    ) {
+                        device.activeFormat = format
+                    }
+                    updatePhotoOutput(for: device)
+                    cont.resume()
+                } catch {
+                    cont.resume(throwing: AppError.cameraConfigurationFailed(error.localizedDescription))
+                }
             }
         }
     }
 
     /// Frame mới nhất cho preview (CVPixelBuffer BGRA).
     public func latestPreviewBuffer() -> (buffer: CVPixelBuffer, atMs: Int64)? {
-        bufferLock.lock(); defer { bufferLock.unlock() }
+        bufferLock.lock()
+        defer { bufferLock.unlock() }
         return latestBuffer
     }
 
@@ -558,9 +557,13 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
         })
         observers.append(nc.addObserver(forName: .AVCaptureDeviceWasDisconnected, object: nil, queue: .main) { [weak self] note in
             guard let device = note.object as? AVCaptureDevice else { return }
-            self?.post(.deviceDisconnected(device.uniqueID))
-            if device.uniqueID == self?.selectedDevice?.uniqueID {
-                self?.post(.interruptionStarted(reason: "Camera ngắt kết nối"))
+            let id = device.uniqueID
+            self?.sessionQueue.async { [weak self] in
+                guard let self else { return }
+                if id == selectedDevice?.uniqueID {
+                    post(.interruptionStarted(reason: "Camera ngắt kết nối"))
+                }
+                post(.deviceDisconnected(id))
             }
         })
         observers.append(nc.addObserver(forName: .AVCaptureSessionRuntimeError, object: session, queue: .main) { [weak self] note in

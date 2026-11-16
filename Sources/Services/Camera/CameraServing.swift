@@ -127,5 +127,11 @@ public protocol CameraServing: AnyObject {
     func setResolution(_ resolution: String) async throws
     var events: AsyncStream<CameraEvent> { get }
     var currentDevice: CameraDescriptor? { get async }
+    var activeResolution: String? { get async }
     var isFallbackVideoStill: Bool { get async }
+}
+
+
+extension CameraServing {
+    public var activeResolution: String? { get async { nil } }
 }

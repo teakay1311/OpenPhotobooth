@@ -19,25 +19,29 @@ public struct FullscreenView: View {
     public var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
-            switch vm.step {
-            case .welcome: welcomeStep
-            case .selectFrame: selectFrameStep
-            case .live: liveStep
-            case .review: reviewStep
-            case .finish: finishStep
+            Group {
+                switch vm.step {
+                case .welcome: welcomeStep
+                case .selectFrame: selectFrameStep
+                case .live: liveStep
+                case .review: reviewStep
+                case .finish: finishStep
+                }
             }
+            .disabled(vm.exitRequested)
             // Exit button (top-right)
             VStack {
                 HStack {
                     Spacer()
                     Button {
-                        env.showFullscreen = false
+                        requestExit()
                     } label: {
                         Image(systemName: "xmark.circle.fill")
                             .font(.system(size: 24))
                             .foregroundStyle(.white.opacity(0.7))
                     }
                     .buttonStyle(.plain)
+                    .disabled(vm.exitRequested)
                     .help("Đóng chế độ toàn màn hình (Esc)")
                     .accessibilityLabel("Đóng chế độ toàn màn hình")
                     .padding(14)
@@ -45,9 +49,9 @@ public struct FullscreenView: View {
                 Spacer()
             }
         }
-        .onExitCommand {
-            env.showFullscreen = false
-        }
+        .onExitCommand { requestExit() }
+        .onChange(of: env.nativeFullscreenExitRequest) { requestExit() }
+        .onChange(of: env.engine.state) { vm.finishExitIfReady() }
         .overlay(alignment: .bottom) {
             ToastOverlay(env: env).allowsHitTesting(false)
         }
@@ -64,8 +68,12 @@ public struct FullscreenView: View {
         }
         .onDisappear {
             shootingTask?.cancel()
-            vm.exitFullscreenRequested()
         }
+    }
+
+    private func requestExit() {
+        shootingTask?.cancel()
+        vm.exitFullscreenRequested()
     }
 
     // MARK: Welcome
@@ -193,14 +201,20 @@ public struct FullscreenView: View {
             case .ready where env.engine.session?.captureMode == .manual:
                 PrimaryButton(title: "Chụp tiếp", systemImage: "camera",
                               disabledReason: captureVM.isCameraReady ? nil : "Chờ camera sẵn sàng") {
-                    do { try env.engine.captureNextManual() }
-                    catch { env.showToast(error.localizedDescription, kind: .warning) }
+                    Task {
+                        guard await env.capturePreview.confirmVideoFallback(), env.showFullscreen, !vm.exitRequested else { return }
+                        do { try env.engine.captureNextManual() }
+                        catch { env.showToast(error.localizedDescription, kind: .warning) }
+                    }
                 }
             case .paused:
                 PrimaryButton(title: "Tiếp tục", systemImage: "play.fill",
                               disabledReason: captureVM.isCameraReady ? nil : "Chờ camera sẵn sàng") {
-                    do { try env.engine.resume() }
-                    catch { env.showToast(error.localizedDescription, kind: .warning) }
+                    Task {
+                        guard await env.capturePreview.confirmVideoFallback(), env.showFullscreen, !vm.exitRequested else { return }
+                        do { try env.engine.resume() }
+                        catch { env.showToast(error.localizedDescription, kind: .warning) }
+                    }
                 }
             case .recoverableError(let message, _):
                 Text(message).foregroundStyle(.white)

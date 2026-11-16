@@ -436,6 +436,7 @@ public final class MetalPreviewNSView: NSView, MTKViewDelegate {
         }
 
         if let params = photoParameters {
+            ci = ImageNormalizer.rotated(ci, degrees: params.photoRotation)
             ci = ImageColorPipeline.applyColor(ci, resolved: params)
         }
 

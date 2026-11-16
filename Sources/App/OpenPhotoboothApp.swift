@@ -84,7 +84,9 @@ private struct PhotoboothWindowContent: View {
                 MainWindow(env: env)
             }
         }
-        .background(NativeFullscreenBinding(isPresented: $env.showFullscreen))
+        .background(NativeFullscreenBinding(isPresented: $env.showFullscreen) {
+            env.nativeFullscreenExitRequest += 1
+        })
         .environmentObject(env)
         .task { await env.boot() }
         .sheet(isPresented: $env.showPackImport) {
@@ -98,11 +100,13 @@ private struct PhotoboothWindowContent: View {
 
 private struct NativeFullscreenBinding: NSViewRepresentable {
     @Binding var isPresented: Bool
+    let onNativeExit: () -> Void
 
     func makeNSView(context: Context) -> FullscreenWindowObserver { FullscreenWindowObserver() }
 
     func updateNSView(_ view: FullscreenWindowObserver, context: Context) {
         view.isPresented = $isPresented
+        view.onNativeExit = onNativeExit
         view.scheduleUpdate()
     }
 }
@@ -110,6 +114,8 @@ private struct NativeFullscreenBinding: NSViewRepresentable {
 /// The kiosk uses the host window's native fullscreen space.
 private final class FullscreenWindowObserver: NSView {
     var isPresented: Binding<Bool>?
+    var onNativeExit: (() -> Void)?
+    private var nativeExitPending = false
     private var requestedFullscreen = false
     private var isTransitioning = false
 
@@ -138,7 +144,8 @@ private final class FullscreenWindowObserver: NSView {
     private func updateWindow() {
         guard let window, let isPresented, !isTransitioning else { return }
         let isFullscreen = window.styleMask.contains(.fullScreen)
-        if isPresented.wrappedValue && !isFullscreen {
+        if !isPresented.wrappedValue { nativeExitPending = false }
+        if isPresented.wrappedValue && !isFullscreen && !nativeExitPending {
             requestedFullscreen = true
             window.toggleFullScreen(nil)
         } else if !isPresented.wrappedValue && requestedFullscreen && isFullscreen {
@@ -158,7 +165,10 @@ private final class FullscreenWindowObserver: NSView {
     @objc private func didExitFullscreen(_ notification: Notification) {
         requestedFullscreen = false
         isTransitioning = false
-        isPresented?.wrappedValue = false
+        if isPresented?.wrappedValue == true {
+            nativeExitPending = true
+            onNativeExit?()
+        }
     }
 
 }

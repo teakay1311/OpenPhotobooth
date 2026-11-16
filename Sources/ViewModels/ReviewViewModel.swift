@@ -910,7 +910,7 @@ public final class ReviewViewModel: ObservableObject {
             env.showToast(env.capturePreview.error ?? "Mở màn Chụp để bật camera trước khi chụp lại.", kind: .warning)
             return false
         }
-        return true
+        return await env.capturePreview.confirmVideoFallback()
     }
 
     // MARK: - Flush pending edits (§3.1, REV-01, NAV-02)
@@ -958,7 +958,9 @@ public final class ReviewViewModel: ObservableObject {
                         snapshotSlotID: slotID,
                         placement: item.placement,
                         cropMode: item.cropMode,
-                        manualOverride: true
+                        manualOverride: true,
+                        expectedSnapshotID: item.snapshotID,
+                        expectedPhotoRevisionID: item.photoRevisionID
                     )
                     pendingPlacements.removeValue(forKey: slotID)
                     if let old = item.old {

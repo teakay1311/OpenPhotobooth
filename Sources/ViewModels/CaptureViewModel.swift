@@ -296,7 +296,7 @@ public final class CaptureViewModel: ObservableObject {
                 env.openReview(sessionID: sid, source: .capture)
                 return
             }
-            guard isCameraReady else { return }
+            guard isCameraReady, await env.capturePreview.confirmVideoFallback(), engine.state == .ready else { return }
             if engine.committedShots.isEmpty {
                 await startNewSessionIfNeeded()
             } else {
@@ -326,14 +326,15 @@ public final class CaptureViewModel: ObservableObject {
                 engine.pause()
             }
         case .paused:
-            guard isCameraReady else { return }
-            try? engine.resume()
+            guard isCameraReady, await env.capturePreview.confirmVideoFallback() else { return }
+            do { try engine.resume() }
+            catch { env.showToast(error.localizedDescription, kind: .warning) }
         case .recoverableError:
             if engine.hasPhotoToSave {
                 await engine.retryPendingSave()
                 return
             }
-            guard isCameraReady else { return }
+            guard isCameraReady, await env.capturePreview.confirmVideoFallback() else { return }
             engine.retryFromError()
             if case .ready = engine.state {
                 try? engine.startOrContinue()
@@ -361,7 +362,8 @@ public final class CaptureViewModel: ObservableObject {
 
     /// Kiểm tra tiền điều kiện §17.3 CreateSession: frame ready + camera usable + storage writable.
     public func startNewSession() async {
-        guard canStartSession, let frame = selectedFrame else { return }
+        guard canStartSession, await env.capturePreview.confirmVideoFallback(),
+              canStartSession, let frame = selectedFrame, !Task.isCancelled else { return }
         // Nếu có phiên paused khác → lựa chọn (§10.3)
         if engine.session != nil, engine.state != .idle {
             env.showToast("Đang có phiên hoạt động", kind: .warning)
@@ -499,6 +501,7 @@ final class CapturePreviewCoordinator: ObservableObject {
     @Published private(set) var selection = "auto"
     @Published private(set) var name = ""
     @Published private(set) var isFallback = false
+    @Published private(set) var appliedResolution: String?
     @Published private(set) var isReady = false
     @Published private(set) var isConnecting = false
     @Published private(set) var error: String?
@@ -510,6 +513,8 @@ final class CapturePreviewCoordinator: ObservableObject {
     private var deferredRefresh = false
     private var readyPreference: String?
     private var readyResolution: String?
+    private var confirmedFallbackGeneration: Int?
+    private var isConfirmingFallback = false
 
     init(env: AppEnvironment) { self.env = env }
 
@@ -523,11 +528,37 @@ final class CapturePreviewCoordinator: ObservableObject {
             return
         }
         deferredRefresh = false
+        if !requestAccess, pending == nil, isReady, readyPreference == env.settings.cameraSelection,
+           readyResolution == env.settings.cameraResolution, await env.camera.isPreviewRunning { return }
         if let pending, !pending.isCancelled, !requestAccess || requestingPermission {
             await pending.value
             return
         }
         await enqueue(requestAccess: requestAccess, explicitSelection: nil, retakeRoute: retakeRoute)
+    }
+
+    func confirmVideoFallback() async -> Bool {
+        guard isReady else { return false }
+        guard isFallback else { return true }
+        if confirmedFallbackGeneration == generation { return true }
+        guard !isConfirmingFallback, let window = NSApp?.keyWindow else { return false }
+        isConfirmingFallback = true
+        defer { isConfirmingFallback = false }
+        let requestedGeneration = generation
+        let route = env.route
+        let fullscreen = env.showFullscreen
+        let alert = NSAlert()
+        alert.messageText = "Camera chỉ chụp ở độ phân giải video"
+        alert.informativeText = "Ảnh sẽ được lấy từ khung hình video của camera đang chọn."
+        alert.addButton(withTitle: "Tiếp tục")
+        alert.addButton(withTitle: "Hủy")
+        let response = await withCheckedContinuation { continuation in
+            alert.beginSheetModal(for: window) { continuation.resume(returning: $0) }
+        }
+        guard response == .alertFirstButtonReturn, !Task.isCancelled, isReady, isFallback,
+              generation == requestedGeneration, env.route == route, env.showFullscreen == fullscreen else { return false }
+        confirmedFallbackGeneration = requestedGeneration
+        return true
     }
 
     func resumeDeferredRefresh() async {
@@ -545,6 +576,8 @@ final class CapturePreviewCoordinator: ObservableObject {
 
     func interrupted(_ message: String) {
         isReady = false
+        confirmedFallbackGeneration = nil
+        appliedResolution = nil
         error = message
         pending?.cancel()
     }
@@ -593,6 +626,7 @@ final class CapturePreviewCoordinator: ObservableObject {
         guard !Task.isCancelled else { return }
 
         isReady = false
+        appliedResolution = nil
         isConnecting = true
         error = nil
         do {
@@ -621,22 +655,34 @@ final class CapturePreviewCoordinator: ObservableObject {
                 actualSelection = "auto"
             }
             try Task.checkCancellation()
-            let device = await camera.currentDevice
-            let fallback = await camera.isFallbackVideoStill
+            guard let device = await camera.currentDevice else { throw AppError.noCamera }
             try Task.checkCancellation()
             selection = actualSelection
-            name = device?.localizedName ?? ""
-            isFallback = fallback
+            name = device.localizedName
             if actualSelection != preferred {
                 env.showToast("Camera đã lưu không khả dụng, tạm dùng Tự động", kind: .warning)
             }
             guard mayStartPreview, env.engine.canChangeCamera else { return }
-            try await camera.setResolution(resolution)
+            do {
+                try await camera.setResolution(resolution)
+            } catch {
+                try Task.checkCancellation()
+                guard resolution != "best" else { throw error }
+                try await camera.setResolution("best")
+            }
             try Task.checkCancellation()
             guard mayStartPreview, env.engine.canChangeCamera else { return }
             try await camera.startPreview()
             try Task.checkCancellation()
+            let applied = await camera.activeResolution
+            let fallback = await camera.isFallbackVideoStill
+            try Task.checkCancellation()
             guard mayStartPreview else { return }
+            isFallback = fallback
+            appliedResolution = applied
+            if resolution != "best", let applied, applied != resolution {
+                env.showToast("Không áp dụng được \(resolution). Camera đang dùng \(applied).", kind: .warning)
+            }
             readyPreference = preferred
             readyResolution = resolution
             isReady = true

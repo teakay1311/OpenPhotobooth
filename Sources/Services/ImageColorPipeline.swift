@@ -36,26 +36,31 @@ public enum ImageNormalizer {
 
     /// Áp dụng photo rotation (PhotoOverride.photoRotation, độ clockwise).
     public static func rotate(_ image: CGImage, degrees: Double) -> CGImage {
+        guard degrees.truncatingRemainder(dividingBy: 360) != 0 else { return image }
+        let output = rotated(CIImage(cgImage: image), degrees: degrees)
+        let rect = CGRect(origin: .zero, size: CGSize(width: round(output.extent.width), height: round(output.extent.height)))
+        return CIContextHolder.shared.context.createCGImage(output, from: rect) ?? image
+    }
+
+    static func rotated(_ image: CIImage, degrees: Double) -> CIImage {
         let norm = degrees.truncatingRemainder(dividingBy: 360)
         let positive = norm < 0 ? norm + 360 : norm
         guard positive != 0 else { return image }
-        let ci = CIImage(cgImage: image)
         let outCI: CIImage
         if abs(positive - 90) < 0.001 {
-            outCI = ci.oriented(.right)
+            outCI = image.oriented(.right)
         } else if abs(positive - 180) < 0.001 {
-            outCI = ci.oriented(.down)
+            outCI = image.oriented(.down)
         } else if abs(positive - 270) < 0.001 {
-            outCI = ci.oriented(.left)
+            outCI = image.oriented(.left)
         } else {
             let radians = CGFloat(-positive * Double.pi / 180)
-            let rotated = ci.transformed(by: CGAffineTransform(rotationAngle: radians))
+            let rotated = image.transformed(by: CGAffineTransform(rotationAngle: radians))
             let ext = rotated.extent
             let aligned = rotated.transformed(by: CGAffineTransform(translationX: -ext.origin.x, y: -ext.origin.y))
             outCI = aligned
         }
-        let targetRect = CGRect(origin: .zero, size: CGSize(width: round(outCI.extent.width), height: round(outCI.extent.height)))
-        return CIContextHolder.shared.context.createCGImage(outCI, from: targetRect) ?? image
+        return outCI
     }
 }
 

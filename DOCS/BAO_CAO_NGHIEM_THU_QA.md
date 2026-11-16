@@ -138,3 +138,40 @@
    - `DOCS/HUONG_DAN_SU_DUNG.md`.
 4. **Báo cáo nghiệm thu kỹ thuật**:
    - `DOCS/BAO_CAO_NGHIEM_THU_QA.md`.
+
+## Ứng viên sửa PB-01–PB-17 · 16/11/2026
+
+Mốc đối chiếu là `a778665b0adfbc257231dce57066fe5a2b22a62b`. Nhánh `codex/photobooth-17-fixes` được kiểm trên macOS 27.0.1 Apple Silicon và Xcode 27.0. XCTest dùng bundle `vn.openphotobooth.qa.app` và dữ liệu thử. Bản có cửa sổ dùng bundle `vn.openphotobooth.qa.fix17.ui`, sao chép từ Release rồi đổi định danh và ký lại. SHA-256 của executable QA sau khi ký lại là `9f86a9acf53bb8400d5a947ca935d395f9abe69b972b9de02b435aa2b9bd5f35`. Các bảng phía trên ghi kết quả của những đợt trước.
+
+- **Xcode XCTest** chạy đạt 188/188 ở mốc và 201/201 ở ứng viên. Nhật ký ứng viên ghi p95 của 30 mẫu chỉnh màu là 70,94 ms và 30 mẫu crop là 71,53 ms. Đây là thời gian tới kết quả preview do ViewModel công bố. [Mốc XCTest](/private/tmp/photobooth-baseline-native.5dP0nm/xcode.log:3523) · [Log ứng viên](/private/tmp/open-photobooth-qa.NANlqy/final.log:1083) · [Xcode result bundle](/private/tmp/open-photobooth-qa.NANlqy/Final.xcresult) · [Mẫu đo](/private/tmp/open-photobooth-qa.NANlqy/final.log:111)
+- **SwiftPM** chạy đạt 188/188 ở mốc và 201/201 trên cùng nguồn ứng viên. Danh sách ca trùng Xcode. p95 chỉnh màu 74,71 ms, crop 70,85 ms. [SwiftPM mốc](/private/tmp/photobooth-base-swiftpm.Qk67gD/swiftpm.log:3202) · [SwiftPM ứng viên](/private/tmp/photobooth-fix17-swiftpm.iNnxy2/final.log:3182)
+- **Gói Release** có `arm64` và `x86_64`, bundle ID `vn.openphotobooth.app` và chữ ký ad-hoc xác minh được. SHA-256 executable là `eb189f9b5c7478949c10bc285f92a69f858f7eb39880f78e25f5edb056dc2a55`. Fixture riêng mô phỏng lỗi build, lỗi sao chép và lỗi xác minh sau thay đích. Ba ca đều giữ nguyên checksum và chữ ký của bản trước. [Gói ứng viên .app](</Users/teakay/Downloads/ỨNG DỤNG + EXTENSIONS/Open Photobooth/Build/QA-PB01-PB17/Open Photobooth.app>) · [Log build](/private/tmp/photobooth-fix17-release.Vz5I95/final.log) · [Fixture đóng gói](/private/tmp/photobooth-packaging-probe.xUmjC2)
+- **UI macOS** quan sát đủ 9 khung trên hồ sơ trống, các điều khiển Chụp, trạng thái camera chưa cấp quyền và điều hướng bằng phím tắt tới Khung ảnh, Thư viện, Thùng rác, Cài đặt. Kiểm thoát Kiosk khi đang ở màn chờ bằng `Esc` và nút đóng. Các ca chụp, quyền thư mục, hai cửa sổ và kích thước tối thiểu cần lượt UI phù hợp.
+
+| Mã | Kết quả trên ứng viên | Bằng chứng và phần còn mở |
+|---|---|---|
+| PB-01 | M/T đạt | `testPB01StaleCaptureCannotReviveSessionMovedToTrash` chặn chụp tiếp và giữ phiên trong rác. Fixture lệch giữ trạng thái và bytes, có báo cáo phục hồi. |
+| PB-02 | M/T đạt cho fixture không có mặt | `testPB02ExplicitAutoFaceCommitsNewPlacementAndCanUndo` kiểm ghi đúng crop, Undo và chặn kết quả ghi đè thao tác tay. Ảnh mặt lệch tâm, ảnh nhóm và đối chiếu UI với bản xuất chưa chạy. |
+| PB-03 | M/T đạt cho đếm ngược | `testPB03OnlySelectedCameraDisconnectPausesAndUnlocksSession` phân biệt hai nguồn giả và kiểm nhả khóa. Ngắt thiết bị vật lý lúc nhận/lưu ảnh chưa chạy. |
+| PB-04 | M đã đối chiếu | Nguồn ảnh tính từ đầu ra của CameraService. Hộp xác nhận và chụp từ camera chỉ có video chưa chạy trên thiết bị thật. |
+| PB-05 | M đã đối chiếu | Sheet xóa kết quả cũ khi bắt đầu lần mới. Chuỗi UI thành công → thất bại → thành công chưa chạy. |
+| PB-06 | M/T đạt | `testPB06ExportKeepsVerifiedFileWhenHistoryInsertFails` làm lỗi chèn lịch sử và xác nhận tệp PNG giữ nguyên. Cảnh báo và Finder từ sheet chưa chạy trên macOS UI. |
+| PB-07 | M/T đạt | `testPB07FrameValidatorRejectsTruncatedImageWithValidSignature` và các ca nhập PNG/JPG, Frame Pack hiện có. Nhập qua cửa sổ native với từng loại lỗi chưa chạy. |
+| PB-08 | M/T đạt | `testPB08SQLiteChecksDistinguishCleanViolationAndFailure` kiểm ba kết quả, gồm integrity sạch khi truy vấn FK lỗi. |
+| PB-09 | M/T đạt | Build Universal, đối chiếu chính output của lần build và ba lỗi thay gói theo fixture. |
+| PB-10 | M/U đạt | Hướng dẫn cập nhật theo 9 khung và điều khiển Chụp đã thấy trên bundle QA. |
+| PB-11 | M/T đạt cho fixture | `testPB11MissingSnapshotLayerBlocksRestoreBeforeMovingFiles` giữ phiên và thư mục trong rác. Hồi quy kiểm ảnh thiếu, lỗi commit và khôi phục bình thường. |
+| PB-12 | M/T đạt cho vòng đời lease | `testPB12RetiredBookmarkStaysAvailableUntilLastUseEnds` xác nhận giữ quyền đang dùng. Đổi A→B, khởi động lại rồi mở tệp A qua Finder cần kiểm sandbox UI thực tế. |
+| PB-13 | M/T đạt cho thiết lập và ảnh dựng | `testHermes_A07_SessionDefaults_Rotation_SmartFace_SetResolution` và `testRotationAppliedInRenderPipeline`. Hình live với thiết bị thật và tổ hợp xoay/lật chưa chạy. |
+| PB-14 | M/T đạt cho khóa mô phỏng | `testPB14ConfigurationDoesNotUnlockWhenAcquisitionFails` mô phỏng hai lần bị từ chối, sau đó áp dụng lại thành công. UI điều khiển trên thiết bị thật chưa chạy. |
+| PB-15 | M/T đạt cho revision thay đổi | `testPB15ExportRejectsAcceptedPreviewAfterPlacementChanges` từ chối tạo tệp và lịch sử từ preview cũ. Hai cửa sổ và đổi nhanh định dạng trong sheet chưa chạy. |
+| PB-16 | M/T và U một phần | `testPB16KioskWaitsForInFlightPhotoBeforeClosing` kiểm ảnh vừa nhận được lưu đúng một lượt trước khi đóng. UI đạt ở màn chờ với `Esc` và nút đóng. Thoát native trong lúc lưu, lỗi lưu và Auto Export chưa có đủ bằng chứng. |
+| PB-17 | M/T đạt cho Xuất tay | `testPB17ExportRejectsDecodableReplacementAndAllowsLegacyEmptyHash` kiểm PNG thay nội dung và hash rỗng. Auto Export và Chia sẻ dùng cùng đường xác thực nguồn. Hai ca đầu ra với nguồn bị thay chưa chạy riêng. |
+
+| Ca theo dõi | Kết quả trên bản QA có cửa sổ |
+|---|---|
+| APP-01 | Ba lượt đều quan sát ít nhất 60 giây từ khi mở đến lúc `Cmd+Q` và tối thiểu 60 giây sau đó. Các PID 97664, 6172 và 8015 kết thúc lúc 15:55:28, 15:58:12 và 16:00:38 giờ Việt Nam. Không quan sát PID mới của cùng executable trong các khoảng sau thoát. Lượt đầu có thao tác UI trước khi thoát. [Nhật ký PID](/private/tmp/photobooth-fix17-ui.LgUyKI/pid.log) |
+| APP-02 | Nút đóng cửa sổ làm mất cửa sổ và PID 97664 vẫn chạy. Lượt mở lại từ Dock bị gián đoạn bởi lỗi timeout của công cụ điều khiển. |
+| APP-03, APP-04 | Chưa đo âm thanh thực hoặc quy nguồn âm. Hệ thống không liệt kê thiết bị camera vật lý trong phiên kiểm thử. |
+
+**Trạng thái bàn giao: ứng viên QA.** Gói chưa qua đủ các ca nghiệm thu trên camera thật, âm thanh, quyền thư mục và UI nhiều cửa sổ. Không thay đổi mã dành riêng cho APP-01–APP-04 vì chưa có bằng chứng gắn hiện tượng báo cáo với đường mã gây lỗi.

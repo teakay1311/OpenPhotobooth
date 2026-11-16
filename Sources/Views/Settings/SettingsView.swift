@@ -214,6 +214,9 @@ struct CameraPane: View {
                 }
                 .frame(width: 260)
                 .disabled(caps == nil || busy)
+                if let applied = env.capturePreview.appliedResolution {
+                    Text("Đang dùng \(applied)").font(.caption).foregroundStyle(.secondary)
+                }
             }
             SettingsRow(label: "Lật preview", description: "Chỉ đổi cách nhìn, không ảnh hưởng ảnh xuất (§4.4)") {
                 Toggle("", isOn: $previewMirror).onChange(of: previewMirror) { env.settings.previewMirror = $0 }
@@ -242,19 +245,19 @@ struct CameraPane: View {
                     HStack {
                         Button("Áp dụng") {
                             Task {
-                                _ = try? await env.camera.applyControls(
-                                    CameraControls(focusLocked: caps.supportsFocus ? true : nil,
-                                                   exposureLocked: caps.supportsExposure ? true : nil,
-                                                   whiteBalanceLocked: caps.supportsWhiteBalance ? true : nil))
+                                await configureControls(CameraControls(focusLocked: caps.supportsFocus ? true : nil,
+                                                                       exposureLocked: caps.supportsExposure ? true : nil,
+                                                                       whiteBalanceLocked: caps.supportsWhiteBalance ? true : nil))
                             }
                         }
-                        .disabled(!caps.supportsFocus && !caps.supportsExposure && !caps.supportsWhiteBalance)
+                        .disabled(busy || (!caps.supportsFocus && !caps.supportsExposure && !caps.supportsWhiteBalance))
                         Button("Đặt lại camera") {
                             Task {
-                                _ = try? await env.camera.applyControls(
-                                    CameraControls(focusLocked: false, exposureLocked: false, whiteBalanceLocked: false))
+                                await configureControls(CameraControls(focusLocked: false, exposureLocked: false,
+                                                                       whiteBalanceLocked: false))
                             }
                         }
+                        .disabled(busy)
                         .help("Chỉ reset các thông số app điều khiển (§4.4)")
                     }
                 }
@@ -274,6 +277,16 @@ struct CameraPane: View {
             }
         }
         .frame(maxWidth: 640, alignment: .leading)
+    }
+
+    private func configureControls(_ controls: CameraControls) async {
+        guard !busy else { return }
+        do {
+            _ = try await env.camera.applyControls(controls)
+        } catch {
+            env.showToast(error.localizedDescription, kind: .warning)
+        }
+        await reloadCaps()
     }
 
     private func reloadCaps() async {
@@ -688,11 +701,9 @@ struct DataPane: View {
             Button("Đặt lại cài đặt", role: .destructive) { confirmReset = true }
                 .confirmationDialog("Đặt lại toàn bộ cài đặt (không xóa dữ liệu)?", isPresented: $confirmReset) {
                     Button("Đặt lại", role: .destructive) {
-                        // Xóa bookmark row mồ côi trước khi reset key (P3-19)
-                        if let bmID = env.settings.exportFolderBookmarkID {
-                            try? env.trashRepo.deleteBookmark(id: bmID)
-                        }
+                        let oldBookmark = env.settings.exportFolderBookmarkID
                         env.settings.resetAll()
+                        if let oldBookmark { try? env.trashRepo.deleteBookmark(id: oldBookmark) }
                         env.showToast("Đã đặt lại cài đặt")
                     }
                     Button("Hủy", role: .cancel) {}

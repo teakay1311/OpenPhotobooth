@@ -1,6 +1,6 @@
 # Hướng dẫn sử dụng Open Photobooth v1.2
 
-Open Photobooth là ứng dụng Photobooth bản địa (native) dành riêng cho hệ điều hành macOS, hỗ trợ chụp ảnh theo khung tùy chỉnh, chỉnh sửa vị trí ảnh, áp dụng bộ lọc màu/làm mịn da và xuất file chất lượng cao.
+Open Photobooth là ứng dụng Photobooth bản địa (native) dành riêng cho hệ điều hành macOS, hỗ trợ chụp ảnh theo khung tùy chỉnh, chỉnh sửa vị trí ảnh, áp dụng preset màu và xuất file chất lượng cao.
 
 ---
 
@@ -15,14 +15,11 @@ Open Photobooth là ứng dụng Photobooth bản địa (native) dành riêng c
 ## 2. Các màn hình và luồng chức năng chính
 
 ### 2.1. Màn hình Chụp ảnh (Capture)
-1. **Chọn khung ảnh**: Danh sách các khung hiển thị ở thanh trượt bên dưới. Mặc định ứng dụng cung cấp 3 khung: *Dải 3 ảnh*, *Lưới 4 ảnh*, và *Một ảnh lớn*.
-2. **Cấu hình thông số**:
-   - **Chế độ**: Tự động (Auto) hoặc Thủ công (Manual).
-   - **Đếm ngược**: 0s, 3s, 5s hoặc 10s.
-   - **Nghỉ giữa lượt**: Thời gian nghỉ để tạo dáng cho lượt chụp kế tiếp.
-   - **Bộ lọc màu & Làm mịn**: Chọn preset màu sắc (Tự nhiên, Vintage, Trắng đen,...) và thanh trượt làm mịn da.
-   - **Lật ảnh (Mirror)**: Xem gương tự nhiên lúc chụp.
-3. **Bắt đầu chụp**: Bấm nút **Chụp** hoặc phím `Space`. Có thể hủy bất kỳ lúc nào bằng phím `Esc`.
+1. **Chọn khung ảnh** trong dải **Khung ảnh**. Ứng dụng có 9 khung dựng sẵn gồm *Dải 3 ảnh*, *Lưới 4 ảnh*, *Một ảnh lớn*, *Cặp ảnh dọc*, *Cặp ảnh ngang*, *Collage 5 ảnh*, *Lưới 6 ảnh*, *Lưới 8 ảnh* và *Lưới 9 ảnh*.
+2. **Cài đặt nhanh** nằm ở cột bên màn Chụp ảnh. Chọn **Tự động** hoặc **Thủ công**, đặt đếm ngược 0, 3, 5, 10 giây hoặc tùy chỉnh từ 1 đến 30 giây, và đặt thời gian nghỉ giữa lượt từ 0 đến 15 giây.
+3. Bật **Chụp thêm để chọn ảnh** nếu muốn chụp nhiều hơn số ô của khung. Khi xem lại, bấm chọn ảnh theo thứ tự muốn đưa vào các ô và bấm lại để bỏ chọn.
+4. Chọn **Preset màu**, **Lật ngang ảnh thành phẩm** và **Âm thanh** ở cùng cột. Các thông số chụp và hướng ảnh thành phẩm được chốt khi bắt đầu phiên. Lật ảnh xem trước được chỉnh riêng trong Cài đặt camera.
+5. Bấm **Chụp** hoặc phím `Space` để bắt đầu. Dùng `Esc` để hủy đếm ngược. Nếu ảnh đã lưu, ứng dụng giữ ảnh để tiếp tục hoặc xem lại.
 
 ### 2.2. Chế độ Toàn màn hình (Fullscreen Kiosk)
 - Bật từ nút **Toàn màn hình** ở góc trên thanh công cụ màn Chụp ảnh.
@@ -33,9 +30,10 @@ Open Photobooth là ứng dụng Photobooth bản địa (native) dành riêng c
 - **Chế độ cắt (Crop Mode)**:
   - **Fill (Lấp đầy)**: Cắt tràn ô ảnh mà không méo tỉ lệ.
   - **Fit (Vừa khung)**: Hiển thị trọn vẹn toàn bộ ảnh trong ô.
-  - **Auto Face (Nhận diện mặt)**: Tự động căn giữa khuôn mặt vào tâm ô ảnh.
+  - **Auto Face (Nhận diện mặt)** căn theo khuôn mặt. Nếu không tìm thấy mặt, ảnh được căn giữa. Bạn có thể yêu cầu căn lại từ Review.
 - **Chụp lại (Retake)**: Chọn một ô ảnh bất kỳ trên dải ảnh và bấm "Chụp lại" để chụp lại đúng ô đó (áp dụng cho cả phiên vừa chụp lẫn bất kỳ phiên nào mở lại từ Thư viện); các ô ảnh khác được giữ nguyên. Sau khi chụp lại thành công, ứng dụng tự động quay về đúng phiên trong màn hình Xem và chỉnh ảnh.
 - **Đổi khung trong Review**: Có thể đổi sang khung khác khi đang xem lại; các ảnh đã chụp sẽ được tự động giữ nguyên và gán vào các ô tương ứng.
+- **Phiên từ phiên bản cũ** tiếp tục dùng màu, crop và góc xoay đã lưu. Bộ dựng ảnh bỏ qua tham số làm mịn da cũ.
 
 ### 2.4. Xuất ảnh (Export) và Chia sẻ (Share)
 - **Xuất thủ công**: Hộp thoại chọn thư mục xuất, định dạng JPG (chất lượng 1–100%) hoặc PNG (trong suốt).
