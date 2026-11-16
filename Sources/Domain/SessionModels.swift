@@ -19,6 +19,20 @@ public struct CaptureSessionRecord: Identifiable, Equatable, Codable, Sendable {
     public var countdownSeconds: Int
     public var intermissionSeconds: Int
 
+    public var pendingSelectionCount: Int? {
+        guard defaults.selectedCaptureOrder == nil,
+              let count = defaults.selectionCaptureCount,
+              (1...ResourceLimits.maxCaptureIndices).contains(count) else { return nil }
+        return count
+    }
+
+    public var captureCount: Int { pendingSelectionCount ?? requiredCaptureCount }
+
+    public func captureIndices(in snapshot: FrameSnapshot) -> Set<Int> {
+        if let count = pendingSelectionCount { return Set(1...count) }
+        return snapshot.requiredIndices
+    }
+
     public init(id: String = IDFactory.new(), status: SessionStatus = .inProgress,
                 activeFrameSnapshotID: String, requiredCaptureCount: Int,
                 currentCaptureIndex: Int = 1, captureMode: CaptureMode,
@@ -134,7 +148,9 @@ public struct SessionDetail: Equatable, Sendable {
     /// Ảnh nguồn đang dùng theo capture index (chỉ những lượt đã chụp).
     public func currentRevisions() -> [Int: PhotoRevision] {
         var result: [Int: PhotoRevision] = [:]
+        let selected = session.defaults.selectedCaptureOrder.map(Set.init)
         for shot in shots {
+            if let selected, !selected.contains(shot.captureIndex) { continue }
             guard let revID = shot.currentPhotoRevisionID,
                   let revs = photoRevisions[shot.id],
                   let rev = revs.first(where: { $0.id == revID }) else { continue }
@@ -143,9 +159,18 @@ public struct SessionDetail: Equatable, Sendable {
         return result
     }
 
-    public var committedCount: Int { currentRevisions().count }
-    public var missingCount: Int { max(0, snapshot.requiredCaptureCount - committedCount) }
-    public var hasEnoughPhotos: Bool { committedCount >= snapshot.requiredCaptureCount }
+    /// Các chỉ số ảnh đã chụp và thuộc snapshot hiện hành (A5).
+    public var availableIndicesForSnapshot: Set<Int> {
+        Set(currentRevisions().filter { $0.value.state == .available }.keys)
+            .intersection(session.captureIndices(in: snapshot))
+    }
+
+    public var committedCount: Int { availableIndicesForSnapshot.count }
+    public var missingIndices: Set<Int> { session.captureIndices(in: snapshot).subtracting(availableIndicesForSnapshot) }
+    public var missingCount: Int { missingIndices.count }
+    public var needsPhotoSelection: Bool { session.pendingSelectionCount != nil && missingIndices.isEmpty }
+    public var hasEnoughPhotos: Bool { session.pendingSelectionCount == nil && missingIndices.isEmpty }
+    public var nextPendingIndex: Int? { missingIndices.min() }
 }
 
 // MARK: - Trash

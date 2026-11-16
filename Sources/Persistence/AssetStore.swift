@@ -127,21 +127,35 @@ public final class AssetStore: @unchecked Sendable {
     /// Chỉ gọi sau purge; trả về số asset dọn được.
     public func collectGarbage() throws -> Int {
         try queue.sync {
-            let orphans = try db.query("""
-                SELECT a.id, a.relative_path FROM assets a
-                WHERE NOT EXISTS (SELECT 1 FROM asset_references r WHERE r.asset_id = a.id)
-                  AND a.storage_state = 'available'
-                LIMIT 200
-                """)
-            var removed = 0
-            for row in orphans {
-                let id = row["id"].stringValue
-                let rel = row["relative_path"].stringValue
-                if let url = try? layout.absoluteURL(forRelativePath: rel) {
-                    try? FileManager.default.removeItem(at: url)
+            let removed = try db.withTransaction { tx in
+                let orphans = try tx.query("""
+                    SELECT a.id, a.relative_path FROM assets a
+                    WHERE NOT EXISTS (SELECT 1 FROM asset_references r WHERE r.asset_id = a.id)
+                      AND a.storage_state = 'available'
+                    LIMIT 200
+                    """)
+                var count = 0
+                for row in orphans {
+                    let id = row["id"].stringValue
+                    let rel = row["relative_path"].stringValue
+                    guard rel.hasPrefix("Assets/"), let url = try? layout.absoluteURL(forRelativePath: rel),
+                          url.resolvingSymlinksInPath().path == layout.rootURL.resolvingSymlinksInPath()
+                            .appendingPathComponent(rel).path else { continue }
+                    do {
+                        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+                        guard values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+                        try FileManager.default.removeItem(at: url)
+                    } catch let error as NSError {
+                        guard error.domain == NSCocoaErrorDomain,
+                              [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(error.code) else {
+                            Log.store.error("Không thể dọn asset: \(error.localizedDescription, privacy: .private)")
+                            continue
+                        }
+                    }
+                    try tx.run("DELETE FROM assets WHERE id=?", [.text(id)])
+                    count += 1
                 }
-                try db.run("DELETE FROM assets WHERE id=?", [.text(id)])
-                removed += 1
+                return count
             }
             if removed > 0 { Log.store.info("Asset GC: dọn \(removed) asset không còn tham chiếu") }
             return removed

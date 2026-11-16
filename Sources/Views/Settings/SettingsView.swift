@@ -11,7 +11,7 @@ public struct SettingsView: View {
         case general = "Chung"
         case camera = "Camera"
         case capture = "Chụp"
-        case color = "Màu & làm đẹp"
+        case color = "Màu sắc"
         case sound = "Âm thanh"
         case storage = "Lưu trữ"
         case fullscreen = "Toàn màn hình"
@@ -35,28 +35,44 @@ public struct SettingsView: View {
     public init(env: AppEnvironment) { self.env = env }
 
     public var body: some View {
-        NavigationSplitView {
+        HStack(spacing: 0) {
             List(SettingsSection.allCases, selection: $selectedSection) { section in
                 Label(section.rawValue, systemImage: section.icon).tag(section)
             }
             .listStyle(.sidebar)
-            .frame(minWidth: 180)
-        } detail: {
+            .frame(width: 200)
+            Divider()
             ScrollView {
-                switch selectedSection {
-                case .general: GeneralPane(env: env)
-                case .camera: CameraPane(env: env)
-                case .capture: CapturePane(env: env)
-                case .color: ColorPane(env: env)
-                case .sound: SoundPane(env: env)
-                case .storage: StoragePane(env: env)
-                case .fullscreen: FullscreenPane(env: env)
-                case .data: DataPane(env: env)
+                Group {
+                    switch selectedSection {
+                    case .general: GeneralPane(env: env)
+                    case .camera: CameraPane(env: env)
+                    case .capture: CapturePane(env: env)
+                    case .color: ColorPane(env: env)
+                    case .sound: SoundPane(env: env)
+                    case .storage: StoragePane(env: env)
+                    case .fullscreen: FullscreenPane(env: env)
+                    case .data: DataPane(env: env)
+                    }
+                }
+                .frame(maxWidth: 640, alignment: .topLeading)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .padding(20)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .onAppear {
+            if let section = env.consumePendingSettingsSection() {
+                selectedSection = section
+            }
+        }
+        .onChange(of: env.route) { r in
+            if r == .settings {
+                if let section = env.consumePendingSettingsSection() {
+                    selectedSection = section
                 }
             }
-            .padding(20)
         }
-        .frame(minWidth: 760)
     }
 }
 
@@ -69,19 +85,28 @@ struct SettingsRow<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(label)
-                if let description {
-                    Text(description).font(.caption).foregroundStyle(.secondary)
-                }
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                rowLabel.frame(width: 250, alignment: .leading)
+                Spacer(minLength: 0)
+                content.help(tooltip ?? label)
             }
-            .frame(width: 250, alignment: .leading)
-            Spacer()
-            content
-                .help(tooltip ?? label)
+            VStack(alignment: .leading, spacing: 8) {
+                rowLabel
+                content.help(tooltip ?? label)
+            }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 6)
+    }
+
+    private var rowLabel: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+            if let description {
+                Text(description).font(.caption).foregroundStyle(.secondary)
+            }
+        }
     }
 }
 
@@ -158,26 +183,22 @@ struct CameraPane: View {
         VStack(alignment: .leading, spacing: 8) {
             SettingsSectionTitle(text: "Camera (§4)")
             SettingsRow(label: "Thiết bị", description: "Mac, USB, Continuity Camera") {
-                Picker("", selection: $selection) {
+                Picker("", selection: Binding(
+                    get: { selection },
+                    set: { id in
+                        selection = id
+                        Task {
+                            await env.capturePreview.choose(id)
+                            await reloadCaps()
+                        }
+                    }
+                )) {
                     Text("Tự động (systemPreferred)").tag("auto")
                     ForEach(devices, id: \.uniqueID) { d in
                         Text(d.localizedName).tag(d.uniqueID)
                     }
                 }
                 .frame(width: 260)
-                .onChange(of: selection) { newValue in
-                    env.settings.cameraSelection = newValue
-                    if !busy {
-                        Task {
-                            if newValue == "auto" {
-                                _ = try? await env.camera.selectAutoDevice()
-                            } else {
-                                _ = try? await env.camera.selectDevice(newValue)
-                            }
-                            await reloadCaps()
-                        }
-                    }
-                }
                 .disabled(busy)
                 .help(busy ? "Thay đổi sau khi kết thúc phiên" : "Áp dụng ở safe point")
             }
@@ -256,9 +277,7 @@ struct CameraPane: View {
     }
 
     private func reloadCaps() async {
-        if let current = await env.camera.currentDevice {
-            caps = current.capabilities
-        }
+        caps = await env.camera.currentDevice?.capabilities
     }
 }
 
@@ -318,13 +337,12 @@ struct ColorPane: View {
     @ObservedObject var env: AppEnvironment
     @State private var preset = "natural"
     @State private var intensity = 100
-    @State private var smooth = 25
     @State private var smartFace = true
     @State private var defaultCrop = CropMode.autoFace
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SettingsSectionTitle(text: "Màu & làm đẹp (§8, §9)")
+            SettingsSectionTitle(text: "Màu sắc (§8, §9)")
             SettingsRow(label: "Preset mặc định", description: "Áp dụng cho phiên mới") {
                 Picker("", selection: $preset) {
                     ForEach(BuiltinPreset.all, id: \.id) { Text($0.nameVN).tag($0.id) }
@@ -338,12 +356,6 @@ struct ColorPane: View {
                 Text("\(intensity)%").monospacedDigit()
             }
             .onChange(of: intensity) { env.settings.presetIntensity = $0 }
-            SettingsRow(label: "Làm mịn da mặc định", description: "0–100 (mặc định 25 — không cam kết tự nhiên mọi ảnh)") {
-                Slider(value: Binding(get: { Double(smooth) }, set: { smooth = Int($0) }), in: 0...100)
-                    .frame(width: 200)
-                Text("\(smooth)%").monospacedDigit()
-            }
-            .onChange(of: smooth) { env.settings.defaultSkinSmooth = $0 }
             SettingsRow(label: "Smart Face Positioning", description: "Tự crop theo khuôn mặt (§9.1)") {
                 Toggle("", isOn: $smartFace).onChange(of: smartFace) { env.settings.smartFace = $0 }
             }
@@ -358,7 +370,6 @@ struct ColorPane: View {
         .onAppear {
             preset = env.settings.defaultPreset
             intensity = env.settings.presetIntensity
-            smooth = env.settings.defaultSkinSmooth
             smartFace = env.settings.smartFace
             defaultCrop = env.settings.defaultCrop
         }
@@ -389,19 +400,24 @@ struct SoundPane: View {
                     Text("\(volume)%").monospacedDigit()
                 }
             }
+            .disabled(!enabled)
             .onChange(of: volume) { env.settings.soundVolume = $0 }
             SettingsRow(label: "Tiếng tick đếm ngược") {
                 Toggle("", isOn: $countdown).onChange(of: countdown) { env.settings.soundCountdown = $0 }
             }
+            .disabled(!enabled)
             SettingsRow(label: "Tiếng chụp (shutter)") {
                 Toggle("", isOn: $shutter).onChange(of: shutter) { env.settings.soundShutter = $0 }
             }
+            .disabled(!enabled)
             SettingsRow(label: "Tiếng hoàn thành") {
                 Toggle("", isOn: $finish).onChange(of: finish) { env.settings.soundFinish = $0 }
             }
+            .disabled(!enabled)
             Button("Nghe thử") {
                 env.audio.handle(.preview("Glass"))
             }
+            .disabled(!enabled)
         }
         .onAppear {
             enabled = env.settings.soundEnabled
@@ -422,6 +438,7 @@ struct StoragePane: View {
     @State private var quality = 95
     @State private var autoExport = false
     @State private var sizeText = ""
+    @State private var bookmarkLabel = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -439,30 +456,27 @@ struct StoragePane: View {
                     .frame(width: 200)
                 Text("\(quality)").monospacedDigit()
             }
+            .disabled(format == .png)
             .onChange(of: quality) { env.settings.jpegQuality = $0 }
             SettingsRow(label: "Auto Export khi Hoàn thành",
                         description: "Mặc định Tắt. Lỗi export không ảnh hưởng phiên đã lưu (§10.1)") {
                 Toggle("", isOn: $autoExport).onChange(of: autoExport) { env.settings.autoExport = $0 }
             }
             SettingsRow(label: "Thư mục xuất mặc định", description: "Security-scoped bookmark (§10.4)") {
-                Text(bookmarkText()).font(.caption).foregroundStyle(.secondary)
+                Text(bookmarkLabel.isEmpty ? bookmarkText() : bookmarkLabel).font(.caption).foregroundStyle(.secondary)
                 Button("Chọn…") { chooseFolder() }
             }
             Divider()
             SettingsRow(label: "Dung lượng dữ liệu", description: "Thư viện nội bộ") {
-                Text(sizeText).foregroundStyle(.secondary)
+                Text(env.storageMeasurement.formattedText).foregroundStyle(.secondary)
             }
             SettingsRow(label: "Ảnh nguồn", description: "Luôn được lưu trong thư viện để có thể chỉnh sửa và khôi phục") {
                 Label("Luôn bật", systemImage: "lock.fill").foregroundStyle(.secondary)
             }
-            Button("Dọn bộ nhớ đệm") {
-                // IO nền — không block MainActor (P3-13)
-                let thumbs = env.thumbnails
-                Task.detached(priority: .utility) {
-                    try? thumbs.clearAll()
-                }
-                env.showToast("Đã dọn cache — không xóa ảnh/khung/phiên")
+            Button(env.isCleaningCache ? "Đang dọn bộ nhớ đệm…" : "Dọn bộ nhớ đệm") {
+                env.cleanCache()
             }
+            .disabled(env.isCleaningCache)
             .help("Cache thumbnail/preview có thể tạo lại, không thuộc Trash 30 ngày (§10.5)")
             Button("Hiện thư mục dữ liệu") {
                 env.shareService.revealInFinder(env.layout.rootURL)
@@ -472,12 +486,8 @@ struct StoragePane: View {
             format = env.settings.exportFormat
             quality = env.settings.jpegQuality
             autoExport = env.settings.autoExport
-            // Tính dung lượng nền — walk cây thư mục không block UI (P3-13)
-            let layout = env.layout
-            Task.detached(priority: .utility) {
-                let text = layout.formattedSize()
-                await MainActor.run { sizeText = text }
-            }
+            bookmarkLabel = bookmarkText()
+            env.requestStorageMeasurement()
         }
         .frame(maxWidth: 640, alignment: .leading)
     }
@@ -495,9 +505,13 @@ struct StoragePane: View {
         panel.canChooseFiles = false
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
-            if let blob = try? url.bookmarkData(options: .withSecurityScope, includingResourceValuesForKeys: nil, relativeTo: nil),
-               let id = try? env.trashRepo.saveBookmark(purpose: "exportFolder", blob: blob, displayPath: url.path) {
-                env.settings.exportFolderBookmarkID = id
+            Task { @MainActor in
+                do {
+                    try env.saveDefaultExportFolder(url)
+                    bookmarkLabel = url.path
+                } catch {
+                    env.showToast("Không lưu được thư mục xuất mặc định. Hãy chọn lại.", kind: .warning)
+                }
             }
         }
     }
@@ -513,10 +527,10 @@ struct FullscreenPane: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SettingsSectionTitle(text: "Fullscreen Photobooth (§14) — không có admin/PIN")
-            SettingsRow(label: "Khung mặc định", description: "Welcome") {
+            SettingsSectionTitle(text: "Toàn màn hình")
+            SettingsRow(label: "Khung mặc định", description: "Màn hình chờ") {
                 Picker("", selection: $defaultFrame) {
-                    Text("Current").tag("")
+                    Text("Khung hiện tại").tag("")
                     ForEach((try? env.frames.listReadyFrames()) ?? [], id: \.id) { f in
                         Text(f.name).tag(f.id)
                     }
@@ -524,9 +538,9 @@ struct FullscreenPane: View {
                 .frame(width: 220)
                 .onChange(of: defaultFrame) { env.settings.fullscreenDefaultFrame = $0 }
             }
-            SettingsRow(label: "Lọc khung", description: "All hoặc danh mục") {
+            SettingsRow(label: "Lọc khung", description: "Tất cả hoặc danh mục") {
                 Picker("", selection: $filter) {
-                    Text("All").tag("all")
+                    Text("Tất cả").tag("all")
                     ForEach((try? env.frames.listCategories()) ?? [], id: \.id) { c in
                         Text(c.name).tag(c.id)
                     }
@@ -534,9 +548,9 @@ struct FullscreenPane: View {
                 .frame(width: 220)
                 .onChange(of: filter) { env.settings.fullscreenFrameFilter = $0 }
             }
-            SettingsRow(label: "Tự quay về Welcome", description: "Chỉ áp dụng ở màn Finish") {
+            SettingsRow(label: "Tự quay về màn hình chờ", description: "Chỉ áp dụng ở màn hoàn thành") {
                 Picker("", selection: $idleReturn) {
-                    Text("Off").tag(0)
+                    Text("Tắt").tag(0)
                     Text("15s").tag(15)
                     Text("30s").tag(30)
                     Text("60s").tag(60)
@@ -564,6 +578,8 @@ struct DataPane: View {
     @State private var trashSize = ""
     @State private var confirmReset = false
     @State private var confirmEmptyTrash = false
+    @State private var pendingPurgeItems: [TrashItem] = []
+    @State private var pendingPurgeBytes: Int64 = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -575,18 +591,22 @@ struct DataPane: View {
                 panel.begin { response in
                     guard response == .OK, let url = panel.url else { return }
                     Task { @MainActor in
-                        // buildPack (đọc bytes mọi asset) + ghi file chạy nền — không block UI (P3-13)
                         let frames = (try? env.frames.listFrames().map(\.id)) ?? []
                         let packService = env.packService
                         let target = url
-                        let ok = (try? await Task.detached(priority: .userInitiated) { () -> Void in
-                            let data = try packService.buildPack(name: "Khung backup", frameIDs: frames)
-                            try data.write(to: target, options: .atomic)
-                        }.value) != nil
-                        if ok {
-                            env.showToast("Đã sao lưu \(frames.count) khung")
-                        } else {
-                            env.showToast("Backup lỗi — thử lại", kind: .warning)
+                        do {
+                            let result = try await Task.detached(priority: .userInitiated) { () -> FramePackService.BuildPackResult in
+                                let res = try packService.preparePack(name: "Khung backup", frameIDs: frames)
+                                try res.data.write(to: target, options: .atomic)
+                                return res
+                            }.value
+                            if result.skippedDraftCount > 0 {
+                                env.showToast("Đã sao lưu \(result.packedFramesCount) khung (bỏ qua \(result.skippedDraftCount) bản nháp)")
+                            } else {
+                                env.showToast("Đã sao lưu \(result.packedFramesCount) khung")
+                            }
+                        } catch {
+                            env.showToast("Sao lưu thất bại: \((error as? AppError)?.message ?? error.localizedDescription)", kind: .warning)
                         }
                     }
                 }
@@ -606,22 +626,64 @@ struct DataPane: View {
             SettingsRow(label: "Dung lượng Thùng rác", description: "Ước tính") {
                 Text(trashSize).foregroundStyle(.secondary)
             }
-            Button("Dọn sạch Thùng rác", role: .destructive) { confirmEmptyTrash = true }
-                .confirmationDialog("Không thể khôi phục sau thao tác này", isPresented: $confirmEmptyTrash) {
-                    Button("Dọn sạch", role: .destructive) {
-                        // Purge + GC chạy nền — không block MainActor (P3-13)
-                        let trashService = env.trashService
-                        let trashRepo = env.trashRepo
-                        Task.detached(priority: .utility) {
-                            let all = (try? trashRepo.list()) ?? []
-                            let report = trashService.purgeAll(items: all)
-                            await MainActor.run {
-                                env.showToast("Dọn sạch: \(report.success) thành công / \(report.failed) lỗi")
+            Button(env.isManualPurging ? "Đang dọn Thùng rác…" : "Dọn sạch Thùng rác", role: .destructive) {
+                let all = (try? env.trashRepo.list()) ?? []
+                let eligible = all.filter { $0.status == .trashed || $0.status == .purgeFailed }
+                guard !eligible.isEmpty else {
+                    env.showToast("Thùng rác trống", kind: .info)
+                    return
+                }
+                pendingPurgeItems = eligible
+                pendingPurgeBytes = eligible.reduce(Int64(0)) { $0 + $1.estimatedBytes }
+                confirmEmptyTrash = true
+            }
+            .disabled(env.isManualPurging)
+            .confirmationDialog("Không thể khôi phục sau thao tác này", isPresented: $confirmEmptyTrash) {
+                Button("Dọn sạch \(pendingPurgeItems.count) mục", role: .destructive) {
+                    guard let taskID = env.beginManualPurge() else {
+                        env.showToast("Đang có tác vụ dọn khác đang chạy", kind: .warning)
+                        return
+                    }
+
+                    let freshAll = (try? env.trashRepo.list()) ?? []
+                    let freshEligible = freshAll.filter { $0.status == .trashed || $0.status == .purgeFailed }
+                    let freshBytes = freshEligible.reduce(Int64(0)) { $0 + $1.estimatedBytes }
+
+                    if Set(freshEligible.map(\.id)) != Set(pendingPurgeItems.map(\.id)) || freshBytes != pendingPurgeBytes {
+                        env.endManualPurge(taskID: taskID)
+                        env.showToast("Danh sách mục hoặc dung lượng đã thay đổi. Vui lòng xác nhận lại.", kind: .warning)
+                        let bytes = (try? env.trashRepo.totalBytes()) ?? 0
+                        trashSize = FileLayout.formattedBytes(bytes)
+                        return
+                    }
+
+                    let trashService = env.trashService
+                    let trashRepo = env.trashRepo
+                    let itemsToPurge = freshEligible
+
+                    Task.detached(priority: .utility) {
+                        let report = trashService.purgeAll(items: itemsToPurge)
+                        await MainActor.run {
+                            env.endManualPurge(taskID: taskID)
+                            if report.failed > 0 {
+                                env.showToast("Dọn sạch: \(report.success) thành công / \(report.failed) lỗi / \(report.skipped) bỏ qua", kind: .warning)
+                            } else if report.skipped > 0 {
+                                env.showToast("Đã dọn sạch \(report.success) mục (\(report.skipped) mục bỏ qua)")
+                            } else {
+                                env.showToast("Đã dọn sạch \(report.success) mục")
                             }
+                            let bytes = (try? trashRepo.totalBytes()) ?? 0
+                            trashSize = FileLayout.formattedBytes(bytes)
                         }
                     }
-                    Button("Hủy", role: .cancel) {}
                 }
+                Button("Hủy", role: .cancel) {
+                    pendingPurgeItems = []
+                    pendingPurgeBytes = 0
+                }
+            } message: {
+                Text("Dọn sạch toàn bộ \(pendingPurgeItems.count) mục trong Thùng rác (\(FileLayout.formattedBytes(pendingPurgeBytes)))?\nKhông thể khôi phục sau thao tác này.")
+            }
             Divider()
             Button("Đặt lại cài đặt", role: .destructive) { confirmReset = true }
                 .confirmationDialog("Đặt lại toàn bộ cài đặt (không xóa dữ liệu)?", isPresented: $confirmReset) {
@@ -642,6 +704,14 @@ struct DataPane: View {
         .onAppear {
             let bytes = (try? env.trashRepo.totalBytes()) ?? 0
             trashSize = FileLayout.formattedBytes(bytes)
+        }
+        .task {
+            for await _ in EventBus.shared.stream {
+                let bytes = (try? env.trashRepo.totalBytes()) ?? 0
+                await MainActor.run {
+                    trashSize = FileLayout.formattedBytes(bytes)
+                }
+            }
         }
         .frame(maxWidth: 640, alignment: .leading)
     }

@@ -109,16 +109,22 @@ public struct CapturedImagePayload: @unchecked Sendable {
 }
 
 public protocol CameraServing: AnyObject {
+    /// Đọc trạng thái quyền hiện tại của camera mà không khởi phát yêu cầu cấp quyền (§4.3, BUG-CAM-01).
+    func cameraPermissionState() async -> CameraPermissionState
+    /// Chỉ khởi phát prompt xin quyền khi trạng thái là notDetermined và được gọi từ thao tác chủ động của người dùng.
     func requestAccessIfNeeded() async -> CameraPermissionState
     func discoverDevices() async -> [CameraDescriptor]
     func selectDevice(_ id: CameraID) async throws -> CameraCapabilities
     /// Chọn camera theo mode auto (systemPreferredCamera hoặc device đầu tiên).
     func selectAutoDevice() async throws -> CameraCapabilities
+    /// Trả thành công sau khi nhận frame đầu tiên của lần khởi động hiện tại.
     func startPreview() async throws
+    var isPreviewRunning: Bool { get async }
     func stopPreview() async
     /// Fallback still từ video khi thiết bị không hỗ trợ still (codec = "video-frame").
     func captureStill(requestID: UUID) async throws -> CapturedImagePayload
     func applyControls(_ controls: CameraControls) async throws -> AppliedControls
+    func setResolution(_ resolution: String) async throws
     var events: AsyncStream<CameraEvent> { get }
     var currentDevice: CameraDescriptor? { get async }
     var isFallbackVideoStill: Bool { get async }

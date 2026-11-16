@@ -22,6 +22,7 @@ public struct PackFrame: Codable, Equatable {
     public var backgroundColor: String?
     public var backgroundPlacement: String?
     public var foregroundPlacement: String?
+    public var explicitWhite: Bool?
 }
 
 public struct PackCanvas: Codable, Equatable {

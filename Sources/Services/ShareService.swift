@@ -17,7 +17,20 @@ public final class ShareService: @unchecked Sendable {
 
     /// Chuẩn bị file trong Shares/Temp/<share-id>/ (§11.4) — dùng lại export file nếu khớp revision.
     public func prepareShareFile(detail: SessionDetail, filenameBase: String,
-                                 format: ExportImageFormat = .jpeg, quality: Int = 95) async throws -> URL {
+                                 format: ExportImageFormat = .jpeg, quality: Int = 95,
+                                 parentToken: OperationCoordinator.OperationToken? = nil) async throws -> URL {
+        let opToken = try OperationCoordinator.shared.acquire(key: "session:\(detail.session.id)", reason: "ShareService: prepare share", parentToken: parentToken)
+        defer { opToken.release() }
+
+        guard let latestSession = try sessions.getSession(id: detail.session.id),
+              latestSession.status != .trashed else {
+            throw AppError.notFound("Phiên chụp không tồn tại hoặc đã bị xóa")
+        }
+        guard latestSession.revisionNo == detail.session.revisionNo,
+              latestSession.activeFrameSnapshotID == detail.snapshot.id else {
+            throw AppError.invalidState("Dữ liệu phiên đã thay đổi, vui lòng làm mới và thử lại")
+        }
+
         let shareID = IDFactory.new()
         let dir = layout.sharesTempDir.appendingPathComponent(shareID, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -31,10 +44,13 @@ public final class ShareService: @unchecked Sendable {
     }
 
     private func renderForShare(detail: SessionDetail, format: ExportImageFormat) async throws -> CGImage {
-        let model = await builder.buildModel(detail: detail,
-                                             targetWidth: detail.snapshot.canvasWidth,
-                                             targetHeight: detail.snapshot.canvasHeight,
-                                             transparentBackground: format == .png)
+        guard detail.hasEnoughPhotos else {
+            throw AppError.notEnoughPhotos(missing: detail.missingCount)
+        }
+        let model = try await builder.buildModelStrict(detail: detail,
+                                                       targetWidth: detail.snapshot.canvasWidth,
+                                                       targetHeight: detail.snapshot.canvasHeight,
+                                                       transparentBackground: format == .png)
         return try CompositeRenderer.render(model: model)
     }
 
@@ -58,7 +74,13 @@ public final class ShareService: @unchecked Sendable {
         }
     }
 
+    public var revealInFinderHook: ((URL) -> Void)? = nil
+
     public func revealInFinder(_ url: URL) {
+        if let hook = revealInFinderHook {
+            hook(url)
+            return
+        }
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 

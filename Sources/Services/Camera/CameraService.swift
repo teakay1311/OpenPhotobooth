@@ -17,13 +17,14 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
     private let sessionQueue = DispatchQueue(label: "vn.openphotobooth.camera.session")
     private let videoQueue = DispatchQueue(label: "vn.openphotobooth.camera.video")
     private let photoOutput = AVCapturePhotoOutput()
-    private let videoDataOutput = AVCaptureVideoDataOutput()
+    private var videoDataOutput: AVCaptureVideoDataOutput?
 
     private var currentInput: AVCaptureDeviceInput?
     private var selectedDevice: AVCaptureDevice?
+    private var baselineFormat: AVCaptureDevice.Format?
     private var capabilities = CameraCapabilities()
     private var fallbackStill = false
-    private var previewRunning = false
+    private var previewOutputID: ObjectIdentifier?
     private var latestBuffer: (buffer: CVPixelBuffer, atMs: Int64)?
     private let bufferLock = NSLock()
     private var pendingContinuations: [String: CheckedContinuation<CapturedImagePayload, Error>] = [:]
@@ -53,9 +54,6 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
 
     public override init() {
         super.init()
-        videoDataOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
-        videoDataOutput.alwaysDiscardsLateVideoFrames = true
-        videoDataOutput.setSampleBufferDelegate(self, queue: videoQueue)
         registerNotifications()
     }
 
@@ -79,6 +77,17 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
     }}
 
     // MARK: - Permission (§4.3)
+
+    public func cameraPermissionState() async -> CameraPermissionState {
+        let status = AVCaptureDevice.authorizationStatus(for: .video)
+        switch status {
+        case .authorized: return .authorized
+        case .notDetermined: return .notDetermined
+        case .denied: return .denied
+        case .restricted: return .restricted
+        @unknown default: return .denied
+        }
+    }
 
     public func requestAccessIfNeeded() async -> CameraPermissionState {
         let status = AVCaptureDevice.authorizationStatus(for: .video)
@@ -124,9 +133,22 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
         let fmt = device.activeFormat
         let dims = CMVideoFormatDescriptionGetDimensions(fmt.formatDescription)
         let stillSupported = Self.supportsStill(device: device)
+        var allResolutions: [CGSize] = []
+        for f in device.formats {
+            let d = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+            let sz = CGSize(width: Double(d.width), height: Double(d.height))
+            if !allResolutions.contains(sz) {
+                allResolutions.append(sz)
+            }
+        }
+        if allResolutions.isEmpty {
+            allResolutions = [CGSize(width: Double(dims.width), height: Double(dims.height))]
+        }
+        allResolutions.sort { ($0.width * $0.height) > ($1.width * $1.height) }
+
         var caps = CameraCapabilities(
             supportsStillPhoto: stillSupported,
-            resolutions: [CGSize(width: Double(dims.width), height: Double(dims.height))],
+            resolutions: allResolutions,
             supportsFocus: device.isFocusModeSupported(.locked),
             supportsExposure: device.isExposureModeSupported(.custom) || device.isExposureModeSupported(.locked),
             supportsWhiteBalance: device.isWhiteBalanceModeSupported(.locked),
@@ -164,16 +186,40 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
         }
     }
 
-    /// Chọn camera theo mode: auto → systemPreferredCamera (§4.2).
+    /// Chọn camera theo mode: auto → ưu tiên camera tích hợp trước Continuity (§3.1, BUG-CAM-02).
     public func selectAutoDevice() async throws -> CameraCapabilities {
         let devices = await discoverDevices()
         guard !devices.isEmpty else { throw AppError.noCamera }
-        let preferred = devices.first { $0.isSystemPreferred } ?? devices[0]
-        return try await selectDevice(preferred.uniqueID)
+        let sorted = devices.sorted { (a: CameraDescriptor, b: CameraDescriptor) -> Bool in
+            let scoreA = a.kind == .builtIn ? 3 : (a.kind == .usb ? 2 : 1)
+            let scoreB = b.kind == .builtIn ? 3 : (b.kind == .usb ? 2 : 1)
+            if scoreA != scoreB { return scoreA > scoreB }
+            if a.isSystemPreferred != b.isSystemPreferred { return a.isSystemPreferred }
+            return a.localizedName < b.localizedName
+        }
+        var lastError: Error?
+        for dev in sorted {
+            try Task.checkCancellation()
+            do {
+                return try await selectDevice(dev.uniqueID)
+            } catch {
+                lastError = error
+                Log.camera.warning("Auto-select fallback: cannot configure \(dev.localizedName): \(error)")
+            }
+        }
+        throw lastError ?? AppError.noCamera
     }
 
     private func configureDeviceLocked(uniqueID: String) throws {
         guard let device = AVCaptureDevice(uniqueID: uniqueID) else { throw AppError.noCamera }
+        // Tạo input trước để lỗi tạo thiết bị mới không tháo thiết bị hiện tại.
+        let input: AVCaptureDeviceInput
+        do {
+            input = try AVCaptureDeviceInput(device: device)
+        } catch {
+            throw AppError.cameraConfigurationFailed(error.localizedDescription)
+        }
+        stopPreviewLocked()
         session.beginConfiguration()
         defer { session.commitConfiguration() }
         if let oldInput = currentInput {
@@ -181,16 +227,9 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
             currentInput = nil
         }
         session.removeOutput(photoOutput)
-        session.removeOutput(videoDataOutput)
-        let input: AVCaptureDeviceInput
-        do {
-            input = try AVCaptureDeviceInput(device: device)
-        } catch {
-            throw AppError.cameraConfigurationFailed(error.localizedDescription)
-        }
+        selectedDevice = nil
+        baselineFormat = nil
         guard session.canAddInput(input) else { throw AppError.cameraConfigurationFailed("Không thêm được input") }
-        try input.device.lockForConfiguration()
-        device.unlockForConfiguration()
         session.addInput(input)
         if session.canAddOutput(photoOutput) {
             session.addOutput(photoOutput)
@@ -200,13 +239,11 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
                 photoOutput.maxPhotoDimensions = CMVideoDimensions(width: dims.width, height: dims.height)
             }
         }
-        if session.canAddOutput(videoDataOutput) {
-            session.addOutput(videoDataOutput)
-        }
         let conn = photoOutput.connection(with: .video)
         conn?.isEnabled = true
         currentInput = input
         selectedDevice = device
+        baselineFormat = device.activeFormat
         if let desc = makeDescriptor(from: device) {
             capabilities = desc.capabilities
             fallbackStill = !desc.capabilities.supportsStillPhoto
@@ -217,53 +254,114 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
     // MARK: - Preview
 
     public func startPreview() async throws {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            sessionQueue.async { [weak self] in
-                guard let self else { cont.resume(throwing: AppError.cameraBusy); return }
-                if self.currentInput == nil {
-                    cont.resume(throwing: AppError.noCamera)
+        try Task.checkCancellation()
+        let activeOutput = try await withCheckedThrowingContinuation { (cont: CheckedContinuation<AVCaptureVideoDataOutput, Error>) in
+            sessionQueue.async { [self] in
+                guard currentInput != nil else { cont.resume(throwing: AppError.noCamera); return }
+                if let output = videoDataOutput, session.isRunning, hasFreshPreviewFrame() {
+                    cont.resume(returning: output)
                     return
                 }
-                self.session.startRunning()
-                self.previewRunning = true
+                stopPreviewLocked()
+                // Một output riêng cho mỗi lần khởi động để callback cũ không thể xác nhận preview mới.
+                let output = AVCaptureVideoDataOutput()
+                output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+                output.alwaysDiscardsLateVideoFrames = true
+                output.setSampleBufferDelegate(self, queue: videoQueue)
+                session.beginConfiguration()
+                guard session.canAddOutput(output) else {
+                    session.commitConfiguration()
+                    cont.resume(throwing: AppError.cameraConfigurationFailed("Không thêm được đầu ra preview"))
+                    return
+                }
+                session.addOutput(output)
+                session.commitConfiguration()
+                videoDataOutput = output
+                let id = ObjectIdentifier(output)
+                bufferLock.withLock { previewOutputID = id }
+                session.startRunning()
+                guard session.isRunning else {
+                    stopPreviewLocked()
+                    cont.resume(throwing: AppError.cameraConfigurationFailed("Không khởi động được preview"))
+                    return
+                }
+                cont.resume(returning: output)
+            }
+        }
+        let outputID = ObjectIdentifier(activeOutput)
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(5)
+        do {
+            while clock.now < deadline {
+                try Task.checkCancellation()
+                let state = bufferLock.withLock { (previewOutputID == outputID, latestBuffer != nil) }
+                guard state.0 else { throw CancellationError() }
+                if state.1 { return }
+                try await clock.sleep(for: .milliseconds(40))
+            }
+            throw AppError.cameraConfigurationFailed("Camera chưa gửi khung hình (đã chờ 5 giây)")
+        } catch {
+            await stopPreview(matching: activeOutput)
+            throw error
+        }
+    }
+
+    public func stopPreview() async { await stopPreview(matching: nil) }
+
+    private func stopPreview(matching output: AVCaptureVideoDataOutput?) async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            sessionQueue.async { [self] in
+                if output == nil || videoDataOutput === output {
+                    stopPreviewLocked()
+                }
                 cont.resume()
             }
         }
     }
 
-    public func stopPreview() async {
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            sessionQueue.async { [weak self] in
-                guard let self else { cont.resume(); return }
-                if self.previewRunning {
-                    self.session.stopRunning()
-                    self.previewRunning = false
-                }
-                cont.resume()
-            }
+    private func stopPreviewLocked() {
+        bufferLock.withLock {
+            previewOutputID = nil
+            latestBuffer = nil
+        }
+        if session.isRunning { session.stopRunning() }
+        if let output = videoDataOutput {
+            output.setSampleBufferDelegate(nil, queue: nil)
+            session.beginConfiguration()
+            session.removeOutput(output)
+            session.commitConfiguration()
+            videoDataOutput = nil
         }
     }
 
     public var isPreviewRunning: Bool { get async {
         await withCheckedContinuation { cont in
-            sessionQueue.async { [weak self] in cont.resume(returning: self?.previewRunning ?? false) }
+            sessionQueue.async { [self] in
+                cont.resume(returning: session.isRunning && hasFreshPreviewFrame())
+            }
         }
     }}
+
+    private func hasFreshPreviewFrame() -> Bool {
+        guard let frame = latestPreviewBuffer() else { return false }
+        return Time.nowMs() - frame.atMs < 5_000
+    }
 
     // MARK: - Still capture (§4.4, §4.5)
 
     public func captureStill(requestID: UUID) async throws -> CapturedImagePayload {
         let key = requestID.uuidString
-        // E-CAP-01: từ chối request trùng khi đang chờ
-        pendingLock.lock()
-        if !pendingContinuations.isEmpty {
-            pendingLock.unlock()
-            throw AppError.duplicateShutterRequest
-        }
         return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<CapturedImagePayload, Error>) in
-            pendingLock.lock()
-            pendingContinuations[key] = cont
-            pendingLock.unlock()
+            // Kiểm tra và đăng ký lượt chụp trong cùng một lần khóa.
+            let registered = pendingLock.withLock {
+                guard pendingContinuations.isEmpty else { return false }
+                pendingContinuations[key] = cont
+                return true
+            }
+            guard registered else {
+                cont.resume(throwing: AppError.duplicateShutterRequest)
+                return
+            }
             sessionQueue.async { [weak self] in
                 guard let self else {
                     self?.failPending(key, error: AppError.cameraBusy)
@@ -398,6 +496,52 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
         }
     }
 
+    private var configuredResolution: String = "best"
+
+    public func setResolution(_ resolution: String) async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            sessionQueue.async { [weak self] in
+                guard let self else { cont.resume(throwing: AppError.cameraBusy); return }
+                self.configuredResolution = resolution
+                guard let device = self.selectedDevice else {
+                    cont.resume()
+                    return
+                }
+                if resolution == "best" {
+                    if let baseline = self.baselineFormat {
+                        do {
+                            try device.lockForConfiguration()
+                            device.activeFormat = baseline
+                            device.unlockForConfiguration()
+                            Log.camera.info("Đã khôi phục Best Stable format: \(device.localizedName, privacy: .public)")
+                        } catch {
+                            Log.camera.warning("Không khôi phục được Best Stable format: \(error.localizedDescription, privacy: .public)")
+                        }
+                    }
+                    cont.resume()
+                    return
+                }
+                let parts = resolution.split(separator: "x")
+                if parts.count == 2, let w = Int32(parts[0]), let h = Int32(parts[1]) {
+                    if let matchingFormat = device.formats.first(where: {
+                        let d = CMVideoFormatDescriptionGetDimensions($0.formatDescription)
+                        return d.width == w && d.height == h
+                    }) {
+                        do {
+                            try device.lockForConfiguration()
+                            device.activeFormat = matchingFormat
+                            device.unlockForConfiguration()
+                            Log.camera.info("Đã áp dụng độ phân giải camera: \(resolution, privacy: .public)")
+                        } catch {
+                            Log.camera.warning("Không áp dụng được độ phân giải \(resolution, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                        }
+                    }
+                }
+                cont.resume()
+            }
+        }
+    }
+
     /// Frame mới nhất cho preview (CVPixelBuffer BGRA).
     public func latestPreviewBuffer() -> (buffer: CVPixelBuffer, atMs: Int64)? {
         bufferLock.lock(); defer { bufferLock.unlock() }
@@ -448,9 +592,10 @@ public final class CameraService: NSObject, CameraServing, @unchecked Sendable {
 extension CameraService: AVCaptureVideoDataOutputSampleBufferDelegate {
     public func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        bufferLock.lock()
-        latestBuffer = (buffer, Time.nowMs())
-        bufferLock.unlock()
+        bufferLock.withLock {
+            guard previewOutputID == ObjectIdentifier(output) else { return }
+            latestBuffer = (buffer, Time.nowMs())
+        }
     }
 }
 
@@ -474,11 +619,17 @@ extension CameraService: AVCapturePhotoCaptureDelegate {
             failPending(key, error: AppError.ioFailure("Không đọc được dữ liệu ảnh"))
             return
         }
-        let props = CGImageSourceCopyPropertiesAtIndex(CGImageSourceCreateWithData(data as CFData, nil)!, 0, nil) as? [CFString: Any]
-        let w = props?[kCGImagePropertyPixelWidth] as? Int ?? 0
-        let h = props?[kCGImagePropertyPixelHeight] as? Int ?? 0
-        let orientation = props?[kCGImagePropertyOrientation] as? Int ?? 1
-        let profile = props?[kCGImagePropertyProfileName] as? String
+        guard !data.isEmpty,
+              let source = CGImageSourceCreateWithData(data as CFData, nil),
+              CGImageSourceGetCount(source) > 0,
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] else {
+            failPending(key, error: AppError.ioFailure("Không đọc được thuộc tính ảnh"))
+            return
+        }
+        let w = props[kCGImagePropertyPixelWidth] as? Int ?? 0
+        let h = props[kCGImagePropertyPixelHeight] as? Int ?? 0
+        let orientation = props[kCGImagePropertyOrientation] as? Int ?? 1
+        let profile = props[kCGImagePropertyProfileName] as? String
         succeedPending(key, payload: CapturedImagePayload(
             data: data, actualWidth: w, actualHeight: h, orientation: orientation,
             colorProfile: profile, capturedAtMs: Time.nowMs(), requestID: key, codec: "jpeg"))

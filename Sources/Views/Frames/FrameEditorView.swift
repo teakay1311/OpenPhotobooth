@@ -7,6 +7,8 @@ public struct FrameEditorView: View {
     @StateObject private var vm: FrameEditorViewModel
     @State private var inspectorTab: EditorTab = .slot
     @State private var showCloseConfirm = false
+    private let imported: FrameEditorImportDraft?
+    private let onImportFinished: ((Frame?) -> Void)?
 
     public enum EditorTab: String, CaseIterable {
         case canvas = "Canvas"
@@ -16,12 +18,21 @@ public struct FrameEditorView: View {
 
     public init(env: AppEnvironment) {
         self.env = env
+        imported = nil
+        onImportFinished = nil
+        _vm = StateObject(wrappedValue: FrameEditorViewModel(env: env))
+    }
+
+    init(env: AppEnvironment, imported: FrameEditorImportDraft, onImportFinished: @escaping (Frame?) -> Void) {
+        self.env = env
+        self.imported = imported
+        self.onImportFinished = onImportFinished
         _vm = StateObject(wrappedValue: FrameEditorViewModel(env: env))
     }
 
     public var body: some View {
         VStack(spacing: 0) {
-            toolbar
+            toolbar.fixedSize(horizontal: false, vertical: true)
             Divider()
             HStack(spacing: 0) {
                 slotList.frame(width: 190)
@@ -35,9 +46,26 @@ public struct FrameEditorView: View {
             statusBar
         }
         .onAppear {
+            if let imported {
+                vm.load(imported: imported)
+                return
+            }
             vm.load(frameID: env.frameEditorDraft?.frameID)
+            env.frameEditorHasChanges = vm.hasAnyChanges
+            env.frameEditorSaveHandler = { vm.save() }
         }
-        .onDisappear { env.frameEditorDraft = nil }
+        .onChange(of: vm.hasAnyChanges) { hasChanges in
+            if imported == nil { env.frameEditorHasChanges = hasChanges }
+        }
+        .onDisappear {
+            if imported != nil {
+                vm.discardImportedFrame()
+                return
+            }
+            env.frameEditorDraft = nil
+            env.frameEditorHasChanges = false
+            env.frameEditorSaveHandler = nil
+        }
     }
 
     // MARK: Toolbar (§2.7)
@@ -45,42 +73,38 @@ public struct FrameEditorView: View {
     private var toolbar: some View {
         HStack(spacing: 10) {
             Button {
-                if vm.hasChanges {
-                    showCloseConfirm = true
-                } else {
-                    env.closeFrameEditor()
-                }
+                if let onImportFinished { onImportFinished(nil) }
+                else { env.requestNavigation(to: .frames) }
             } label: {
                 Label("Quay lại", systemImage: "chevron.left")
-            }
-            .confirmationDialog("Có thay đổi chưa lưu", isPresented: $showCloseConfirm) {
-                Button("Lưu") {
-                    if vm.save() { env.closeFrameEditor() }
-                }
-                Button("Bỏ thay đổi", role: .destructive) { env.closeFrameEditor() }
-                Button("Hủy", role: .cancel) {}
-            } message: {
-                Text("Lưu / Bỏ thay đổi / Hủy")
             }
             TextField("Tên khung", text: $vm.draftName)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 200)
                 .help("Tên chỉ được lưu khi bấm Lưu")
             PrimaryButton(title: "Lưu", systemImage: "checkmark",
-                          disabledReason: vm.canSave ? nil : (vm.hasChanges ? "Validator chưa pass" : "Chưa có thay đổi")) {
-                if vm.save() { env.closeFrameEditor() }
+                          disabledReason: vm.canSave ? nil : (vm.hasAnyChanges ? "Validator chưa pass" : "Chưa có thay đổi")) {
+                if let onImportFinished {
+                    if let frame = vm.saveImportedFrame() { onImportFinished(frame) }
+                } else if vm.save() {
+                    env.closeFrameEditor()
+                }
             }
             Button { vm.undo() } label: { Image(systemName: "arrow.uturn.backward") }
                 .disabled(!vm.canUndo)
                 .help("⌘Z Undo (một lần kéo = một Undo)")
+                .keyboardShortcut("z", modifiers: .command)
             Button { vm.redo() } label: { Image(systemName: "arrow.uturn.forward") }
                 .disabled(!vm.canRedo)
                 .help("⇧⌘Z Redo")
+                .keyboardShortcut("z", modifiers: [.command, .shift])
             Divider()
             Button { vm.addSlot() } label: { Label("Thêm ô", systemImage: "plus.rectangle") }
-                .help("Thêm ô ảnh (tối đa 24 ô, 12 lượt)")
+                .disabled(vm.slots.count >= 12)
+                .help("Thêm ô ảnh (tối đa 12 ô)")
             if let sel = vm.selectedSlotID {
                 Button { vm.duplicateSlot(sel) } label: { Image(systemName: "plus.square.on.square") }
+                    .disabled(vm.slots.count >= 12)
                     .help("Nhân bản ô")
                 Button { vm.deleteSlot(sel) } label: { Image(systemName: "trash") }
                     .disabled(vm.slots.count <= 1)
@@ -99,8 +123,13 @@ public struct FrameEditorView: View {
             Toggle(isOn: $vm.snapEnabled) { Image(systemName: "magnet") }
                 .toggleStyle(.button).help("Snap 6–8pt")
             Spacer()
-            Button { vm.regeneratePreview() } label: { Label("Preview", systemImage: "eye") }
-                .help("Preview dùng cùng renderer geometry với export (I-05)")
+            Button {
+                vm.regeneratePreview()
+                inspectorTab = .canvas
+            } label: {
+                Label("Preview", systemImage: "eye")
+            }
+            .help("Xem trước và chuyển sang tab Canvas (I-05)")
         }
         .padding(10)
     }
@@ -190,16 +219,17 @@ public struct FrameEditorView: View {
         if let sel = vm.selectedSlotID, let slot = vm.slots.first(where: { $0.id == sel }) {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Ô #\(slot.zOrder + 1)").font(.headline)
-                NumericRow(label: "X", value: slot.x) { v in
+                Text("Tọa độ chuẩn hóa (0.0 – 1.0 theo canvas)").font(.caption2).foregroundStyle(.secondary)
+                NumericRow(label: "X (0–1)", value: slot.x) { v in
                     var s = slot; s.x = v; vm.updateSlotFromInspector(s)
                 }
-                NumericRow(label: "Y", value: slot.y) { v in
+                NumericRow(label: "Y (0–1)", value: slot.y) { v in
                     var s = slot; s.y = v; vm.updateSlotFromInspector(s)
                 }
-                NumericRow(label: "W", value: slot.width) { v in
+                NumericRow(label: "Rộng W (0–1)", value: slot.width) { v in
                     var s = slot; s.width = max(v, 0.01); vm.updateSlotFromInspector(s)
                 }
-                NumericRow(label: "H", value: slot.height) { v in
+                NumericRow(label: "Cao H (0–1)", value: slot.height) { v in
                     var s = slot; s.height = max(v, 0.01); vm.updateSlotFromInspector(s)
                 }
                 NumericRow(label: "Rotation°", value: slot.rotationDegrees, range: -180...180) { v in

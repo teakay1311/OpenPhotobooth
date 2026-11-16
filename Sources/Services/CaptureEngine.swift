@@ -36,6 +36,23 @@ public final class CaptureEngine: ObservableObject {
     @Published public private(set) var snapshot: FrameSnapshot?
     @Published public private(set) var lastError: AppError?
 
+    public struct ShotContext: Equatable {
+        public let sessionID: String
+        public let snapshotID: String
+        public let captureIndex: Int
+        public let kind: ShotKind
+        public let keepCrop: Bool
+
+        public init(sessionID: String, snapshotID: String, captureIndex: Int, kind: ShotKind, keepCrop: Bool = false) {
+            self.sessionID = sessionID
+            self.snapshotID = snapshotID
+            self.captureIndex = captureIndex
+            self.kind = kind
+            self.keepCrop = keepCrop
+        }
+    }
+    public private(set) var lastShotContext: ShotContext?
+
     public var onShotCommitted: ((Int, PhotoRevision, ShotKind) -> Void)?
     public var onSessionStatusChanged: ((SessionStatus) -> Void)?
 
@@ -43,10 +60,23 @@ public final class CaptureEngine: ObservableObject {
     private let safetySave: SafetySaveService
     private let sessions: SessionRepository
     private let audio: AudioService
+    private let coordinator: OperationCoordinator
+    private var sessionLockToken: OperationCoordinator.OperationToken?
     private var cameraEventTask: Task<Void, Never>?
     private var timerToken = 0
-    private var pauseRequested = false
+    @Published public private(set) var pauseRequested = false
+    private var pendingPauseReason: PauseReason?
     private var captureInFlight = false
+    private struct PendingPhoto {
+        let sessionID: String
+        let index: Int
+        let kind: ShotKind
+        let requestID: String
+        let payload: CapturedImagePayload
+    }
+    private var pendingPhoto: PendingPhoto?
+    public var hasPhotoToSave: Bool { pendingPhoto != nil }
+    private var isNavigationSafePointHold = false
     /// Giữ tùy chọn "giữ crop" của lệnh retake đang chạy (§3.3) — bền vững qua route vì nằm trong engine.
     private var pendingRetakeKeepCrop = false
     private var notificationObservers: [NSObjectProtocol] = []
@@ -55,11 +85,13 @@ public final class CaptureEngine: ObservableObject {
     public private(set) var intervalSeconds: Int = 2
 
     public init(camera: CameraServing, safetySave: SafetySaveService,
-                sessions: SessionRepository, audio: AudioService) {
+                sessions: SessionRepository, audio: AudioService,
+                coordinator: OperationCoordinator = OperationCoordinator.shared) {
         self.camera = camera
         self.safetySave = safetySave
         self.sessions = sessions
         self.audio = audio
+        self.coordinator = coordinator
         registerLifecycleObservers()
         listenCameraEvents()
     }
@@ -88,7 +120,8 @@ public final class CaptureEngine: ObservableObject {
 
     public var canChangeCamera: Bool {
         switch state {
-        case .ready, .paused, .intermission, .recoverableError, .idle, .reviewing: return true
+        case .ready, .paused, .recoverableError, .idle, .reviewing: return true
+        case .intermission, .countdown, .capturing, .persisting: return false // Intermission còn lượt là bận (§3.5 BUG-CAM-02)
         default: return false
         }
     }
@@ -101,7 +134,8 @@ public final class CaptureEngine: ObservableObject {
     }
 
     public var requiredIndices: Set<Int> {
-        Set(snapshot?.slots.map(\.captureIndex) ?? [])
+        guard let snapshot else { return [] }
+        return session?.captureIndices(in: snapshot) ?? snapshot.requiredIndices
     }
 
     public var nextPendingIndex: Int? {
@@ -136,23 +170,92 @@ public final class CaptureEngine: ObservableObject {
         return record
     }
 
+    public var canAdoptSession: Bool {
+        !isCaptureBusy && !hasPhotoToSave && !isNavigationSafePointHold
+    }
+
     /// Tiếp tục phiên đã có (recovery / "Tiếp tục phiên cũ" §10.3).
+    @discardableResult
     public func adoptSession(record: CaptureSessionRecord, snapshot: FrameSnapshot,
-                             committed: [Int: PhotoRevision]) {
+                             committed: [Int: PhotoRevision], forReview: Bool = false) -> Bool {
+        guard canAdoptSession else { return false }
+        timerToken += 1
+        if session?.id != record.id || self.snapshot?.id != snapshot.id {
+            releaseSessionLock()
+            lastShotContext = nil
+            pendingRetakeKeepCrop = false
+        }
         session = record
         self.snapshot = snapshot
-        committedShots = committed
-        state = .ready
+        let validIndices = record.captureIndices(in: snapshot)
+        committedShots = committed.filter { validIndices.contains($0.key) }
+        state = forReview ? .reviewing : .ready
         countdownSeconds = record.countdownSeconds
         intervalSeconds = record.intermissionSeconds
+        return true
     }
 
     public func resetToIdle() {
+        guard !hasPhotoToSave else { return }
+        pauseRequested = false
+        pendingPauseReason = nil
         timerToken += 1
+        releaseSessionLock()
         session = nil
         snapshot = nil
         committedShots = [:]
+        lastShotContext = nil
         state = .idle
+    }
+
+    // MARK: - Lock & Navigation Hold Helpers (DATA-01, NAV-02)
+
+    private func acquireSessionLockIfNeeded(sessionID: String) {
+        guard sessionLockToken == nil else { return }
+        sessionLockToken = try? coordinator.acquire(key: "session:\(sessionID)", reason: "CaptureEngine: capturing")
+    }
+
+    private func releaseSessionLock() {
+        sessionLockToken?.release()
+        sessionLockToken = nil
+    }
+
+    public func holdCountdownTimer() {
+        timerToken += 1
+    }
+
+    public func holdAtSafePoint() {
+        isNavigationSafePointHold = true
+    }
+
+    public func releaseSafePointHold() {
+        isNavigationSafePointHold = false
+        if case .ready = state {
+            if session?.captureMode == .automatic, let next = nextPendingIndex {
+                scheduleIntermission(nextIndex: next)
+            }
+        }
+    }
+
+    public func resumeFromNavigationHold(remainingSeconds: Int, captureIndex: Int, kind: ShotKind, isIntermission: Bool) {
+        if case .paused = state {
+            // L1: Pause do mất focus, sleep hoặc mất camera vẫn còn hiệu lực
+            return
+        }
+        if isIntermission {
+            scheduleIntermission(nextIndex: captureIndex)
+        } else {
+            scheduleCountdown(seconds: max(remainingSeconds, 1), index: captureIndex, kind: kind)
+        }
+    }
+
+    public func pauseFromNavigationHold(nextIndex: Int, kind: ShotKind) {
+        timerToken += 1
+        state = .paused(reason: .user, nextIndex: nextIndex, kind: kind)
+        if let session {
+            try? sessions.setStatus(sessionID: session.id, status: .paused)
+        }
+        releaseSessionLock()
     }
 
     // MARK: - Start / Pause / Resume / Cancel
@@ -165,6 +268,7 @@ public final class CaptureEngine: ObservableObject {
             return
         }
         pauseRequested = false
+        pendingPauseReason = nil
         scheduleCountdown(seconds: countdownSeconds, index: index, kind: .normal)
     }
 
@@ -176,6 +280,7 @@ public final class CaptureEngine: ObservableObject {
         guard case .ready = state else { throw AppError.invalidState("Chưa sẵn sàng") }
         guard let index = nextPendingIndex else { enterReview(); return }
         pauseRequested = false
+        pendingPauseReason = nil
         scheduleCountdown(seconds: countdownSeconds, index: index, kind: .normal)
     }
 
@@ -185,6 +290,8 @@ public final class CaptureEngine: ObservableObject {
         case .countdown, .intermission:
             timerToken += 1
             state = .ready
+            releaseSessionLock()
+            lastShotContext = nil
         default:
             break
         }
@@ -195,12 +302,17 @@ public final class CaptureEngine: ObservableObject {
         case .countdown(_, let index, let kind):
             timerToken += 1
             state = .paused(reason: reason, nextIndex: index, kind: kind)
+            if let session { try? sessions.setStatus(sessionID: session.id, status: .paused) }
+            releaseSessionLock()
         case .intermission(let index, _):
             timerToken += 1
             state = .paused(reason: reason, nextIndex: index, kind: .normal)
+            if let session { try? sessions.setStatus(sessionID: session.id, status: .paused) }
+            releaseSessionLock()
         case .capturing, .persisting:
-            // Đợi safe point (§5.2) — sau persist sẽ apply
+            // Đợi safe point (§5.2 / L1) — sau persist sẽ apply
             pauseRequested = true
+            pendingPauseReason = reason
         default:
             break
         }
@@ -225,6 +337,7 @@ public final class CaptureEngine: ObservableObject {
     /// "Giữ phiên và thoát" (§2.2 Paused) — session đã lưu paused trong DB, engine về idle.
     /// Phiên đã hoàn thành giữ nguyên trạng thái completed (không hạ xuống paused).
     public func keepSessionAndExit() {
+        guard !hasPhotoToSave, !isCaptureBusy else { return }
         if let session {
             if let current = try? sessions.getSession(id: session.id),
                current.status == .inProgress || current.status == .reviewable || current.status == .draft {
@@ -232,6 +345,7 @@ public final class CaptureEngine: ObservableObject {
             }
         }
         timerToken += 1
+        releaseSessionLock()
         state = .idle
         session = nil
         snapshot = nil
@@ -254,16 +368,30 @@ public final class CaptureEngine: ObservableObject {
 
     public func enterReview() {
         timerToken += 1
+        releaseSessionLock()
         state = .reviewing
         if let session {
-            try? sessions.setStatus(sessionID: session.id, status: .reviewable)
-            onSessionStatusChanged?(.reviewable)
+            let currentStatus = (try? sessions.getSession(id: session.id))?.status ?? session.status
+            if currentStatus != .completed {
+                try? sessions.setStatus(sessionID: session.id, status: .reviewable)
+                onSessionStatusChanged?(.reviewable)
+            }
         }
     }
 
-    /// Rời RecoverableError về Ready (nút "Thử lại lượt" §2.2).
+    /// Rời RecoverableError về Ready hoặc đếm ngược lại lượt retake/additional (CAP-01).
     public func retryFromError() {
-        if case .recoverableError = state { state = .ready }
+        guard !hasPhotoToSave else { return }
+        guard case .recoverableError(_, let captureIndex) = state else { return }
+        releaseSessionLock()
+        if let ctx = lastShotContext, ctx.kind == .retake, ctx.captureIndex == captureIndex {
+            pendingRetakeKeepCrop = ctx.keepCrop
+            scheduleCountdown(seconds: countdownSeconds, index: captureIndex, kind: .retake)
+        } else if let ctx = lastShotContext, ctx.kind == .additional, ctx.captureIndex == captureIndex {
+            scheduleCountdown(seconds: countdownSeconds, index: captureIndex, kind: .additional)
+        } else {
+            state = .ready
+        }
     }
 
     public func beginExport() {
@@ -275,47 +403,95 @@ public final class CaptureEngine: ObservableObject {
     }
 
     public func complete() {
-        guard case .reviewing = state else { return }
+        guard !hasPhotoToSave else { return }
         if let session {
-            try? sessions.setStatus(sessionID: session.id, status: .completed)
             onSessionStatusChanged?(.completed)
         }
         audio.handle(.completed)
         // Reset về idle để có thể bắt đầu phiên mới ngay (P1-6) — phiên đã completed trong DB,
         // mở lại được từ Thư viện bất cứ lúc nào.
         timerToken += 1
+        releaseSessionLock()
         state = .idle
         session = nil
         snapshot = nil
         committedShots = [:]
+        lastShotContext = nil
     }
 
     // MARK: - Timer (§5.3)
 
     private func scheduleCountdown(seconds: Int, index: Int, kind: ShotKind) {
+        if pauseRequested {
+            let reason = pendingPauseReason ?? .user
+            pauseRequested = false
+            pendingPauseReason = nil
+            timerToken += 1
+            state = .paused(reason: reason, nextIndex: index, kind: kind)
+            if let session { try? sessions.setStatus(sessionID: session.id, status: .paused) }
+            releaseSessionLock()
+            return
+        }
+        guard let session, let snap = snapshot else { return }
+        let sessionID = session.id
+        let snapshotID = snap.id
+        acquireSessionLockIfNeeded(sessionID: session.id)
+        lastShotContext = ShotContext(sessionID: session.id, snapshotID: snap.id,
+                                      captureIndex: index, kind: kind,
+                                      keepCrop: pendingRetakeKeepCrop)
         timerToken += 1
         let token = timerToken
+        state = .countdown(remainingSeconds: max(seconds, 1), captureIndex: index, kind: kind)
         Task { [weak self] in
             await self?.runTimer(seconds: seconds, token: token) { remaining in
                 .countdown(remainingSeconds: remaining, captureIndex: index, kind: kind)
             } tick: { remaining in
                 if remaining <= 3 { self?.audio.handle(.countdownTick(last: remaining == 1)) }
             } finish: { [weak self] in
-                await self?.performCapture(index: index, kind: kind, token: token)
+                guard let self, self.timerToken == token,
+                      self.session?.id == sessionID, self.snapshot?.id == snapshotID else { return }
+                await self.performCapture(index: index, kind: kind, token: token, expectedSessionID: sessionID, expectedSnapshotID: snapshotID)
             }
         }
     }
 
     private func scheduleIntermission(nextIndex: Int) {
+        if pauseRequested {
+            let reason = pendingPauseReason ?? .user
+            pauseRequested = false
+            pendingPauseReason = nil
+            timerToken += 1
+            state = .paused(reason: reason, nextIndex: nextIndex, kind: .normal)
+            if let session { try? sessions.setStatus(sessionID: session.id, status: .paused) }
+            releaseSessionLock()
+            return
+        }
+        guard let session, let snap = snapshot else { return }
+        let sessionID = session.id
+        let snapshotID = snap.id
+        acquireSessionLockIfNeeded(sessionID: session.id)
         timerToken += 1
         let token = timerToken
         let seconds = intervalSeconds
+        state = .intermission(nextIndex: nextIndex, remainingSeconds: max(seconds, 1))
         Task { [weak self] in
             await self?.runTimer(seconds: seconds, token: token) { remaining in
                 .intermission(nextIndex: nextIndex, remainingSeconds: remaining)
             } tick: { _ in
             } finish: { [weak self] in
-                self?.scheduleCountdown(seconds: self?.countdownSeconds ?? 3, index: nextIndex, kind: .normal)
+                guard let self, self.timerToken == token,
+                      self.session?.id == sessionID, self.snapshot?.id == snapshotID else { return }
+                if self.pauseRequested {
+                    let reason = self.pendingPauseReason ?? .user
+                    self.pauseRequested = false
+                    self.pendingPauseReason = nil
+                    self.timerToken += 1
+                    self.state = .paused(reason: reason, nextIndex: nextIndex, kind: .normal)
+                    if let sess = self.session, sess.id == sessionID { try? self.sessions.setStatus(sessionID: sess.id, status: .paused) }
+                    self.releaseSessionLock()
+                    return
+                }
+                self.scheduleCountdown(seconds: self.countdownSeconds, index: nextIndex, kind: .normal)
             }
         }
     }
@@ -348,30 +524,50 @@ public final class CaptureEngine: ObservableObject {
 
     // MARK: - Capture + persist barrier (I-01, I-09, §5.3)
 
-    private func performCapture(index: Int, kind: ShotKind, token: Int) async {
-        guard token == timerToken else { return }
-        guard !captureInFlight else { return }   // I-01
+    public func retryPendingSave() async {
+        guard let pendingPhoto, pendingPhoto.sessionID == session?.id,
+              case .recoverableError = state, !captureInFlight else { return }
+        acquireSessionLockIfNeeded(sessionID: pendingPhoto.sessionID)
+        pauseRequested = true
+        pendingPauseReason = .user
+        await performCapture(index: pendingPhoto.index, kind: pendingPhoto.kind,
+                             token: timerToken, retry: pendingPhoto)
+    }
+
+    private func performCapture(index: Int, kind: ShotKind, token: Int, retry: PendingPhoto? = nil, expectedSessionID: String? = nil, expectedSnapshotID: String? = nil) async {
+        guard token == timerToken, !captureInFlight, !hasPhotoToSave || retry != nil else { return }
         guard let session, let snap = snapshot else {
             state = .recoverableError(message: "Không có phiên chụp", captureIndex: index)
             return
         }
+        if let expectedSessionID, session.id != expectedSessionID { return }
+        if let expectedSnapshotID, snap.id != expectedSnapshotID { return }
         captureInFlight = true
         defer { captureInFlight = false }
-        state = .capturing(captureIndex: index, kind: kind)
-        // CameraServing.captureStill nhận UUID; SafetySaveService/DB dùng String (capture_request_id).
-        let requestUUID = UUID()
-        let requestID = requestUUID.uuidString
         do {
-            let payload = try await camera.captureStill(requestID: requestUUID)
-            audio.handle(.shutter)
+            let photo: PendingPhoto
+            if let retry {
+                photo = retry
+            } else {
+                state = .capturing(captureIndex: index, kind: kind)
+                let request = UUID()
+                let payload = try await camera.captureStill(requestID: request)
+                photo = PendingPhoto(sessionID: session.id, index: index, kind: kind,
+                                     requestID: request.uuidString, payload: payload)
+                pendingPhoto = photo
+                audio.handle(.shutter)
+            }
             state = .persisting(captureIndex: index, kind: kind)
+            let payload = photo.payload
             // Persist barrier: ghi file + verify + DB transaction (§5.3) — lỗi không tăng index
             let revision = try await safetySave.savePhoto(
                 sessionID: session.id, captureIndex: index,
-                payloadData: payload.data, requestID: requestID,
+                payloadData: payload.data, requestID: photo.requestID,
                 width: payload.actualWidth, height: payload.actualHeight,
                 orientation: payload.orientation, codec: payload.codec,
-                colorProfile: payload.colorProfile)
+                colorProfile: payload.colorProfile,
+                parentToken: sessionLockToken)
+            pendingPhoto = nil
             committedShots[index] = revision
             EventBus.shared.post(.shotCommitted(sessionID: session.id, captureIndex: index, photoRevisionID: revision.id))
             onShotCommitted?(index, revision, kind)
@@ -384,45 +580,87 @@ public final class CaptureEngine: ObservableObject {
                 }
                 pendingRetakeKeepCrop = false
             }
-            let required = Set(snap.slots.map(\.captureIndex))
+
+            // Safe point thoát / tạm dừng (§Bước 2 / L1): kiểm tra trước khi lên lịch lượt kế
+            let currentStatus = (try? sessions.getSession(id: session.id))?.status ?? session.status
+            if pauseRequested {
+                let reason = pendingPauseReason ?? .user
+                pauseRequested = false
+                pendingPauseReason = nil
+                timerToken += 1
+                let required = session.captureIndices(in: snap)
+                if required.isSubset(of: Set(committedShots.keys)) {
+                    if currentStatus != .completed {
+                        try? sessions.setStatus(sessionID: session.id, status: .reviewable)
+                        onSessionStatusChanged?(.reviewable)
+                    }
+                    state = .reviewing
+                    audio.handle(.completed)
+                    releaseSessionLock()
+                } else {
+                    let next = nextPendingIndex ?? index
+                    state = .paused(reason: reason, nextIndex: next, kind: .normal)
+                    try? sessions.setStatus(sessionID: session.id, status: .paused)
+                    releaseSessionLock()
+                }
+                return
+            }
+
+            if isNavigationSafePointHold {
+                isNavigationSafePointHold = false
+                let required = session.captureIndices(in: snap)
+                if required.isSubset(of: Set(committedShots.keys)) {
+                    if currentStatus != .completed {
+                        try? sessions.setStatus(sessionID: session.id, status: .reviewable)
+                        onSessionStatusChanged?(.reviewable)
+                    }
+                    state = .reviewing
+                    audio.handle(.completed)
+                    releaseSessionLock()
+                } else if session.captureMode == .manual {
+                    state = .ready
+                    releaseSessionLock()
+                } else {
+                    // Đợi quyết định từ dialog điều hướng (NAV-02)
+                    state = .ready
+                }
+                return
+            }
+
+            let required = session.captureIndices(in: snap)
             if required.isSubset(of: Set(committedShots.keys)) {
-                try? sessions.setStatus(sessionID: session.id, status: .reviewable)
+                if currentStatus != .completed {
+                    try? sessions.setStatus(sessionID: session.id, status: .reviewable)
+                    onSessionStatusChanged?(.reviewable)
+                }
                 state = .reviewing
                 audio.handle(.completed)
-                onSessionStatusChanged?(.reviewable)
+                releaseSessionLock()
             } else if kind != .normal {
                 state = .reviewing
+                releaseSessionLock()
             } else if session.captureMode == .manual {
                 state = .ready   // CAP-10: chờ người dùng bấm Chụp tiếp
+                releaseSessionLock()
             } else if let next = nextPendingIndex {
                 scheduleIntermission(nextIndex: next)
             } else {
                 state = .reviewing
+                releaseSessionLock()
             }
-        } catch let error as AppError {
-            if case .duplicateShutterRequest = error {
-                // E-CAP-01: bỏ qua, không alert — nhưng phải thoát khỏi .capturing để không kẹt UI
-                timerToken += 1
-                state = .ready
-                return
-            }
-            timerToken += 1
-            lastError = error
-            state = .recoverableError(message: error.message, captureIndex: index)
-            audio.handle(.warning)
         } catch {
             timerToken += 1
-            lastError = AppError.ioFailure(error.localizedDescription)
-            state = .recoverableError(message: error.localizedDescription, captureIndex: index)
-            audio.handle(.warning)
-        }
-        if pauseRequested {
             pauseRequested = false
-            // Vô hiệu hóa mọi timer intermission/countdown đã schedule trước đó
-            // (I-10: không tự tiếp tục chụp sau khi pause/sleep-wake).
-            timerToken += 1
-            let next = nextPendingIndex ?? index
-            state = .paused(reason: .user, nextIndex: next, kind: .normal)
+            pendingPauseReason = nil
+            isNavigationSafePointHold = false
+            if !hasPhotoToSave { releaseSessionLock() }
+            let failure = (error as? AppError) ?? .ioFailure(error.localizedDescription)
+            lastError = failure
+            state = .recoverableError(message: failure.message, captureIndex: index)
+            if kind != .retake, (try? sessions.getSession(id: session.id)?.status) != .completed {
+                try? sessions.setStatus(sessionID: session.id, status: .paused)
+            }
+            audio.handle(.warning)
         }
     }
 
@@ -487,7 +725,12 @@ public final class CaptureEngine: ObservableObject {
         notificationObservers.append(nc.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                if case .countdown = self.state { self.pause(reason: .appInactive) }
+                switch self.state {
+                case .countdown, .intermission, .capturing, .persisting:
+                    self.pause(reason: .appInactive)
+                default:
+                    break
+                }
             }
         })
     }
@@ -496,3 +739,17 @@ public final class CaptureEngine: ObservableObject {
         nextPendingIndex ?? (requiredIndices.contains(fallback) ? fallback : nil)
     }
 }
+
+#if DEBUG
+extension CaptureEngine {
+    public func setStateForTesting(_ newState: State) {
+        self.state = newState
+    }
+    public var timerTokenForTesting: Int {
+        timerToken
+    }
+    public var isNavigationSafePointHoldForTesting: Bool {
+        isNavigationSafePointHold
+    }
+}
+#endif

@@ -3,7 +3,7 @@ import Foundation
 /// Schema v1 — DDL chuyển ngữ trực tiếp từ đặc tả §16.2 + §16.3 (asset_references),
 /// bổ sung bảng app_state cho seedVersion/clock-marker (§6.4 idempotent seeding).
 public enum Schema {
-    public static let currentVersion: Int64 = 2
+    public static let currentVersion: Int64 = 3
 
     static let v1Statements: [String] = [
         """
@@ -228,7 +228,7 @@ public enum Schema {
         """
         CREATE TABLE IF NOT EXISTS trash_items (
             id TEXT PRIMARY KEY,
-            root_type TEXT NOT NULL CHECK(root_type IN ('session','frame','category','preset')),
+            root_type TEXT NOT NULL CHECK(root_type IN ('session','frame','category','preset','photo')),
             root_id TEXT NOT NULL,
             display_name TEXT NOT NULL,
             deleted_at_ms INTEGER NOT NULL,
@@ -298,7 +298,7 @@ public enum Schema {
         }
 
         if applied.isEmpty {
-            // Cài đặt schema ban đầu v1 + v2 hoàn chỉnh (mới hoàn toàn)
+            // Cài đặt schema ban đầu v1 + v2 + v3 hoàn chỉnh (mới hoàn toàn)
             try db.withTransaction { tx in
                 for stmt in v1Statements { try tx.run(stmt) }
                 try tx.run("INSERT INTO schema_migrations(version, applied_at_ms) VALUES(?, ?)",
@@ -309,6 +309,8 @@ public enum Schema {
                 try tx.run("ALTER TABLE sessions ADD COLUMN intermission_seconds INTEGER NOT NULL DEFAULT 2")
                 try tx.run("INSERT INTO schema_migrations(version, applied_at_ms) VALUES(?, ?)",
                            [.int(2), .int(now)])
+                try tx.run("INSERT INTO schema_migrations(version, applied_at_ms) VALUES(?, ?)",
+                           [.int(3), .int(now)])
             }
             return
         }
@@ -353,6 +355,83 @@ public enum Schema {
 
                 try tx.run("INSERT INTO schema_migrations(version, applied_at_ms) VALUES(?, ?)",
                            [.int(2), .int(now)])
+            }
+        }
+
+        // Migration v2 -> v3 (§2.3 item 4: mở rộng trash_items.root_type với 'photo')
+        if !applied.contains(3) {
+            // 1. Tạo bản sao an toàn trước migration v3 nếu DB nằm trên đĩa
+            if db.databasePath != ":memory:" {
+                let dbURL = URL(fileURLWithPath: db.databasePath)
+                let backupDir = backupFolder ?? dbURL.deletingLastPathComponent().appendingPathComponent("backups")
+                try? FileManager.default.createDirectory(at: backupDir, withIntermediateDirectories: true)
+                let backupURL = backupDir.appendingPathComponent("openphotobooth-pre-migration-v3-\(now).sqlite")
+                do {
+                    try db.backup(to: backupURL.path)
+                    Log.store.info("Đã sao lưu an toàn trước migration v2->v3: \(backupURL.path, privacy: .public)")
+                } catch {
+                    throw AppError.ioFailure("Không tạo được bản sao lưu an toàn trước migration v2->v3: \(error.localizedDescription)")
+                }
+            }
+
+            // Ghi nhận số lượng bản ghi trước migration để đối chiếu
+            let preSessions = (try? db.query("SELECT COUNT(*) c FROM sessions").first?["c"]?.intValue) ?? 0
+            let prePhotos = (try? db.query("SELECT COUNT(*) c FROM photo_revisions").first?["c"]?.intValue) ?? 0
+            let preAdjustments = (try? db.query("SELECT COUNT(*) c FROM photo_adjustments").first?["c"]?.intValue) ?? 0
+            let preSnapshots = (try? db.query("SELECT COUNT(*) c FROM frame_snapshots").first?["c"]?.intValue) ?? 0
+            let preTrash = (try? db.query("SELECT COUNT(*) c FROM trash_items").first?["c"]?.intValue) ?? 0
+
+            // 2. Thực thi migration trong transaction duy nhất
+            try db.withTransaction { tx in
+                try tx.run("""
+                    CREATE TABLE IF NOT EXISTS trash_items_v3 (
+                        id TEXT PRIMARY KEY,
+                        root_type TEXT NOT NULL CHECK(root_type IN ('session','frame','category','preset','photo')),
+                        root_id TEXT NOT NULL,
+                        display_name TEXT NOT NULL,
+                        deleted_at_ms INTEGER NOT NULL,
+                        expires_at_ms INTEGER NOT NULL,
+                        original_parent_id TEXT,
+                        estimated_bytes INTEGER NOT NULL DEFAULT 0,
+                        status TEXT NOT NULL CHECK(status IN ('trashed','restoring','purging','purge_failed')),
+                        last_error TEXT,
+                        UNIQUE(root_type,root_id)
+                    )
+                """)
+                try tx.run("""
+                    INSERT INTO trash_items_v3(id, root_type, root_id, display_name, deleted_at_ms,
+                        expires_at_ms, original_parent_id, estimated_bytes, status, last_error)
+                    SELECT id, root_type, root_id, display_name, deleted_at_ms,
+                        expires_at_ms, original_parent_id, estimated_bytes, status, last_error
+                    FROM trash_items
+                """)
+                try tx.run("DROP TABLE trash_items")
+                try tx.run("ALTER TABLE trash_items_v3 RENAME TO trash_items")
+                try tx.run("CREATE INDEX IF NOT EXISTS ix_trash_expiry ON trash_items(status,expires_at_ms)")
+
+                try tx.run("INSERT INTO schema_migrations(version, applied_at_ms) VALUES(?, ?)",
+                           [.int(3), .int(now)])
+            }
+
+            // 3. Kiểm tra tính toàn vẹn cơ sở dữ liệu và số lượng đối tượng sau migration (§2.3 item 4)
+            let integrityRows = try db.query("PRAGMA integrity_check")
+            let integrityResult = integrityRows.first?["integrity_check"]?.stringValue ?? ""
+            guard integrityResult.lowercased() == "ok" else {
+                throw AppError.databaseCorrupt("PRAGMA integrity_check thất bại sau migration v3: \(integrityResult)")
+            }
+
+            let postSessions = (try? db.query("SELECT COUNT(*) c FROM sessions").first?["c"]?.intValue) ?? 0
+            let postPhotos = (try? db.query("SELECT COUNT(*) c FROM photo_revisions").first?["c"]?.intValue) ?? 0
+            let postAdjustments = (try? db.query("SELECT COUNT(*) c FROM photo_adjustments").first?["c"]?.intValue) ?? 0
+            let postSnapshots = (try? db.query("SELECT COUNT(*) c FROM frame_snapshots").first?["c"]?.intValue) ?? 0
+            let postTrash = (try? db.query("SELECT COUNT(*) c FROM trash_items").first?["c"]?.intValue) ?? 0
+
+            guard postSessions == preSessions,
+                  postPhotos == prePhotos,
+                  postAdjustments == preAdjustments,
+                  postSnapshots == preSnapshots,
+                  postTrash == preTrash else {
+                throw AppError.databaseCorrupt("Dữ liệu không khớp sau migration v3: sessions \(preSessions)->\(postSessions), photos \(prePhotos)->\(postPhotos), trash \(preTrash)->\(postTrash)")
             }
         }
     }

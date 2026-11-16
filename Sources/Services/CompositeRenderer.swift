@@ -20,14 +20,25 @@ public enum CompositeRenderer {
         let scale = Double(W) / Double(snap.canvasWidth)
         let canvasRect = CGRect(x: 0, y: 0, width: W, height: H)
 
-        // Base: màu canvas hoặc trong suốt (PNG alpha §11.2)
-        var canvas: CIImage
-        if model.options.transparentBackground {
-            canvas = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0)).cropped(to: canvasRect)
+        // D2-A09: Màu canvas nằm dưới lớp nền, ảnh và overlay (§7.2, §11.2).
+        // Quy tắc thống nhất:
+        // - Trắng mặc định (#FFFFFFFF / #FFFFFF) thiếu dấu hiệu explicitWhite -> canvas trong suốt (alpha 0).
+        // - Trắng chọn tường minh (explicitWhite == true) -> trắng đục (1,1,1,1).
+        // - Các màu khác -> dùng đúng màu RGBA và alpha đã lưu.
+        let hex = snap.backgroundColorHex.trimmingCharacters(in: CharacterSet(charactersIn: "#")).uppercased()
+        let isWhiteHex = (hex == "FFFFFFFF" || hex == "FFFFFF")
+        let canvasColor: CIColor
+        if isWhiteHex {
+            if snap.explicitWhite == true {
+                canvasColor = CIColor(red: 1, green: 1, blue: 1, alpha: 1)
+            } else {
+                canvasColor = CIColor(red: 0, green: 0, blue: 0, alpha: 0)
+            }
         } else {
-            let c = CIColor(cgColor: model.options.matteColor)
-            canvas = CIImage(color: c).cropped(to: canvasRect)
+            let cg = ColorHex.toCGColor(snap.backgroundColorHex)
+            canvasColor = CIColor(cgColor: cg)
         }
+        var canvas = CIImage(color: canvasColor).cropped(to: canvasRect)
 
         // Background layer
         if let bg = snap.background, let image = model.assetImages[bg.assetID] {
@@ -53,6 +64,12 @@ public enum CompositeRenderer {
             }
         }
 
+        // D2-A09: JPG (hoặc transparentBackground == false) ghép kết quả còn trong suốt lên nền trắng
+        if !model.options.transparentBackground {
+            let whiteMatte = CIImage(color: CIColor(red: 1, green: 1, blue: 1, alpha: 1)).cropped(to: canvasRect)
+            canvas = canvas.composited(over: whiteMatte)
+        }
+
         guard let output = CIContextHolder.shared.context.createCGImage(canvas, from: canvasRect) else {
             throw AppError.exportFailed("Không tạo được ảnh render")
         }
@@ -75,13 +92,7 @@ public enum CompositeRenderer {
         let resolved = ResolvedPhotoParams.resolve(defaults: model.defaults,
                                                    override: model.overrides[slot.captureIndex])
 
-        // 1. Skin smoothing (trước preset — §8.4)
-        if resolved.skinSmooth > 0.001,
-           let faces = model.faces[slot.captureIndex], !faces.isEmpty,
-           let smoothed = SkinSmoothingFilter.apply(ciImage: photo, faces: faces, strength: resolved.skinSmooth) {
-            photo = smoothed
-        }
-        // 2. Preset + intensity + adjustments
+        // 1. Preset + intensity + adjustments (§8.4)
         photo = ImageColorPipeline.applyColor(photo, resolved: resolved)
 
         // 3. Crop/placement (§7.3)

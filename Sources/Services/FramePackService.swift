@@ -15,36 +15,95 @@ public final class FramePackService: @unchecked Sendable {
 
     // MARK: - Export (§13.3)
 
-    public func buildPack(name: String, frameIDs: [String], includeCategories: Bool = true) throws -> Data {
+    public struct BuildPackResult: Sendable {
+        public let data: Data
+        public let packedFramesCount: Int
+        public let skippedDraftCount: Int
+        public let skippedReasons: [String]
+    }
+
+    public func preparePack(name: String, frameIDs: [String], includeCategories: Bool = true) throws -> BuildPackResult {
+        var seen = Set<String>()
+        var uniqueIDs: [String] = []
+        for id in frameIDs {
+            if !seen.contains(id) {
+                seen.insert(id)
+                uniqueIDs.append(id)
+            }
+        }
+
         var packFrames: [PackFrame] = []
         var fileMap: [String: Data] = [:]  // relPath -> bytes
         var files: [PackFileEntry] = []
+        var skippedReasons: [String] = []
+        var skippedDraftCount = 0
         let categories = (try? frames.listCategories()) ?? []
 
-        for frameID in frameIDs {
-            guard let frame = try frames.getFrame(id: frameID),
-                  let revID = frame.currentRevisionID,
-                  let rev = try frames.getRevision(id: revID) else { continue }
+        for frameID in uniqueIDs {
+            guard let frame = try frames.getFrame(id: frameID), frame.lifecycle == .active else {
+                throw AppError.notFound("Khung \(frameID) không tồn tại hoặc đã bị xóa")
+            }
+            guard let revID = frame.currentRevisionID,
+                  let rev = try frames.getRevision(id: revID) else {
+                throw AppError.invalidState("Khung '\(frame.name)' thiếu revision hiện hành")
+            }
             let slots = try frames.getSlots(revisionID: revID)
+
+            // Nháp 0 ô: bỏ qua có báo số lượng và lý do (A1)
+            if slots.isEmpty {
+                skippedDraftCount += 1
+                skippedReasons.append("Bỏ qua bản nháp '\(frame.name)' do chưa có ô ảnh")
+                continue
+            }
+
+            // Khung cũ vượt 12 ô
+            if slots.count > 12 {
+                throw AppError.invalidState("Khung '\(frame.name)' có \(slots.count) ô (vượt giới hạn tối đa 12 ô)")
+            }
+
+            // Trùng index hoặc hình học không hợp lệ
+            var seenIndices = Set<Int>()
+            for s in slots {
+                if seenIndices.contains(s.captureIndex) {
+                    throw AppError.invalidState("Khung '\(frame.name)' có chỉ số ô ảnh trùng lặp (\(s.captureIndex))")
+                }
+                seenIndices.insert(s.captureIndex)
+                guard s.x.isFinite, s.y.isFinite, s.width.isFinite, s.height.isFinite,
+                      s.width > 0, s.height > 0 else {
+                    throw AppError.invalidState("Khung '\(frame.name)' có hình học ô ảnh không hợp lệ")
+                }
+            }
+
             var bgRef: String? = nil
             var fgRef: String? = nil
-            if let bgID = rev.backgroundAssetID, let info = assets.assetInfo(assetID: bgID) {
-                let path = "assets/\(info.sha256).png"
+            if let bgID = rev.backgroundAssetID {
+                guard let info = assets.assetInfo(assetID: bgID),
+                      let data = try? assets.loadData(assetID: bgID) else {
+                    throw AppError.missingFrameAssets
+                }
+                let ext = (data.count >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF) ? "jpg" : "png"
+                let path = "assets/\(info.sha256).\(ext)"
                 bgRef = "sha256:\(info.sha256)"
-                if fileMap[path] == nil, let data = try? assets.loadData(assetID: bgID) {
+                if fileMap[path] == nil {
                     fileMap[path] = data
                     files.append(PackFileEntry(path: path, sha256: info.sha256, size: data.count))
                 }
             }
-            if let fgID = rev.foregroundAssetID, let info = assets.assetInfo(assetID: fgID) {
-                let path = "assets/\(info.sha256).png"
+            if let fgID = rev.foregroundAssetID {
+                guard let info = assets.assetInfo(assetID: fgID),
+                      let data = try? assets.loadData(assetID: fgID) else {
+                    throw AppError.missingFrameAssets
+                }
+                let ext = (data.count >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF) ? "jpg" : "png"
+                let path = "assets/\(info.sha256).\(ext)"
                 fgRef = "sha256:\(info.sha256)"
-                if fileMap[path] == nil, let data = try? assets.loadData(assetID: fgID) {
+                if fileMap[path] == nil {
                     fileMap[path] = data
                     files.append(PackFileEntry(path: path, sha256: info.sha256, size: data.count))
                 }
             }
             let categoryName = frame.categoryID.flatMap { cid in categories.first { $0.id == cid }?.name }
+            let explicitWhite = (try? db.query("SELECT value FROM app_state WHERE key=?", [.text("explicit_white_\(revID)")]).first?["value"]?.stringValue) == "1"
             packFrames.append(PackFrame(
                 frameId: frame.id, name: frame.name,
                 category: includeCategories ? categoryName : nil,
@@ -58,8 +117,14 @@ public final class FramePackService: @unchecked Sendable {
                 assets: PackFrameAssets(background: bgRef, foreground: fgRef),
                 backgroundColor: rev.backgroundColorHex,
                 backgroundPlacement: rev.backgroundPlacement.rawValue,
-                foregroundPlacement: rev.foregroundPlacement.rawValue))
+                foregroundPlacement: rev.foregroundPlacement.rawValue,
+                explicitWhite: explicitWhite ? true : nil))
         }
+
+        guard !packFrames.isEmpty else {
+            throw AppError.invalidState("Không có khung hợp lệ nào để đóng gói (tất cả là bản nháp 0 ô hoặc danh sách rỗng)")
+        }
+
         let manifest = PackManifest(schemaVersion: 1, packFormatVersion: 1,
                                     packId: IDFactory.new(), name: name,
                                     createdAt: ISO8601DateFormatter().string(from: Date()),
@@ -72,7 +137,12 @@ public final class FramePackService: @unchecked Sendable {
         let zipData = ZipArchive.archive(entries: entries)
         // Verify archive trước khi save (§13.3)
         _ = try Self.validate(data: zipData)
-        return zipData
+        return BuildPackResult(data: zipData, packedFramesCount: packFrames.count,
+                               skippedDraftCount: skippedDraftCount, skippedReasons: skippedReasons)
+    }
+
+    public func buildPack(name: String, frameIDs: [String], includeCategories: Bool = true) throws -> Data {
+        try preparePack(name: name, frameIDs: frameIDs, includeCategories: includeCategories).data
     }
 
     // MARK: - Validation (§13.2)
@@ -100,6 +170,9 @@ public final class FramePackService: @unchecked Sendable {
             guard !frame.slots.isEmpty else {
                 throw AppError.unsafeFramePack("Khung '\(frame.name)' không có ô ảnh")
             }
+            guard frame.slots.count <= 12 else {
+                throw AppError.unsafeFramePack("Khung '\(frame.name)' có \(frame.slots.count) ô (vượt giới hạn tối đa 12 ô)")
+            }
             guard (ResourceLimits.canvasMin...ResourceLimits.canvasMax).contains(frame.canvas.width),
                   (ResourceLimits.canvasMin...ResourceLimits.canvasMax).contains(frame.canvas.height),
                   Double(frame.canvas.width) * Double(frame.canvas.height) <= ResourceLimits.maxMegapixels * 1_000_000 else {
@@ -107,8 +180,8 @@ public final class FramePackService: @unchecked Sendable {
             }
             var indices: Set<Int> = []
             for slot in frame.slots {
-                guard slot.captureIndex >= 1, slot.captureIndex <= ResourceLimits.maxCaptureIndices else {
-                    throw AppError.unsafeFramePack("Khung '\(frame.name)' captureIndex ngoài phạm vi")
+                guard slot.captureIndex >= 1, slot.captureIndex <= 12 else {
+                    throw AppError.unsafeFramePack("Khung '\(frame.name)' captureIndex ngoài phạm vi (1...12)")
                 }
                 guard slot.x.isFinite, slot.y.isFinite, slot.width.isFinite, slot.height.isFinite,
                       slot.width > 0, slot.height > 0 else {
@@ -116,11 +189,40 @@ public final class FramePackService: @unchecked Sendable {
                 }
                 indices.insert(slot.captureIndex)
             }
+            guard indices.count == frame.slots.count else {
+                throw AppError.unsafeFramePack("Khung '\(frame.name)' có chỉ số ô ảnh trùng lặp")
+            }
             if let maxIdx = indices.max(), indices != Set(1...maxIdx) {
                 warnings.append("Khung '\(frame.name)' thiếu lượt chụp liên tục")
             }
         }
         // Files: path an toàn + trỏ đúng assets/<sha>.<ext>
+        let entryNames = entries.map(\.name)
+        guard Set(entryNames).count == entryNames.count else {
+            throw AppError.unsafeFramePack("Gói chứa entry trùng tên")
+        }
+        let entryNameSet = Set(entryNames)
+        for declared in manifest.files {
+            guard entryNameSet.contains(declared.path) else {
+                throw AppError.unsafeFramePack("Gói thiếu tệp đã khai báo: \(declared.path)")
+            }
+        }
+        let declaredShas = Set(manifest.files.map(\.sha256))
+        for frame in manifest.frames {
+            if let bg = frame.assets.background {
+                let sha = bg.replacingOccurrences(of: "sha256:", with: "")
+                guard declaredShas.contains(sha) else {
+                    throw AppError.unsafeFramePack("Khung '\(frame.name)' tham chiếu nền không có trong gói")
+                }
+            }
+            if let fg = frame.assets.foreground {
+                let sha = fg.replacingOccurrences(of: "sha256:", with: "")
+                guard declaredShas.contains(sha) else {
+                    throw AppError.unsafeFramePack("Khung '\(frame.name)' tham chiếu lớp phủ không có trong gói")
+                }
+            }
+        }
+
         let validPaths = Set(manifest.files.map(\.path))
         for entry in entries where entry.name != "manifest.json" {
             guard !entry.name.contains(".."), !entry.name.hasPrefix("/"), !entry.name.contains("\0") else {
@@ -218,89 +320,200 @@ public final class FramePackService: @unchecked Sendable {
 
     // MARK: - Import (§13.2, PACK-01..05)
 
-    public struct ImportChoice: Equatable {
+    public enum PackItemStatus: Equatable, Sendable {
+        case imported(frameID: String)
+        case replaced(frameID: String)
+        case skipped
+        case unselected
+        case failedBeforeWrite(String)
+        case partiallyWritten(String)
+
+        public var isSuccess: Bool {
+            switch self {
+            case .imported, .replaced, .skipped, .unselected: return true
+            default: return false
+            }
+        }
+
+        public var message: String {
+            switch self {
+            case .imported(let id): return id
+            case .replaced(let id): return id
+            case .skipped: return "Bỏ qua"
+            case .unselected: return "Đã bỏ chọn"
+            case .failedBeforeWrite(let r): return "Thất bại trước khi ghi: \(r)"
+            case .partiallyWritten(let r): return "Có thể đã ghi một phần: \(r)"
+            }
+        }
+    }
+
+    public struct ImportChoice: Equatable, Sendable {
         public var packFrameID: String
         public var policy: PackDuplicatePolicy
         public var selected: Bool
+
+        public init(packFrameID: String, policy: PackDuplicatePolicy, selected: Bool) {
+            self.packFrameID = packFrameID
+            self.policy = policy
+            self.selected = selected
+        }
     }
 
     /// Nhập theo lựa chọn từng khung; per-frame transaction; kết quả từng item (§13.2).
     public func applyImport(result: PackValidationResult,
                             choices: [ImportChoice],
                             data: Data) throws -> [String: Result<String, String>] {
+        let detailed = try applyImportDetailed(result: result, choices: choices, data: data)
+        var outcomes: [String: Result<String, String>] = [:]
+        for (id, status) in detailed {
+            switch status {
+            case .imported(let frameID), .replaced(let frameID):
+                outcomes[id] = .success(frameID)
+            case .skipped:
+                outcomes[id] = .success("Bỏ qua")
+            case .unselected:
+                outcomes[id] = .success("Đã bỏ chọn")
+            case .failedBeforeWrite(let err):
+                outcomes[id] = .failure("Thất bại trước khi ghi: \(err)")
+            case .partiallyWritten(let err):
+                outcomes[id] = .failure("Có thể đã ghi một phần: \(err)")
+            }
+        }
+        return outcomes
+    }
+
+    /// Nhập chi tiết phân loại kết quả từng mục theo mốc ghi dữ liệu (§13.2, FRM-01).
+    public func applyImportDetailed(result: PackValidationResult,
+                                    choices: [ImportChoice],
+                                    data: Data) throws -> [String: PackItemStatus] {
+        _ = try Self.validate(data: data)
         let entries = try ZipArchive.read(data: data)
         var extracted: [String: Data] = [:]
         for entry in entries where entry.name != "manifest.json" {
             extracted[entry.name] = try ZipArchive.extract(data: data, entry: entry,
                                                            maxUncompressedBytes: ResourceLimits.maxAssetBytes)
         }
-        var outcomes: [String: Result<String, String>] = [:]
+        var statuses: [String: PackItemStatus] = [:]
         let existingNames = try frames.listFrames().map(\.name)
         for choice in choices {
             guard choice.selected else {
-                outcomes[choice.packFrameID] = .success("Đã bỏ chọn")
+                statuses[choice.packFrameID] = .unselected
                 continue
             }
             guard let packFrame = result.manifest.frames.first(where: { $0.frameId == choice.packFrameID }) else {
-                outcomes[choice.packFrameID] = .failure("Không tìm thấy khung trong manifest")
+                statuses[choice.packFrameID] = .failedBeforeWrite("Không tìm thấy khung trong manifest")
                 continue
             }
+            if choice.policy == .skip {
+                statuses[choice.packFrameID] = .skipped
+                continue
+            }
+            var didEnterWriteZone = false
             do {
                 switch choice.policy {
                 case .skip:
-                    outcomes[choice.packFrameID] = .success("Bỏ qua")
+                    statuses[choice.packFrameID] = .skipped
                 case .copy:
                     let newID = try importFrame(packFrame: packFrame, extracted: extracted,
-                                                forceNewID: true, existingNames: existingNames)
-                    outcomes[choice.packFrameID] = .success(newID)
+                                                forceNewID: true, existingNames: existingNames,
+                                                onEnteredWriteZone: { didEnterWriteZone = true })
+                    statuses[choice.packFrameID] = .imported(frameID: newID)
                 case .replace:
                     let id = try importFrame(packFrame: packFrame, extracted: extracted,
-                                             forceNewID: false, existingNames: existingNames)
-                    outcomes[choice.packFrameID] = .success(id)
+                                             forceNewID: false, existingNames: existingNames,
+                                             onEnteredWriteZone: { didEnterWriteZone = true })
+                    statuses[choice.packFrameID] = .replaced(frameID: id)
                 }
             } catch {
-                outcomes[choice.packFrameID] = .failure(error.localizedDescription)
+                if didEnterWriteZone {
+                    statuses[choice.packFrameID] = .partiallyWritten(error.localizedDescription)
+                } else {
+                    statuses[choice.packFrameID] = .failedBeforeWrite(error.localizedDescription)
+                }
             }
         }
         EventBus.shared.post(.frameLibraryChanged(frameID: nil))
         EventBus.shared.post(.categoryChanged)
-        return outcomes
+        return statuses
     }
 
     private func importFrame(packFrame: PackFrame, extracted: [String: Data],
-                             forceNewID: Bool, existingNames: [String]) throws -> String {
-        // Tải asset
-        var bgAsset: AssetStore.StoredAsset?
-        var fgAsset: AssetStore.StoredAsset?
+                             forceNewID: Bool, existingNames: [String],
+                             onEnteredWriteZone: () -> Void) throws -> String {
         let ownerKey = "pack-\(packFrame.frameId)-\(forceNewID ? "copy" : "replace")-\(IDFactory.new())"
-        if let bgRef = packFrame.assets.background {
-            let sha = bgRef.replacingOccurrences(of: "sha256:", with: "")
-            if let data = extracted.first(where: { $0.key.contains(sha) })?.value {
-                bgAsset = try assets.store(data: data, mediaType: "image/png", purpose: AssetKind.frameBackground.rawValue,
-                                           ownerType: "frame_revision", ownerID: ownerKey)
+        onEnteredWriteZone()
+        do {
+            // Tải asset
+            var bgAsset: AssetStore.StoredAsset?
+            var fgAsset: AssetStore.StoredAsset?
+            if let bgRef = packFrame.assets.background {
+                let sha = bgRef.replacingOccurrences(of: "sha256:", with: "")
+                if let data = extracted.first(where: { $0.key.contains(sha) })?.value {
+                    let isJpeg = data.count >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF
+                    let mediaType = isJpeg ? "image/jpeg" : "image/png"
+                    bgAsset = try assets.store(data: data, mediaType: mediaType, purpose: AssetKind.frameBackground.rawValue,
+                                               ownerType: "frame_revision", ownerID: ownerKey)
+                }
             }
-        }
-        if let fgRef = packFrame.assets.foreground {
-            let sha = fgRef.replacingOccurrences(of: "sha256:", with: "")
-            if let data = extracted.first(where: { $0.key.contains(sha) })?.value {
-                fgAsset = try assets.store(data: data, mediaType: "image/png", purpose: AssetKind.frameForeground.rawValue,
-                                           ownerType: "frame_revision", ownerID: ownerKey)
+            if let fgRef = packFrame.assets.foreground {
+                let sha = fgRef.replacingOccurrences(of: "sha256:", with: "")
+                if let data = extracted.first(where: { $0.key.contains(sha) })?.value {
+                    let isJpeg = data.count >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF
+                    let mediaType = isJpeg ? "image/jpeg" : "image/png"
+                    fgAsset = try assets.store(data: data, mediaType: mediaType, purpose: AssetKind.frameForeground.rawValue,
+                                               ownerType: "frame_revision", ownerID: ownerKey)
+                }
             }
-        }
-        // Category display name → tạo nếu chưa có (không fail cả pack nếu category lỗi)
-        var categoryID: String? = nil
-        if let catName = packFrame.category, !catName.isEmpty {
-            categoryID = try? frames.createCategory(name: catName).id
-            if categoryID == nil, let all = try? frames.listCategories() {
-                categoryID = all.first { $0.name.lowercased() == catName.lowercased() }?.id
+            // Category display name → tạo nếu chưa có (không fail cả pack nếu category lỗi)
+            var categoryID: String? = nil
+            if let catName = packFrame.category, !catName.isEmpty {
+                categoryID = try? frames.createCategory(name: catName).id
+                if categoryID == nil, let all = try? frames.listCategories() {
+                    categoryID = all.first { $0.name.lowercased() == catName.lowercased() }?.id
+                }
             }
-        }
 
-        if !forceNewID, let existing = try frames.listFrames().first(where: {
-            $0.name.lowercased() == packFrame.name.lowercased()
-        }), let _ = existing.currentRevisionID {
-            // Thay thế: tạo revision mới trên frame được chọn (PACK-05), session cũ giữ snapshot
-            var rev = FrameRevision(frameID: existing.id, revisionNo: 1,
+            if !forceNewID, let existing = try frames.listFrames().first(where: {
+                $0.name.lowercased() == packFrame.name.lowercased()
+            }), let _ = existing.currentRevisionID {
+                // Thay thế: tạo revision mới trên frame được chọn (PACK-05), session cũ giữ snapshot
+                var rev = FrameRevision(frameID: existing.id, revisionNo: 1,
+                                        canvasWidth: packFrame.canvas.width, canvasHeight: packFrame.canvas.height,
+                                        backgroundAssetID: bgAsset?.id, foregroundAssetID: fgAsset?.id,
+                                        backgroundColorHex: packFrame.backgroundColor ?? "#FFFFFFFF",
+                                        backgroundPlacement: PlacementKind(rawValue: packFrame.backgroundPlacement ?? "") ?? .aspectFill,
+                                        foregroundPlacement: PlacementKind(rawValue: packFrame.foregroundPlacement ?? "") ?? .aspectFit)
+                _ = rev.revisionNo
+                let slots = packFrame.slots.map { s in
+                    FrameSlot(id: IDFactory.new(), frameRevisionID: rev.id,
+                              captureIndex: s.captureIndex, x: s.x, y: s.y, width: s.width, height: s.height,
+                              rotationDegrees: s.rotationDegrees ?? 0, zOrder: s.zOrder,
+                              maskType: MaskType(rawValue: s.mask ?? "") ?? .rectangle,
+                              cornerRadius: s.cornerRadius ?? 0,
+                              defaultCropMode: CropMode(rawValue: s.cropMode ?? "") ?? .autoFace)
+                }
+                let committed = try frames.commitRevision(frameID: existing.id, draft: rev, slots: slots)
+                // Trạng thái theo validator thật (F-VAL) — không set .ready mù (§7.5)
+                let issues = FrameValidator.validate(canvasWidth: rev.canvasWidth, canvasHeight: rev.canvasHeight,
+                                                     slots: slots, hasBackground: bgAsset != nil,
+                                                     hasForeground: fgAsset != nil,
+                                                     backgroundColorHex: rev.backgroundColorHex)
+                try frames.setValidationStatus(frameID: existing.id, status: issues.isEmpty ? .ready : .invalid)
+                // Chuyển owner references từ key tạm sang revision thật (tránh orphan).
+                try assets.moveReferences(ownerType: "frame_revision", fromOwnerID: ownerKey, toOwnerID: committed.id)
+                if packFrame.explicitWhite == true {
+                    try? db.run("INSERT OR REPLACE INTO app_state(key, value) VALUES(?, '1')", [.text("explicit_white_\(committed.id)")])
+                }
+                if let cid = categoryID { try frames.setCategory(frameID: existing.id, categoryID: cid) }
+                return existing.id
+            }
+
+            // Bản sao: frame mới + ID mới (PACK-04)
+            let name = FrameRepository.uniqueName(base: packFrame.name, existing: existingNames)
+            let newFrame = try frames.createEmptyFrame(name: name, categoryID: categoryID,
+                                                       canvasWidth: packFrame.canvas.width,
+                                                       canvasHeight: packFrame.canvas.height)
+            var rev = FrameRevision(frameID: newFrame.id, revisionNo: 1,
                                     canvasWidth: packFrame.canvas.width, canvasHeight: packFrame.canvas.height,
                                     backgroundAssetID: bgAsset?.id, foregroundAssetID: fgAsset?.id,
                                     backgroundColorHex: packFrame.backgroundColor ?? "#FFFFFFFF",
@@ -315,51 +528,22 @@ public final class FramePackService: @unchecked Sendable {
                           cornerRadius: s.cornerRadius ?? 0,
                           defaultCropMode: CropMode(rawValue: s.cropMode ?? "") ?? .autoFace)
             }
-            let committed = try frames.commitRevision(frameID: existing.id, draft: rev, slots: slots)
+            let committed = try frames.commitRevision(frameID: newFrame.id, draft: rev, slots: slots)
             // Trạng thái theo validator thật (F-VAL) — không set .ready mù (§7.5)
             let issues = FrameValidator.validate(canvasWidth: rev.canvasWidth, canvasHeight: rev.canvasHeight,
                                                  slots: slots, hasBackground: bgAsset != nil,
                                                  hasForeground: fgAsset != nil,
                                                  backgroundColorHex: rev.backgroundColorHex)
-            try frames.setValidationStatus(frameID: existing.id, status: issues.isEmpty ? .ready : .invalid)
-            // Chuyển owner references từ key tạm sang revision thật (tránh orphan).
+            try frames.setValidationStatus(frameID: newFrame.id, status: issues.isEmpty ? .ready : .invalid)
+            // Chuyển owner references từ key tạm sang revision thật
             try assets.moveReferences(ownerType: "frame_revision", fromOwnerID: ownerKey, toOwnerID: committed.id)
-            if let cid = categoryID { try frames.setCategory(frameID: existing.id, categoryID: cid) }
-            return existing.id
+            if packFrame.explicitWhite == true {
+                try? db.run("INSERT OR REPLACE INTO app_state(key, value) VALUES(?, '1')", [.text("explicit_white_\(committed.id)")])
+            }
+            return newFrame.id
+        } catch {
+            try? assets.removeReferences(ownerType: "frame_revision", ownerID: ownerKey)
+            throw error
         }
-
-        // Bản sao: frame mới + ID mới (PACK-04)
-        let name = FrameRepository.uniqueName(base: packFrame.name, existing: existingNames)
-        let newFrame = try frames.createEmptyFrame(name: name, categoryID: categoryID,
-                                                   canvasWidth: packFrame.canvas.width,
-                                                   canvasHeight: packFrame.canvas.height)
-        var rev = FrameRevision(frameID: newFrame.id, revisionNo: 1,
-                                canvasWidth: packFrame.canvas.width, canvasHeight: packFrame.canvas.height,
-                                backgroundAssetID: bgAsset?.id, foregroundAssetID: fgAsset?.id,
-                                backgroundColorHex: packFrame.backgroundColor ?? "#FFFFFFFF",
-                                backgroundPlacement: PlacementKind(rawValue: packFrame.backgroundPlacement ?? "") ?? .aspectFill,
-                                foregroundPlacement: PlacementKind(rawValue: packFrame.foregroundPlacement ?? "") ?? .aspectFit)
-        _ = rev.revisionNo
-        let slots = packFrame.slots.map { s in
-            FrameSlot(id: IDFactory.new(), frameRevisionID: rev.id,
-                      captureIndex: s.captureIndex, x: s.x, y: s.y, width: s.width, height: s.height,
-                      rotationDegrees: s.rotationDegrees ?? 0, zOrder: s.zOrder,
-                      maskType: MaskType(rawValue: s.mask ?? "") ?? .rectangle,
-                      cornerRadius: s.cornerRadius ?? 0,
-                      defaultCropMode: CropMode(rawValue: s.cropMode ?? "") ?? .autoFace)
-        }
-        let committed = try frames.commitRevision(frameID: newFrame.id, draft: rev, slots: slots)
-        // Trạng thái theo validator thật (F-VAL) — không set .ready mù (§7.5)
-        let issues = FrameValidator.validate(canvasWidth: rev.canvasWidth, canvasHeight: rev.canvasHeight,
-                                             slots: slots, hasBackground: bgAsset != nil,
-                                             hasForeground: fgAsset != nil,
-                                             backgroundColorHex: rev.backgroundColorHex)
-        try frames.setValidationStatus(frameID: newFrame.id, status: issues.isEmpty ? .ready : .invalid)
-        // Chuyển owner references từ key tạm sang revision thật
-        if let revID = try frames.getFrame(id: newFrame.id)?.currentRevisionID {
-            try assets.moveReferences(ownerType: "frame_revision", fromOwnerID: ownerKey, toOwnerID: revID)
-        }
-        _ = committed
-        return newFrame.id
     }
 }

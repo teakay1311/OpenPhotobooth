@@ -17,9 +17,12 @@ public final class ExportViewModel: ObservableObject {
     @Published public private(set) var isExporting = false
     @Published public private(set) var lastResultURL: URL?
     @Published public private(set) var errorMessage: String?
+    @Published public private(set) var previewImage: CGImage?
+    @Published public private(set) var isPreviewLoading = false
 
     public let env: AppEnvironment
     public var review: ReviewViewModel?
+    private var previewTask: Task<Void, Never>?
 
     public init(env: AppEnvironment) {
         self.env = env
@@ -30,15 +33,16 @@ public final class ExportViewModel: ObservableObject {
     public func configure(detail: SessionDetail) {
         width = detail.snapshot.canvasWidth
         height = detail.snapshot.canvasHeight
-        let df = DateFormatter()
-        df.dateFormat = "yyyyMMdd_HHmmss"
-        filename = "Photobooth_\(df.string(from: Date()))"
-        if let bmID = env.settings.exportFolderBookmarkID,
-           let stored = try? env.trashRepo.bookmark(id: bmID) {
-            var stale = false
-            folderURL = try? URL(resolvingBookmarkData: stored.blob, options: .withSecurityScope,
-                                 relativeTo: nil, bookmarkDataIsStale: &stale)
+        filename = ExportService.defaultFilenameBase()
+        if env.settings.exportFolderBookmarkID != nil {
+            do {
+                folderURL = try env.exportService.resolveExportFolder(bookmarkID: env.settings.exportFolderBookmarkID)
+            } catch {
+                folderURL = nil
+                errorMessage = "Không còn quyền truy cập thư mục mặc định. Hãy chọn lại."
+            }
         }
+        updatePreview()
     }
 
     public func setWidth(_ w: Int) {
@@ -47,6 +51,7 @@ public final class ExportViewModel: ObservableObject {
             let ratio = Double(detail.snapshot.canvasHeight) / Double(detail.snapshot.canvasWidth)
             height = min(max(Int(Double(width) * ratio), ResourceLimits.canvasMin), ResourceLimits.canvasMax)
         }
+        updatePreview()
     }
 
     public func setHeight(_ h: Int) {
@@ -54,6 +59,28 @@ public final class ExportViewModel: ObservableObject {
         if aspectLocked, let detail = currentDetail() {
             let ratio = Double(detail.snapshot.canvasWidth) / Double(detail.snapshot.canvasHeight)
             width = min(max(Int(Double(height) * ratio), ResourceLimits.canvasMin), ResourceLimits.canvasMax)
+        }
+        updatePreview()
+    }
+
+    public func updatePreview() {
+        previewTask?.cancel()
+        guard let detail = currentDetail() else {
+            isPreviewLoading = false
+            previewImage = nil
+            return
+        }
+        let outputSize = (width: width, height: height)
+        let outputFormat = format
+        isPreviewLoading = true
+        previewTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled, let self else { return }
+            let image = await self.env.renderBuilder.renderPreview(
+                detail: detail, maxDimension: 480, format: outputFormat, outputSize: outputSize)
+            guard !Task.isCancelled else { return }
+            self.previewImage = image
+            self.isPreviewLoading = false
         }
     }
 
@@ -72,16 +99,11 @@ public final class ExportViewModel: ObservableObject {
             guard response == .OK, let url = panel.url else { return }
             Task { @MainActor in
                 self.folderURL = url
-                // Lưu security-scoped bookmark (§10.4) — xóa bookmark cũ để không tích lũy row mồ côi
-                if let blob = try? url.bookmarkData(options: .withSecurityScope,
-                                                    includingResourceValuesForKeys: nil, relativeTo: nil) {
-                    let oldID = self.env.settings.exportFolderBookmarkID
-                    if let id = try? self.env.trashRepo.saveBookmark(purpose: "exportFolder", blob: blob, displayPath: url.path) {
-                        self.env.settings.exportFolderBookmarkID = id
-                        if let oldID, oldID != id {
-                            try? self.env.trashRepo.deleteBookmark(id: oldID)
-                        }
-                    }
+                do {
+                    try self.env.saveDefaultExportFolder(url)
+                    self.errorMessage = nil
+                } catch {
+                    self.errorMessage = "Không lưu được thư mục mặc định. Bạn vẫn có thể thử xuất lần này."
                 }
             }
         }
@@ -122,12 +144,25 @@ public final class ExportViewModel: ObservableObject {
 /// FramePackImportViewModel (Sheet I §2.10): verify trước, preview, policy từng khung.
 @MainActor
 public final class FramePackImportViewModel: ObservableObject {
+    public enum ImportPhase: Equatable {
+        case idle
+        case verifying
+        case ready
+        case importing
+        case completed
+        case failedBeforeWrite(String)
+        case failedUnknown(String)
+    }
+
+    @Published public private(set) var phase: ImportPhase = .idle
     @Published public private(set) var packResult: PackValidationResult?
     @Published public private(set) var packName: String = ""
     @Published public private(set) var warnings: [String] = []
     @Published public var choices: [String: (policy: PackDuplicatePolicy, selected: Bool)] = [:]
     @Published public private(set) var isImporting = false
     @Published public private(set) var results: [String: Result<String, String>]?
+    @Published public private(set) var itemStatuses: [String: FramePackService.PackItemStatus]?
+    @Published public private(set) var partiallyWrittenCount: Int = 0
     @Published public private(set) var fatalMessage: String?
     @Published public var replaceConfirmPending: String? = nil
 
@@ -139,6 +174,11 @@ public final class FramePackImportViewModel: ObservableObject {
     /// Xác minh gói TRƯỚC preview (§2.10); không giải nén trực tiếp vào thư viện.
     /// Verify + giải nén + SHA256 chạy nền để không block MainActor (P3).
     public func loadAndValidate(url: URL) async {
+        phase = .verifying
+        fatalMessage = nil
+        results = nil
+        itemStatuses = nil
+        partiallyWrittenCount = 0
         let accessing = url.startAccessingSecurityScopedResource()
         defer { if accessing { url.stopAccessingSecurityScopedResource() } }
         do {
@@ -157,16 +197,30 @@ public final class FramePackImportViewModel: ObservableObject {
                 map[entry.frame.frameId] = (policy, true)
             }
             choices = map
+            phase = .ready
         } catch let e as AppError {
             fatalMessage = e.message   // E-FRM-05: không import
+            phase = .failedBeforeWrite(e.message)
         } catch {
             fatalMessage = error.localizedDescription
+            phase = .failedBeforeWrite(error.localizedDescription)
         }
     }
 
     public func applyImport() {
+        // FRM-01: Ngăn nhập lại khi đang áp dụng hoặc đã có kết quả
+        guard !isImporting, results == nil else { return }
+        switch phase {
+        case .ready, .failedBeforeWrite: break
+        default: return
+        }
         guard let result = packResult, let data = packData else { return }
+        let selectedList = choices.filter { $0.value.selected }
+        guard !selectedList.isEmpty else { return }
+
         isImporting = true
+        phase = .importing
+        fatalMessage = nil
         let list = result.entries.map { entry in
             FramePackService.ImportChoice(packFrameID: entry.frame.frameId,
                                           policy: choices[entry.frame.frameId]?.policy ?? .skip,
@@ -176,19 +230,41 @@ public final class FramePackImportViewModel: ObservableObject {
         Task {
             do {
                 // Import (extract + store assets + transactions) chạy nền để không block UI
-                let outcomes = try await Task.detached(priority: .userInitiated) {
-                    try packService.applyImport(result: result, choices: list, data: data)
+                let statuses = try await Task.detached(priority: .userInitiated) {
+                    try packService.applyImportDetailed(result: result, choices: list, data: data)
                 }.value
                 await MainActor.run {
-                    results = outcomes
-                    isImporting = false
-                    let okCount = outcomes.values.filter { if case .success = $0 { return true }; return false }.count
-                    env.showToast("Nhập gói: \(okCount)/\(outcomes.count) mục thành công")
+                    self.itemStatuses = statuses
+                    var outMap: [String: Result<String, String>] = [:]
+                    for (id, s) in statuses {
+                        switch s {
+                        case .imported(let fid), .replaced(let fid):
+                            outMap[id] = .success(fid)
+                        case .skipped:
+                            outMap[id] = .success("Bỏ qua")
+                        case .unselected:
+                            outMap[id] = .success("Đã bỏ chọn")
+                        case .failedBeforeWrite(let r):
+                            outMap[id] = .failure("Thất bại trước khi ghi: \(r)")
+                        case .partiallyWritten(let r):
+                            outMap[id] = .failure("Có thể đã ghi một phần: \(r)")
+                        }
+                    }
+                    self.results = outMap
+                    self.isImporting = false
+                    self.phase = .completed
+                    let okCount = statuses.values.filter(\.isSuccess).count
+                    self.partiallyWrittenCount = statuses.values.filter {
+                        if case .partiallyWritten = $0 { return true }; return false
+                    }.count
+                    self.env.showToast("Nhập gói: \(okCount)/\(statuses.count) mục thành công")
                 }
             } catch {
                 await MainActor.run {
-                    isImporting = false
-                    fatalMessage = "Nhập thất bại: \((error as? AppError)?.message ?? error.localizedDescription)"
+                    self.isImporting = false
+                    let msg = (error as? AppError)?.message ?? error.localizedDescription
+                    self.fatalMessage = "Nhập thất bại: \(msg)"
+                    self.phase = .failedBeforeWrite(msg)
                 }
             }
         }
@@ -202,6 +278,8 @@ public final class FullscreenViewModel: ObservableObject {
     @Published public private(set) var readyFrames: [FrameCardModel] = []
     @Published public var selectedFrameID: String?
     @Published public private(set) var idleSecondsLeft: Int?
+    @Published public private(set) var isStarting = false
+    @Published public private(set) var isFinishing = false
     @Published public var shareSheetOpen = false
     @Published public private(set) var reviewVM: ReviewViewModel?
 
@@ -227,59 +305,79 @@ public final class FullscreenViewModel: ObservableObject {
         if env.settings.fullscreenFrameFilter != "all" {
             filtered = filtered.filter { $0.categoryID == env.settings.fullscreenFrameFilter }
         }
+        if !filtered.contains(where: { $0.id == selectedFrameID }) {
+            selectedFrameID = nil
+        }
         readyFrames = filtered.map { f in
             let slots = f.currentRevisionID.flatMap { (try? env.frames.getSlots(revisionID: $0)) ?? [] } ?? []
-            return FrameCardModel(frame: f, thumbnail: nil, slotCount: slots.count)
+            let revID = f.currentRevisionID ?? f.id
+            let thumb = env.frameThumbnails.cachedThumbnail(frameID: f.id, revisionID: revID)
+            return FrameCardModel(frame: f, thumbnail: thumb, slotCount: Set(slots.map(\.captureIndex)).count)
         }
-    }
-
-    public func startCapture() {
-        guard selectedFrameID != nil || captureVM.selectedFrameID != nil else { return }
-        if selectedFrameID != nil { captureVM.selectFrame(selectedFrameID) }
-        step = .live
-    }
-
-    public func beginShooting() {
-        Task {
-            await captureVM.startNewSession()
-            if engine.session != nil {
-                // Giữ step = .live: liveStep hiển thị camera + countdown;
-                // khi engine vào .reviewing thì onChange sẽ gọi openReview() (P1-11).
-                // Đặt .review ngay tại đây sẽ unmount liveStep → reviewVM không bao giờ được tạo.
-            } else {
-                env.showToast("Không bắt đầu được phiên — kiểm tra camera/khung", kind: .warning)
-                step = .selectFrame
+        for f in filtered {
+            if let revID = f.currentRevisionID {
+                if env.frameThumbnails.cachedThumbnail(frameID: f.id, revisionID: revID) == nil {
+                    let fid = f.id
+                    Task { @MainActor [weak self] in
+                        if let data = await self?.env.frameThumbnails.requestThumbnail(frameID: fid, revisionID: revID) {
+                            if let idx = self?.readyFrames.firstIndex(where: { $0.id == fid }) {
+                                self?.readyFrames[idx].thumbnail = data
+                            }
+                        }
+                    }
+                }
             }
         }
     }
 
-    public func openReview() {
-        guard let id = engine.session?.id else { return }
+    public func beginShooting() async {
+        guard !isStarting, !engine.isCaptureBusy, !engine.hasPhotoToSave,
+              let selectedFrameID, readyFrames.contains(where: { $0.id == selectedFrameID }),
+              captureVM.isCameraReady else { return }
+        isStarting = true
+        defer { isStarting = false }
+
+        engine.keepSessionAndExit()
+        captureVM.selectFrame(selectedFrameID)
+        await captureVM.startNewSession()
+        guard env.showFullscreen, !Task.isCancelled else {
+            if engine.isCaptureBusy { engine.pause() }
+            return
+        }
+        if engine.state == .reviewing {
+            await openReview()
+        } else if engine.session != nil {
+            step = .live
+        } else {
+            env.showToast("Không bắt đầu được phiên chụp", kind: .warning)
+        }
+    }
+
+    public func openReview() async {
+        guard reviewVM == nil, let id = engine.session?.id else { return }
         let vm = ReviewViewModel(env: env)
         reviewVM = vm
-        Task {
-            await vm.load(sessionID: id)
-            step = .review
-        }
+        await vm.load(sessionID: id)
+        guard env.showFullscreen, engine.session?.id == id else { return }
+        step = .review
     }
 
-    public func finish() {
-        Task {
-            await reviewVM?.complete()
-            if reviewVM == nil, let id = engine.session?.id {
-                // reviewVM chưa kịp tạo (engine chuyển .reviewing khi không có view lắng nghe):
-                // cập nhật trạng thái phiên trực tiếp để không kẹt reviewable.
-                try? env.sessions.setStatus(sessionID: id, status: .completed)
-            }
-            step = .finish
-            startIdleTimer()
+    public func finish() async {
+        guard !isFinishing, let id = reviewVM?.detail?.session.id else { return }
+        isFinishing = true
+        defer { isFinishing = false }
+        do {
+            _ = try await env.completeSession(sessionID: id)
+            if env.showFullscreen { step = .finish }
+        } catch {
+            env.showToast((error as? AppError)?.message ?? "Không thể hoàn thành phiên", kind: .warning)
         }
     }
 
     public func backToWelcome() {
         step = .welcome
-        idleTimer?.invalidate()
-        idleTimer = nil
+        reviewVM = nil
+        pauseIdleTimer()
     }
 
     // MARK: - Idle return (§14.3 — chỉ áp dụng ở màn Finish)
@@ -287,8 +385,8 @@ public final class FullscreenViewModel: ObservableObject {
     public func startIdleTimer(seconds: Int? = nil) {
         idleTimer?.invalidate()
         let total = seconds ?? env.settings.fullscreenIdleReturn
+        idleSecondsLeft = total > 0 ? total : nil
         guard total > 0 else { return }
-        idleSecondsLeft = total
         idleTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] t in
             Task { @MainActor in
                 guard let self else { t.invalidate(); return }
@@ -319,6 +417,8 @@ public final class FullscreenViewModel: ObservableObject {
         // Đang capture → tạm dừng và giữ phiên, không tự hủy (§14.1, FS-02)
         if engine.isCaptureBusy {
             engine.pause()
+        } else if engine.session != nil {
+            engine.keepSessionAndExit()
         }
         pauseIdleTimer()
     }

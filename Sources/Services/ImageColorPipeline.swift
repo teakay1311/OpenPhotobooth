@@ -36,19 +36,26 @@ public enum ImageNormalizer {
 
     /// Áp dụng photo rotation (PhotoOverride.photoRotation, độ clockwise).
     public static func rotate(_ image: CGImage, degrees: Double) -> CGImage {
-        guard degrees.truncatingRemainder(dividingBy: 360) != 0 else { return image }
+        let norm = degrees.truncatingRemainder(dividingBy: 360)
+        let positive = norm < 0 ? norm + 360 : norm
+        guard positive != 0 else { return image }
         let ci = CIImage(cgImage: image)
-        let radians = CGFloat(-degrees * Double.pi / 180) // screen-clockwise
-        let center = CGPoint(x: ci.extent.midX, y: ci.extent.midY)
-        var t = CGAffineTransform(translationX: center.x, y: center.y)
-            .rotated(by: radians)
-            .translatedBy(x: -center.x, y: -center.y)
-        let rotated = ci.transformed(by: t).cropped(to: ci.extent.insetBy(dx: -ci.extent.width, dy: -ci.extent.height))
-        let fitted = rotated.transformed(by: CGAffineTransform(translationX: -rotated.extent.minX + (ci.extent.width - rotated.extent.width) / 2,
-                                                               y: -rotated.extent.minY + (ci.extent.height - rotated.extent.height) / 2))
-        _ = t
-        t = .identity
-        return CIContextHolder.shared.context.createCGImage(fitted, from: CGRect(x: 0, y: 0, width: ci.extent.width, height: ci.extent.height)) ?? image
+        let outCI: CIImage
+        if abs(positive - 90) < 0.001 {
+            outCI = ci.oriented(.right)
+        } else if abs(positive - 180) < 0.001 {
+            outCI = ci.oriented(.down)
+        } else if abs(positive - 270) < 0.001 {
+            outCI = ci.oriented(.left)
+        } else {
+            let radians = CGFloat(-positive * Double.pi / 180)
+            let rotated = ci.transformed(by: CGAffineTransform(rotationAngle: radians))
+            let ext = rotated.extent
+            let aligned = rotated.transformed(by: CGAffineTransform(translationX: -ext.origin.x, y: -ext.origin.y))
+            outCI = aligned
+        }
+        let targetRect = CGRect(origin: .zero, size: CGSize(width: round(outCI.extent.width), height: round(outCI.extent.height)))
+        return CIContextHolder.shared.context.createCGImage(outCI, from: targetRect) ?? image
     }
 }
 
@@ -85,6 +92,26 @@ public enum ImageColorPipeline {
         applyAdjustments(input, color: parameters)
     }
 
+    private static let highlightsShadowsKernel: CIColorKernel? = {
+        let kernelSource = """
+        kernel vec4 highlightsShadows(__sample pixel, float shadows, float highlights) {
+            float a = pixel.a;
+            if (a == 0.0) { return pixel; }
+            vec3 rgb = pixel.rgb / a;
+            float Y = clamp(0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b, 0.0, 1.0);
+            float tS = clamp((Y - 0.10) / 0.40, 0.0, 1.0);
+            float S = 1.0 - (tS * tS * (3.0 - 2.0 * tS));
+            float tH = clamp((Y - 0.50) / 0.40, 0.0, 1.0);
+            float H = tH * tH * (3.0 - 2.0 * tH);
+            float dS = 0.25 * shadows * S * (shadows >= 0.0 ? (1.0 - Y) : Y);
+            float dH = 0.25 * highlights * H * (highlights >= 0.0 ? (1.0 - Y) : Y);
+            vec3 res = max(rgb + vec3(dS + dH), vec3(0.0));
+            return vec4(res * a, a);
+        }
+        """
+        return CIColorKernel(source: kernelSource)
+    }()
+
     static func applyAdjustments(_ input: CIImage, color: ColorParameterSet) -> CIImage {
         var image = input
         // Exposure: -1..1 → EV -1.5..1.5
@@ -100,6 +127,13 @@ public enum ImageColorPipeline {
             f?.setValue(image, forKey: kCIInputImageKey)
             f?.setValue(1.0 + color.contrast * 0.5, forKey: kCIInputContrastKey)
             if let o = f?.outputImage { image = o }
+        }
+        // Highlights & Shadows: chèn sau Tương phản và trước Bão hòa (§3.2). Bỏ qua ở giá trị 0.
+        if abs(color.highlights) > 0.001 || abs(color.shadows) > 0.001 {
+            if let k = highlightsShadowsKernel,
+               let o = k.apply(extent: image.extent, arguments: [image, Float(color.shadows), Float(color.highlights)]) {
+                image = o
+            }
         }
         // Saturation: -1..1 → 0..2 (Đen trắng dùng -1)
         if abs(color.saturation) > 0.001 {
@@ -117,6 +151,13 @@ public enum ImageColorPipeline {
             let targetTemp = 6500.0 - color.temperature * 2000.0
             let targetTint = color.tint * 100.0
             f?.setValue(CIVector(x: targetTemp, y: targetTint), forKey: "inputTargetNeutral")
+            if let o = f?.outputImage { image = o.cropped(to: input.extent) }
+        }
+        // Vibrance: chèn sau Nhiệt độ/Tint và trước Độ nét (§3.2). Bỏ qua ở giá trị 0.
+        if abs(color.vibrance) > 0.001 {
+            let f = CIFilter(name: "CIVibrance")
+            f?.setValue(image, forKey: kCIInputImageKey)
+            f?.setValue(color.vibrance * 0.8, forKey: "inputAmount")
             if let o = f?.outputImage { image = o.cropped(to: input.extent) }
         }
         // Sharpness: unsharp mask nhẹ, tránh halo (§8.4)

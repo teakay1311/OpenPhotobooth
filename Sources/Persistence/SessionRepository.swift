@@ -21,6 +21,11 @@ public final class SessionRepository: @unchecked Sendable {
                               frameNameAtCapture: String? = nil,
                               countdownSeconds: Int = 3,
                               intermissionSeconds: Int = 2) throws -> CaptureSessionRecord {
+        guard snapshot.requiredCaptureCount > 0 else { throw AppError.frameUnconfigured }
+        if let count = defaults.selectionCaptureCount,
+           count < snapshot.requiredCaptureCount || count > ResourceLimits.maxCaptureIndices {
+            throw AppError.invalidState("Số lượt chụp phải đủ để điền khung ảnh")
+        }
         let session = CaptureSessionRecord(
             status: .inProgress,
             activeFrameSnapshotID: snapshot.id,
@@ -43,7 +48,7 @@ public final class SessionRepository: @unchecked Sendable {
                       frameNameAtCapture.map { .text($0) } ?? .null,
                       .int(Int64(countdownSeconds)), .int(Int64(intermissionSeconds))])
             // Shots 1..N với index distinct theo snapshot (CAP-02: nhiều slot dùng chung index)
-            for index in 1...snapshot.requiredCaptureCount {
+            for index in session.captureIndices(in: snapshot).sorted() {
                 try tx.run("""
                     INSERT INTO session_shots(id, session_id, capture_index, current_photo_revision_id)
                     VALUES(?,?,?,NULL)
@@ -78,7 +83,7 @@ public final class SessionRepository: @unchecked Sendable {
         let defaults = (defaultsJSON.data(using: .utf8)).flatMap { try? JSONDecoder().decode(SessionDefaultsSnapshot.self, from: $0) }
             ?? SessionDefaultsSnapshot(presetID: "natural", presetName: "Tự nhiên",
                                        presetResolvedParameters: .natural, presetIntensity: 1,
-                                       color: .neutral, skinSmooth: 0.25, outputMirror: false)
+                                       color: .neutral, skinSmooth: 0, outputMirror: false)
         let rawFrameName = row["frame_name_at_capture"].stringValue
         let frameNameAtCapture: String? = rawFrameName.isEmpty ? nil : rawFrameName
         let countdownSeconds = row["countdown_seconds"]?.intValue ?? 3
@@ -109,26 +114,60 @@ public final class SessionRepository: @unchecked Sendable {
     }
 
     public func listSessions(statuses: [SessionStatus]? = nil, searchText: String = "") throws -> [SessionCard] {
+        let defaultsJSON = "(CASE WHEN json_valid(s.session_defaults_json) THEN s.session_defaults_json ELSE '{}' END)"
+        let selectionCount = "json_extract(\(defaultsJSON), '$.selectionCaptureCount')"
+        let pendingSelection = "\(selectionCount) BETWEEN 1 AND \(ResourceLimits.maxCaptureIndices) AND json_extract(\(defaultsJSON), '$.selectedCaptureOrder') IS NULL"
+        let committedExpr = """
+            (SELECT COUNT(DISTINCT sh.capture_index) FROM session_shots sh
+             JOIN photo_revisions pr ON pr.id = sh.current_photo_revision_id
+             JOIN frame_snapshots fs ON fs.id = s.active_frame_snapshot_id
+             WHERE sh.session_id = s.id AND pr.state = 'available'
+               AND CASE WHEN \(pendingSelection) THEN sh.capture_index BETWEEN 1 AND \(selectionCount)
+                        ELSE sh.capture_index IN (
+                            SELECT json_extract(value, '$.captureIndex')
+                            FROM json_each(
+                                CASE WHEN json_valid(fs.snapshot_json)
+                                     THEN json_extract(fs.snapshot_json, '$.slots')
+                                     ELSE '[]' END
+                            )
+                        ) END)
+            """
+        let effectiveStatusExpr = "CASE WHEN s.status = 'completed' AND \(committedExpr) < s.required_capture_count THEN 'paused' ELSE s.status END"
+
         var sql = """
-            SELECT s.*, (SELECT COUNT(*) FROM session_shots sh
-                         WHERE sh.session_id = s.id AND sh.current_photo_revision_id IS NOT NULL) AS committed
+            SELECT s.*, \(committedExpr) AS committed
             FROM sessions s
             """
         var conditions: [String] = []
         var bind: [SQLiteValue] = []
         if let statuses, !statuses.isEmpty {
             let placeholders = statuses.map { _ in "?" }.joined(separator: ",")
-            conditions.append("s.status IN (\(placeholders))")
+            conditions.append("\(effectiveStatusExpr) IN (\(placeholders))")
             bind += statuses.map { .text($0.rawValue) }
         } else {
-            conditions.append("s.status <> 'trashed'") // danh sách thường không hiện trashed
+            conditions.append("s.status NOT IN ('trashed', 'purging')") // danh sách thường không hiện trashed / purging
         }
+
+        let trimmedSearch = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedSearch.isEmpty {
+            let pattern = "%\(trimmedSearch)%"
+            conditions.append("(s.frame_name_at_capture LIKE ? OR s.id LIKE ? OR datetime(s.created_at_ms / 1000, 'unixepoch', 'localtime') LIKE ?)")
+            bind += [.text(pattern), .text(pattern), .text(pattern)]
+        }
+
         sql += " WHERE " + conditions.joined(separator: " AND ")
         sql += " ORDER BY s.updated_at_ms DESC LIMIT 500"
         let rows = try db.query(sql, bind)
         return rows.compactMap { row -> SessionCard? in
-            guard let s = Self.session(from: row) else { return nil }
-            return SessionCard(session: s, committedCount: row["committed"]?.intValue ?? 0,
+            guard var s = Self.session(from: row) else { return nil }
+            let committed = row["committed"]?.intValue ?? 0
+            // Trạng thái hiệu lực cho hồ sơ cũ lệch dữ liệu (DATA-02 / §5.4):
+            // Nếu phiên lưu .completed nhưng committed < required, hiệu lực thực tế là .paused
+            if s.status == .completed && committed < s.requiredCaptureCount {
+                s.status = .paused
+                s.completedAtMs = nil
+            }
+            return SessionCard(session: s, committedCount: committed,
                                hasRenderCache: false)
         }
     }
@@ -208,6 +247,22 @@ public final class SessionRepository: @unchecked Sendable {
         return snap
     }
 
+    static func loadSnapshot(_ id: String, tx: SQLiteDatabase.TransactionHandle) throws -> FrameSnapshot {
+        let row = try tx.query("SELECT snapshot_json FROM frame_snapshots WHERE id=?", [.text(id)]).first
+        guard let json = row?["snapshot_json"]?.stringValue else { throw AppError.notFound("Snapshot khung") }
+        return try jsonDecoder.decode(FrameSnapshot.self, from: Data(json.utf8))
+    }
+
+    static func availableCaptureIndices(sessionID: String, tx: SQLiteDatabase.TransactionHandle) throws -> Set<Int> {
+        let rows = try tx.query("""
+            SELECT sh.capture_index FROM session_shots sh
+            JOIN photo_revisions pr ON pr.id=sh.current_photo_revision_id AND pr.shot_id=sh.id
+            WHERE sh.session_id=? AND pr.state='available'
+              AND NOT EXISTS (SELECT 1 FROM trash_items WHERE root_type='photo' AND root_id=pr.id)
+            """, [.text(sessionID)])
+        return Set(rows.compactMap { $0["capture_index"]?.intValue })
+    }
+
     public func getPhotoRevision(id: String) throws -> PhotoRevision? {
         let rows = try db.query("SELECT * FROM photo_revisions WHERE id=?", [.text(id)])
         return rows.first.flatMap { row in
@@ -253,8 +308,17 @@ public final class SessionRepository: @unchecked Sendable {
                             orientation: Int, codec: String, colorProfile: String?) throws -> PhotoRevision {
         try db.withTransaction { tx in
             // Idempotency: requestID đã commit thì trả về revision hiện có
-            let rows = try tx.query("SELECT * FROM photo_revisions WHERE capture_request_id=?", [.text(requestID)])
+            let rows = try tx.query("""
+                SELECT pr.*, sh.session_id, sh.capture_index, s.status AS session_status
+                FROM photo_revisions pr JOIN session_shots sh ON sh.id=pr.shot_id
+                JOIN sessions s ON s.id=sh.session_id WHERE pr.capture_request_id=?
+                """, [.text(requestID)])
             if let r = rows.first {
+                guard r["session_id"].stringValue == sessionID,
+                      r["capture_index"]?.intValue == captureIndex,
+                      !["trashed", "purging"].contains(r["session_status"].stringValue) else {
+                    throw AppError.invalidState("Yêu cầu lưu ảnh không khớp phiên hoặc lượt chụp")
+                }
                 // Trả về revision đã tồn tại — đọc color_profile thật từ DB, không hardcoded nil.
                 let storedProfile = r["color_profile"].stringValue
                 return PhotoRevision(id: r["id"].stringValue, shotID: r["shot_id"].stringValue,
@@ -268,9 +332,24 @@ public final class SessionRepository: @unchecked Sendable {
                                      captureRequestID: requestID,
                                      capturedAtMs: r["captured_at_ms"]?.int64Value ?? 0)
             }
-            let sessionRows = try tx.query("SELECT status, required_capture_count, revision_no FROM sessions WHERE id=?", [.text(sessionID)])
-            guard let sRow = sessionRows.first else { throw AppError.notFound("session \(sessionID)") }
-            let required = sRow["required_capture_count"]?.intValue ?? 1
+            let sessionRows = try tx.query("SELECT * FROM sessions WHERE id=?", [.text(sessionID)])
+            guard let sRow = sessionRows.first, let session = Self.session(from: sRow) else {
+                throw AppError.notFound("session \(sessionID)")
+            }
+            if sRow["status"]?.stringValue == "trashed" || sRow["status"]?.stringValue == "purging" {
+                throw AppError.invalidState("Phiên chụp đã bị đưa vào Thùng rác")
+            }
+            if let snapID = sRow["active_frame_snapshot_id"]?.stringValue, !snapID.isEmpty {
+                let snapRows = try tx.query("SELECT snapshot_json FROM frame_snapshots WHERE id=?", [.text(snapID)])
+                if let json = snapRows.first?["snapshot_json"]?.stringValue,
+                   let snapData = json.data(using: .utf8),
+                   let snap = try? JSONDecoder().decode(FrameSnapshot.self, from: snapData) {
+                    if !session.captureIndices(in: snap).contains(captureIndex) {
+                        throw AppError.invalidState("Lượt chụp \(captureIndex) không thuộc khung ảnh hiện hành")
+                    }
+                }
+            }
+            let required = session.captureCount
 
             // Shot theo captureIndex
             let shotRows = try tx.query("SELECT id FROM session_shots WHERE session_id=? AND capture_index=?", [.text(sessionID), .int(Int64(captureIndex))])
@@ -313,7 +392,14 @@ public final class SessionRepository: @unchecked Sendable {
     /// Chuyển con trỏ current của shot (Undo retake §5.5 — không xóa revision).
     public func switchCurrentRevision(shotID: String, toRevisionID: String, sessionID: String) throws {
         try db.withTransaction { tx in
-            let belongs = try tx.query("SELECT COUNT(*) c FROM photo_revisions WHERE id=? AND shot_id=?", [.text(toRevisionID), .text(shotID)])
+            let belongs = try tx.query("""
+                SELECT COUNT(*) c FROM photo_revisions pr
+                JOIN session_shots sh ON sh.id=pr.shot_id
+                JOIN sessions s ON s.id=sh.session_id
+                WHERE pr.id=? AND sh.id=? AND s.id=? AND pr.state='available'
+                  AND s.status NOT IN ('trashed','purging')
+                  AND NOT EXISTS (SELECT 1 FROM trash_items WHERE root_type='photo' AND root_id=pr.id)
+                """, [.text(toRevisionID), .text(shotID), .text(sessionID)])
             guard (belongs.first?["c"]?.intValue ?? 0) > 0 else {
                 throw AppError.invalidState("Revision không thuộc shot này (§16.2.2)")
             }
@@ -360,6 +446,22 @@ public final class SessionRepository: @unchecked Sendable {
     public func setOverride(sessionID: String, photoRevisionID: String, override: PhotoOverride) throws {
         let json = String(data: try Self.jsonEncoder.encode(override), encoding: .utf8) ?? "{}"
         try db.withTransaction { tx in
+            let revCheck = try tx.query("""
+                SELECT sh.current_photo_revision_id, s.status FROM photo_revisions pr
+                JOIN session_shots sh ON sh.id = pr.shot_id
+                JOIN sessions s ON s.id = sh.session_id
+                WHERE pr.id = ? AND s.id = ? AND pr.state='available'
+                  AND NOT EXISTS (SELECT 1 FROM trash_items WHERE root_type='photo' AND root_id=pr.id)
+                """, [.text(photoRevisionID), .text(sessionID)])
+            guard let row = revCheck.first else {
+                throw AppError.notFound("Không tìm thấy ảnh của phiên")
+            }
+            if row["status"]?.stringValue == "trashed" || row["status"]?.stringValue == "purging" {
+                throw AppError.invalidState("Phiên chụp đã bị đưa vào Thùng rác")
+            }
+            guard row["current_photo_revision_id"]?.stringValue == photoRevisionID else {
+                throw AppError.invalidState("Phiên bản ảnh đã thay đổi. Hãy chọn lại ảnh hiện hành.")
+            }
             let exists = try tx.query("SELECT COUNT(*) c FROM photo_adjustments WHERE photo_revision_id=?", [.text(photoRevisionID)])
             if (exists.first?["c"]?.intValue ?? 0) > 0 {
                 try tx.run("UPDATE photo_adjustments SET overrides_json=?, parameter_version=1, updated_at_ms=? WHERE photo_revision_id=?",
@@ -373,14 +475,23 @@ public final class SessionRepository: @unchecked Sendable {
     }
 
     /// Áp dụng màu cho tất cả: override snapshot cho mọi ảnh current (§8.3, một transaction).
-    public func applyColorToAll(sessionID: String, color: ColorOverrides?, skinSmooth: Double?,
-                                presetID: String?, presetParameters: ColorParameterSet?, presetIntensity: Double?) throws {
+    public func applyColorToAll(sessionID: String, color: ColorOverrides?,
+                                presetID: String?, presetParameters: ColorParameterSet?, presetIntensity: Double?,
+                                explicitNoPreset: Bool? = nil) throws {
         try db.withTransaction { tx in
             let rows = try tx.query("""
                 SELECT pr.id, sh.capture_index FROM photo_revisions pr
                 JOIN session_shots sh ON sh.id = pr.shot_id
                 JOIN sessions s ON s.id = sh.session_id
-                WHERE sh.session_id = ? AND sh.current_photo_revision_id = pr.id
+                WHERE sh.session_id = ? AND sh.current_photo_revision_id = pr.id AND pr.state='available'
+                  AND s.status NOT IN ('trashed','purging')
+                  AND NOT EXISTS (SELECT 1 FROM trash_items WHERE root_type='photo' AND root_id=pr.id)
+                  AND CASE WHEN json_type(CASE WHEN json_valid(s.session_defaults_json)
+                                         THEN s.session_defaults_json ELSE '{}' END, '$.selectedCaptureOrder') = 'array'
+                           THEN sh.capture_index IN (
+                               SELECT value FROM json_each(s.session_defaults_json, '$.selectedCaptureOrder')
+                           )
+                           ELSE 1 END
                 """, [.text(sessionID)])
             for row in rows {
                 let revID = row["id"].stringValue
@@ -391,8 +502,13 @@ public final class SessionRepository: @unchecked Sendable {
                     o = decoded
                 }
                 o.color = color ?? o.color
-                if let ss = skinSmooth { o.skinSmooth = ss }
-                if let pid = presetID {
+                if explicitNoPreset == true {
+                    o.explicitNoPreset = true
+                    o.presetID = nil
+                    o.presetParameters = .neutral
+                    o.presetIntensity = 0.0
+                } else if let pid = presetID {
+                    o.explicitNoPreset = nil
                     o.presetID = pid
                     o.presetParameters = presetParameters
                     o.presetIntensity = presetIntensity
@@ -409,10 +525,237 @@ public final class SessionRepository: @unchecked Sendable {
         }
     }
 
+    /// Áp dụng preset cho cả phiên (§3.2): cập nhật tất cả ảnh hiện hành còn khả dụng (kể cả ảnh dự phòng) trong 1 giao dịch.
+    public func applyPresetToSession(sessionID: String,
+                                     presetID: String,
+                                     presetParameters: ColorParameterSet) throws -> (before: [String: PhotoOverride?], after: [String: PhotoOverride]) {
+        try db.withTransaction { tx in
+            let sessRows = try tx.query("SELECT status, session_defaults_json FROM sessions WHERE id=?", [.text(sessionID)])
+            guard let sessRow = sessRows.first else {
+                throw AppError.notFound("Không tìm thấy phiên chụp")
+            }
+            let status = sessRow["status"]?.stringValue ?? ""
+            if status == "trashed" || status == "purging" {
+                throw AppError.invalidState("Phiên chụp đã bị đưa vào Thùng rác")
+            }
+            var defaultIntensity: Double = 1.0
+            var defaultPresetID: String? = nil
+            if let defJson = sessRow["session_defaults_json"]?.stringValue.data(using: .utf8),
+               let decoded = try? Self.jsonDecoder.decode(SessionDefaultsSnapshot.self, from: defJson) {
+                defaultIntensity = decoded.presetIntensity
+                defaultPresetID = decoded.presetID
+            }
+
+            let rows = try tx.query("""
+                SELECT pr.id, sh.capture_index FROM photo_revisions pr
+                JOIN session_shots sh ON sh.id = pr.shot_id
+                WHERE sh.session_id = ? AND sh.current_photo_revision_id = pr.id AND pr.state = 'available'
+                  AND NOT EXISTS (SELECT 1 FROM trash_items WHERE root_type='photo' AND root_id=pr.id)
+                """, [.text(sessionID)])
+
+            var before: [String: PhotoOverride?] = [:]
+            var after: [String: PhotoOverride] = [:]
+
+            for row in rows {
+                let revID = row["id"].stringValue
+                let existing = try tx.query("SELECT overrides_json FROM photo_adjustments WHERE photo_revision_id=?", [.text(revID)])
+                var oldOverride: PhotoOverride? = nil
+                var o = PhotoOverride()
+                if let data = existing.first?["overrides_json"].stringValue.data(using: .utf8),
+                   let decoded = try? Self.jsonDecoder.decode(PhotoOverride.self, from: data) {
+                    oldOverride = decoded
+                    o = decoded
+                }
+                before.updateValue(oldOverride, forKey: revID)
+
+                let wasOff = (o.explicitNoPreset == true) || (o.presetID == nil && defaultPresetID == nil)
+                let intensity: Double
+                if wasOff {
+                    intensity = defaultIntensity
+                } else if let curIntensity = o.presetIntensity, abs(curIntensity) < 0.0001 {
+                    intensity = 0.0
+                } else {
+                    intensity = o.presetIntensity ?? defaultIntensity
+                }
+
+                o.explicitNoPreset = nil
+                o.presetID = presetID
+                o.presetParameters = presetParameters
+                o.presetIntensity = intensity
+
+                after[revID] = o
+
+                let json = String(data: try Self.jsonEncoder.encode(o), encoding: .utf8) ?? "{}"
+                let up = try tx.query("SELECT COUNT(*) c FROM photo_adjustments WHERE photo_revision_id=?", [.text(revID)])
+                if (up.first?["c"]?.intValue ?? 0) > 0 {
+                    try tx.run("UPDATE photo_adjustments SET overrides_json=?, updated_at_ms=? WHERE photo_revision_id=?",
+                               [.text(json), .int(Time.nowMs()), .text(revID)])
+                } else {
+                    try tx.run("INSERT INTO photo_adjustments(photo_revision_id, overrides_json, parameter_version, updated_at_ms) VALUES(?,?,1,?)",
+                               [.text(revID), .text(json), .int(Time.nowMs())])
+                }
+            }
+
+            try tx.run("UPDATE sessions SET revision_no=revision_no+1, updated_at_ms=? WHERE id=?",
+                       [.int(Time.nowMs()), .text(sessionID)])
+            return (before: before, after: after)
+        }
+    }
+
+    func restorePresetOverrides(sessionID: String, overrides: [String: PhotoOverride?]) throws {
+        guard !overrides.isEmpty else { return }
+        try db.withTransaction { tx in
+            let rows = try tx.query("""
+                SELECT pr.id FROM photo_revisions pr
+                JOIN session_shots sh ON sh.current_photo_revision_id=pr.id AND sh.id=pr.shot_id
+                JOIN sessions s ON s.id=sh.session_id
+                WHERE s.id=? AND s.status NOT IN ('trashed','purging') AND pr.state='available'
+                  AND NOT EXISTS (SELECT 1 FROM trash_items WHERE root_type='photo' AND root_id=pr.id)
+                """, [.text(sessionID)])
+            let current = Set(rows.map { $0["id"].stringValue })
+            guard Set(overrides.keys).isSubset(of: current) else {
+                throw AppError.invalidState("Phiên bản ảnh đã thay đổi hoặc vào Thùng rác. Không thể áp dụng lịch sử.")
+            }
+            let now = Time.nowMs()
+            for (id, override) in overrides {
+                if let override, !override.isEmpty {
+                    let json = String(decoding: try Self.jsonEncoder.encode(override), as: UTF8.self)
+                    try tx.run("""
+                        INSERT INTO photo_adjustments(photo_revision_id, overrides_json, parameter_version, updated_at_ms)
+                        VALUES(?,?,1,?) ON CONFLICT(photo_revision_id) DO UPDATE SET
+                            overrides_json=excluded.overrides_json, updated_at_ms=excluded.updated_at_ms
+                        """, [.text(id), .text(json), .int(now)])
+                } else {
+                    try tx.run("DELETE FROM photo_adjustments WHERE photo_revision_id=?", [.text(id)])
+                }
+            }
+            try tx.run("UPDATE sessions SET revision_no=revision_no+1, updated_at_ms=? WHERE id=?", [.int(now), .text(sessionID)])
+        }
+        EventBus.shared.post(.sessionChanged(sessionID: sessionID, revision: 0))
+    }
+
     /// Reset overrides của một ảnh (về SessionDefault §9.3).
     public func clearOverride(sessionID: String, photoRevisionID: String) throws {
-        try db.run("DELETE FROM photo_adjustments WHERE photo_revision_id=?", [.text(photoRevisionID)])
-        try bumpRevision(sessionID: sessionID)
+        try db.withTransaction { tx in
+            let revCheck = try tx.query("""
+                SELECT sh.current_photo_revision_id, s.status FROM photo_revisions pr
+                JOIN session_shots sh ON sh.id = pr.shot_id
+                JOIN sessions s ON s.id = sh.session_id
+                WHERE pr.id = ? AND s.id = ? AND pr.state='available'
+                  AND NOT EXISTS (SELECT 1 FROM trash_items WHERE root_type='photo' AND root_id=pr.id)
+                """, [.text(photoRevisionID), .text(sessionID)])
+            guard let row = revCheck.first else {
+                throw AppError.notFound("Không tìm thấy ảnh của phiên")
+            }
+            if row["status"]?.stringValue == "trashed" || row["status"]?.stringValue == "purging" {
+                throw AppError.invalidState("Phiên chụp đã bị đưa vào Thùng rác")
+            }
+            guard row["current_photo_revision_id"]?.stringValue == photoRevisionID else {
+                throw AppError.invalidState("Phiên bản ảnh đã thay đổi. Hãy chọn lại ảnh hiện hành.")
+            }
+            try tx.run("DELETE FROM photo_adjustments WHERE photo_revision_id=?", [.text(photoRevisionID)])
+            try tx.run("UPDATE sessions SET revision_no=revision_no+1, updated_at_ms=? WHERE id=?", [.int(Time.nowMs()), .text(sessionID)])
+        }
+    }
+
+    /// Xóa một hoặc nhiều ảnh khỏi phiên và chuyển vào Thùng rác trong một transaction duy nhất (§2.2).
+    @discardableResult
+    public func trashPhotos(sessionID: String, pairs: [(shotID: String, photoRevisionID: String)]) throws -> [TrashItem] {
+        guard !pairs.isEmpty else { return [] }
+        let lockToken = try OperationCoordinator.shared.acquire(key: "session:\(sessionID)", reason: "trashPhotos")
+        defer { lockToken.release() }
+
+        var createdItems: [TrashItem] = []
+        try db.withTransaction { tx in
+            let sessionRows = try tx.query("SELECT * FROM sessions WHERE id=?", [.text(sessionID)])
+            guard let sRow = sessionRows.first, let session = Self.session(from: sRow) else {
+                throw AppError.notFound("Phiên chụp \(sessionID)")
+            }
+            if session.status == .trashed || session.status == .purging {
+                throw AppError.invalidState("Phiên chụp đã bị đưa vào Thùng rác")
+            }
+
+            // 1. Kiểm tra toàn bộ danh sách cặp (shotID, photoRevisionID)
+            for pair in pairs {
+                let shotRows = try tx.query("""
+                    SELECT sh.current_photo_revision_id, sh.capture_index FROM session_shots sh
+                    JOIN photo_revisions pr ON pr.id=sh.current_photo_revision_id AND pr.shot_id=sh.id
+                    WHERE sh.id=? AND sh.session_id=? AND pr.state='available'
+                      AND NOT EXISTS (SELECT 1 FROM trash_items WHERE root_type='photo' AND root_id=pr.id)
+                    """, [.text(pair.shotID), .text(sessionID)])
+                guard let shotRow = shotRows.first,
+                      shotRow["current_photo_revision_id"]?.stringValue == pair.photoRevisionID else {
+                    throw AppError.invalidState("Phiên bản ảnh đã thay đổi hoặc đang có thao tác xung đột. Hãy chọn lại ảnh hiện hành.")
+                }
+            }
+
+            // 2. Tạo TrashItem và bỏ current_photo_revision_id của các lượt
+            let now = Time.nowMs()
+            let expiresAt = TrashPolicy.expiresAt(deletedAtMs: now)
+            for pair in pairs {
+                let revRows = try tx.query("SELECT relative_path, capture_request_id FROM photo_revisions WHERE id=?", [.text(pair.photoRevisionID)])
+                guard let revRow = revRows.first else {
+                    throw AppError.notFound("Phiên bản ảnh \(pair.photoRevisionID)")
+                }
+                let relPath = revRow["relative_path"].stringValue
+                var byteSize: Int64 = 0
+                if let fileURL = try? layout.absoluteURL(forRelativePath: relPath),
+                   let attrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path) {
+                    byteSize = (attrs[.size] as? Int64) ?? 0
+                }
+
+                let shotIndex = (try? tx.query("SELECT capture_index FROM session_shots WHERE id=?", [.text(pair.shotID)]).first?["capture_index"]?.intValue) ?? 1
+                let shortSession = String(sessionID.prefix(8))
+                let displayName = "Ảnh lượt \(shotIndex) (Phiên \(shortSession))"
+
+                let item = TrashItem(
+                    id: IDFactory.new(),
+                    rootType: .photo,
+                    rootID: pair.photoRevisionID,
+                    displayName: displayName,
+                    deletedAtMs: now,
+                    expiresAtMs: expiresAt,
+                    originalParentID: sessionID,
+                    estimatedBytes: byteSize,
+                    status: .trashed
+                )
+
+                try tx.run("""
+                    INSERT INTO trash_items(id, root_type, root_id, display_name, deleted_at_ms,
+                        expires_at_ms, original_parent_id, estimated_bytes, status, last_error)
+                    VALUES(?,?,?,?,?,?,?,?,?,NULL)
+                    """, [.text(item.id), .text(item.rootType.rawValue), .text(item.rootID),
+                          .text(item.displayName), .int(item.deletedAtMs), .int(item.expiresAtMs),
+                          .text(sessionID), .int(item.estimatedBytes), .text(item.status.rawValue)])
+
+                try tx.run("UPDATE session_shots SET current_photo_revision_id=NULL WHERE id=?", [.text(pair.shotID)])
+                createdItems.append(item)
+            }
+
+            // 3. Tính lại các lượt thiếu và cập nhật trạng thái phiên
+            let snapshot = try Self.loadSnapshot(session.activeFrameSnapshotID, tx: tx)
+            let missingIndices = session.captureIndices(in: snapshot)
+                .subtracting(try Self.availableCaptureIndices(sessionID: sessionID, tx: tx))
+
+            if !missingIndices.isEmpty {
+                // Thiếu lượt bắt buộc: chuyển sang chờ chụp tiếp, bỏ mốc hoàn thành, đặt lượt tiếp theo
+                let nextIdx = missingIndices.sorted().first ?? 1
+                try tx.run("""
+                    UPDATE sessions SET status='paused', completed_at_ms=NULL, current_capture_index=?,
+                        revision_no=revision_no+1, updated_at_ms=?
+                    WHERE id=?
+                    """, [.int(Int64(nextIdx)), .int(now), .text(sessionID)])
+            } else {
+                // Chỉ xóa ảnh dự phòng hoặc khung vẫn đủ ảnh: giữ trạng thái hoàn thành/reviewable
+                try tx.run("""
+                    UPDATE sessions SET revision_no=revision_no+1, updated_at_ms=? WHERE id=?
+                    """, [.int(now), .text(sessionID)])
+            }
+        }
+
+        EventBus.shared.post(.sessionChanged(sessionID: sessionID, revision: 0))
+        EventBus.shared.post(.trashChanged)
+        return createdItems
     }
 
     // MARK: - Placements (§9.2)
@@ -440,18 +783,105 @@ public final class SessionRepository: @unchecked Sendable {
         }
     }
 
-    /// Đổi khung ở Review (§3.6): snapshot mới + mapping + reset placements theo snapshot mới (transaction).
+    /// Đổi khung ở Review (§3.6): snapshot mới + mapping + reset placements theo snapshot mới (transaction, D2-A08, DATA-01, DATA-02).
     public func changeFrame(sessionID: String, newSnapshot: FrameSnapshot) throws {
-        // Bảo vệ: snapshot 0 ô ảnh (khung hỏng/nhập tay) — tránh vừa sai dữ liệu vừa crash vòng `1...count`.
-        guard newSnapshot.requiredCaptureCount >= 1 else { throw AppError.frameUnconfigured }
+        try replaceFrame(sessionID: sessionID, proposedSnapshot: newSnapshot, selection: nil)
+    }
+
+    public func confirmPhotoSelection(sessionID: String, order: [Int]) throws {
+        try replaceFrame(sessionID: sessionID, proposedSnapshot: nil, selection: order)
+    }
+
+    private func replaceFrame(sessionID: String, proposedSnapshot: FrameSnapshot?, selection: [Int]?) throws {
+        let lockToken = try OperationCoordinator.shared.acquire(key: "session:\(sessionID)", reason: "changeFrame")
+        defer { lockToken.release() }
+
         try db.withTransaction { tx in
-            try tx.run("UPDATE sessions SET active_frame_snapshot_id=?, required_capture_count=?, revision_no=revision_no+1, updated_at_ms=? WHERE id=?",
-                       [.text(newSnapshot.id), .int(Int64(newSnapshot.requiredCaptureCount)), .int(Time.nowMs()), .text(sessionID)])
-            // Thêm shot cho index mới nếu N_new > cũ (§3.4.3)
-            for index in 1...newSnapshot.requiredCaptureCount {
+            let rows = try tx.query("SELECT * FROM sessions WHERE id=? AND status NOT IN ('trashed','purging')", [.text(sessionID)])
+            guard let row = rows.first, var session = Self.session(from: row) else {
+                throw AppError.notFound("session \(sessionID)")
+            }
+            let committedRows = try tx.query("""
+                SELECT sh.capture_index FROM session_shots sh
+                JOIN photo_revisions pr ON pr.id = sh.current_photo_revision_id
+                WHERE sh.session_id=? AND pr.state='available'
+                """, [.text(sessionID)])
+            let committedIndices = Set(committedRows.compactMap { $0["capture_index"]?.intValue })
+            let newSnapshot: FrameSnapshot
+            if let selection {
+                guard let count = session.pendingSelectionCount,
+                      session.status == .reviewable || session.status == .paused,
+                      Set(1...count).isSubset(of: committedIndices),
+                      Set(selection).isSubset(of: Set(1...count)),
+                      let data = try tx.query("SELECT snapshot_json FROM frame_snapshots WHERE id=?",
+                                              [.text(session.activeFrameSnapshotID)]).first?["snapshot_json"]?.stringValue.data(using: .utf8),
+                      let snapshot = try? Self.jsonDecoder.decode(FrameSnapshot.self, from: data) else {
+                    throw AppError.invalidState("Phiên chưa có đủ ảnh để xác nhận")
+                }
+                newSnapshot = try snapshot.assigningPhotos(in: selection)
+                session.defaults.selectedCaptureOrder = selection
+            } else {
+                guard let proposedSnapshot, proposedSnapshot.requiredCaptureCount > 0 else {
+                    throw AppError.frameUnconfigured
+                }
+                if let count = session.defaults.selectionCaptureCount {
+                    guard proposedSnapshot.requiredCaptureCount <= count else {
+                        throw AppError.invalidState("Khung này cần nhiều ảnh hơn số lượt đã đặt cho phiên")
+                    }
+                    if let order = session.defaults.selectedCaptureOrder,
+                       order.count == proposedSnapshot.requiredCaptureCount {
+                        newSnapshot = try proposedSnapshot.assigningPhotos(in: order)
+                    } else {
+                        newSnapshot = proposedSnapshot
+                        session.defaults.selectedCaptureOrder = nil
+                    }
+                } else {
+                    newSnapshot = proposedSnapshot
+                }
+            }
+
+            try Self.storeSnapshot(newSnapshot, tx: tx)
+
+            let oldSnapshotID = session.activeFrameSnapshotID
+            let requiredIndices = session.captureIndices(in: newSnapshot)
+
+            // Thêm shot cho index mới theo tập index thật của snapshot (§5 / DATA-02)
+            for index in requiredIndices {
                 try tx.run("INSERT OR IGNORE INTO session_shots(id, session_id, capture_index, current_photo_revision_id) VALUES(?,?,?,NULL)",
                            [.text(IDFactory.new()), .text(sessionID), .int(Int64(index))])
             }
+
+            let missingIndices = requiredIndices.subtracting(committedIndices)
+
+            let newStatus: SessionStatus
+            let newCompletedAtMs: Int64?
+            let nextIndex: Int
+            if !missingIndices.isEmpty {
+                newStatus = .paused
+                newCompletedAtMs = nil
+                nextIndex = missingIndices.min() ?? 1
+            } else {
+                if session.status == .completed && session.pendingSelectionCount == nil {
+                    newStatus = .completed
+                    newCompletedAtMs = session.completedAtMs ?? Time.nowMs()
+                } else {
+                    newStatus = .reviewable
+                    newCompletedAtMs = nil
+                }
+                nextIndex = requiredIndices.max() ?? 1
+            }
+
+            let defaultsJSON = String(decoding: try Self.jsonEncoder.encode(session.defaults), as: UTF8.self)
+            try tx.run("""
+                UPDATE sessions
+                SET active_frame_snapshot_id=?, required_capture_count=?, current_capture_index=?,
+                    status=?, completed_at_ms=?, revision_no=revision_no+1, updated_at_ms=?, session_defaults_json=?
+                WHERE id=?
+                """, [.text(newSnapshot.id), .int(Int64(newSnapshot.requiredCaptureCount)),
+                      .int(Int64(nextIndex)), .text(newStatus.rawValue),
+                      newCompletedAtMs.map { .int($0) } ?? .null,
+                      .int(Time.nowMs()), .text(defaultsJSON), .text(sessionID)])
+
             // Xóa placements của snapshot cũ — không để orphan sau nhiều lần đổi khung (§3.4).
             try tx.run("DELETE FROM slot_placements WHERE session_id=? AND frame_snapshot_id<>?",
                        [.text(sessionID), .text(newSnapshot.id)])
@@ -464,7 +894,115 @@ public final class SessionRepository: @unchecked Sendable {
                     """, [.text(IDFactory.new()), .text(sessionID), .text(newSnapshot.id), .text(slot.id),
                           .text(slot.defaultCropMode.rawValue), .int(Time.nowMs())])
             }
+            if oldSnapshotID != newSnapshot.id {
+                try Self.removeUnusedSnapshot(oldSnapshotID, tx: tx)
+            }
         }
+        EventBus.shared.post(.sessionChanged(sessionID: sessionID, revision: 0))
+    }
+
+    private static func storeSnapshot(_ snapshot: FrameSnapshot, tx: SQLiteDatabase.TransactionHandle) throws {
+        if (try tx.scalarInt("SELECT COUNT(*) FROM frame_snapshots WHERE id=?", [.text(snapshot.id)])) == 0 {
+            let data = try Self.jsonEncoder.encode(snapshot)
+            try tx.run("""
+                INSERT INTO frame_snapshots(id, source_frame_id, source_frame_revision_id, snapshot_json, snapshot_hash, created_at_ms)
+                VALUES(?,?,?,?,?,?)
+                """, [.text(snapshot.id), snapshot.sourceFrameID.map { .text($0) } ?? .null,
+                      snapshot.sourceFrameRevisionID.map { .text($0) } ?? .null,
+                      .text(String(data: data, encoding: .utf8) ?? "{}"),
+                      .text(snapshot.snapshotHash),
+                      .int(snapshot.createdAtMs)])
+            if let bg = snapshot.background?.assetID {
+                try tx.run("INSERT OR IGNORE INTO asset_references(asset_id, owner_type, owner_id, purpose) VALUES(?,?,?,?)",
+                           [.text(bg), .text("frame_snapshot"), .text(snapshot.id), .text("background")])
+            }
+            if let fg = snapshot.foreground?.assetID {
+                try tx.run("INSERT OR IGNORE INTO asset_references(asset_id, owner_type, owner_id, purpose) VALUES(?,?,?,?)",
+                           [.text(fg), .text("frame_snapshot"), .text(snapshot.id), .text("foreground")])
+            }
+        }
+    }
+
+    private static func removeUnusedSnapshot(_ id: String, tx: SQLiteDatabase.TransactionHandle) throws {
+        let sessionCount = try tx.scalarInt("SELECT COUNT(*) FROM sessions WHERE active_frame_snapshot_id=?", [.text(id)])
+        let placementCount = try tx.scalarInt("SELECT COUNT(*) FROM slot_placements WHERE frame_snapshot_id=?", [.text(id)])
+        guard sessionCount == 0, placementCount == 0 else { return }
+        try tx.run("DELETE FROM asset_references WHERE owner_type='frame_snapshot' AND owner_id=?", [.text(id)])
+        try tx.run("DELETE FROM frame_snapshots WHERE id=?", [.text(id)])
+    }
+
+    /// Repairs only the old selection writer that persisted an order but left the source frame's mapping unchanged.
+    @discardableResult
+    func repairLegacyFrameAssignments(using frames: FrameRepository) throws -> (updated: Int, unresolved: [String]) {
+        let rows = try db.query("""
+            SELECT * FROM sessions WHERE status NOT IN ('trashed','purging')
+              AND json_valid(session_defaults_json)
+              AND json_type(session_defaults_json, '$.selectedCaptureOrder')='array'
+            """)
+        var updated = 0
+        var unresolved: [String] = []
+        var backedUp = false
+        for row in rows {
+            guard let session = Self.session(from: row), let order = session.defaults.selectedCaptureOrder else { continue }
+            guard let snapshot = try snapshotLoader(session.activeFrameSnapshotID) else {
+                unresolved.append(session.id)
+                continue
+            }
+            // The affected writer never changed the source revision's slot IDs or geometry.
+            guard let count = session.defaults.selectionCaptureCount,
+                  (1...ResourceLimits.maxCaptureIndices).contains(count),
+                  Set(order).count == order.count, order.allSatisfy({ (1...count).contains($0) }),
+                  let sourceID = snapshot.sourceFrameRevisionID else {
+                unresolved.append(session.id)
+                continue
+            }
+            let canonical = try frames.getSlots(revisionID: sourceID).map(SnapshotSlot.init(from:))
+            var original = snapshot
+            original.slots = canonical
+            guard !canonical.isEmpty, let expected = try? original.assigningPhotos(in: order) else {
+                unresolved.append(session.id)
+                continue
+            }
+            let slots = snapshot.slots.sorted { $0.id < $1.id }
+            if slots == expected.slots.sorted(by: { $0.id < $1.id }) { continue }
+            guard slots == canonical.sorted(by: { $0.id < $1.id }) else {
+                unresolved.append(session.id)
+                continue
+            }
+            let token = try OperationCoordinator.shared.acquire(key: "session:\(session.id)", reason: "repair frame assignment")
+            defer { token.release() }
+            if !backedUp, db.databasePath != ":memory:" {
+                let backups = layout.rootURL.appendingPathComponent("backups", isDirectory: true)
+                try FileManager.default.createDirectory(at: backups, withIntermediateDirectories: true)
+                try db.backup(to: backups.appendingPathComponent("pre-frame-assignment-\(IDFactory.new()).sqlite").path)
+                backedUp = true
+            }
+            let applied = try db.withTransaction { tx in
+                let current = try tx.query("SELECT revision_no FROM sessions WHERE id=? AND active_frame_snapshot_id=? AND status NOT IN ('trashed','purging')", [.text(session.id), .text(snapshot.id)]).first
+                guard current?["revision_no"]?.intValue == session.revisionNo else { return false }
+                let missing = expected.requiredIndices.subtracting(try Self.availableCaptureIndices(sessionID: session.id, tx: tx))
+                try Self.storeSnapshot(expected, tx: tx)
+                try tx.run("UPDATE slot_placements SET frame_snapshot_id=? WHERE session_id=? AND frame_snapshot_id=?",
+                           [.text(expected.id), .text(session.id), .text(snapshot.id)])
+                let next = missing.min() ?? expected.maxCaptureIndex
+                let status = missing.isEmpty ? (session.status == .completed ? SessionStatus.completed : .reviewable) : .paused
+                try tx.run("""
+                    UPDATE sessions SET active_frame_snapshot_id=?, current_capture_index=?, status=?,
+                        completed_at_ms=?, revision_no=revision_no+1, updated_at_ms=? WHERE id=?
+                    """, [.text(expected.id), .int(Int64(next)), .text(status.rawValue),
+                          status == .completed ? session.completedAtMs.map { .int($0) } ?? .null : .null,
+                          .int(Time.nowMs()), .text(session.id)])
+                try Self.removeUnusedSnapshot(snapshot.id, tx: tx)
+                return true
+            }
+            if applied {
+                updated += 1
+                EventBus.shared.post(.sessionChanged(sessionID: session.id, revision: 0))
+            } else {
+                unresolved.append(session.id)
+            }
+        }
+        return (updated, unresolved)
     }
 
     // MARK: - Export records (§11)

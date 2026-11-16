@@ -7,7 +7,7 @@ public struct FullscreenView: View {
     @ObservedObject var env: AppEnvironment
     @StateObject private var captureVM: CaptureViewModel
     @StateObject private var vm: FullscreenViewModel
-    @Environment(\.dismiss) private var dismiss
+    @State private var shootingTask: Task<Void, Never>?
 
     public init(env: AppEnvironment) {
         self.env = env
@@ -31,31 +31,40 @@ public struct FullscreenView: View {
                 HStack {
                     Spacer()
                     Button {
-                        vm.exitFullscreenRequested()
-                        dismiss()
+                        env.showFullscreen = false
                     } label: {
                         Image(systemName: "xmark.circle.fill")
                             .font(.system(size: 24))
                             .foregroundStyle(.white.opacity(0.7))
                     }
                     .buttonStyle(.plain)
+                    .help("Đóng chế độ toàn màn hình (Esc)")
+                    .accessibilityLabel("Đóng chế độ toàn màn hình")
                     .padding(14)
                 }
                 Spacer()
             }
         }
-        .onAppear {
+        .onExitCommand {
+            env.showFullscreen = false
+        }
+        .overlay(alignment: .bottom) {
+            ToastOverlay(env: env).allowsHitTesting(false)
+        }
+        .task {
             vm.enterFullscreen()
-            captureVM.reloadFrames()
-            // P1-10: refresh quyền/thiết bị camera — permissionState mặc định .notDetermined
-            // khiến startNewSession guard-fail thầm lặng và màn Live đứng yên vĩnh viễn.
-            Task {
-                await captureVM.refreshCameraState()
-                await captureVM.startPreviewIfPossible()
-            }
+            await captureVM.retryCamera()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await captureVM.refreshCameraState() }
+        }
+        .task { await captureVM.observeCameraEvents() }
+        .onChange(of: env.engine.isCaptureBusy) { _, busy in
+            if !busy { Task { await captureVM.resumeDeferredCameraRefresh() } }
         }
         .onDisappear {
-            vm.pauseIdleTimer()
+            shootingTask?.cancel()
+            vm.exitFullscreenRequested()
         }
     }
 
@@ -106,17 +115,54 @@ public struct FullscreenView: View {
                     .padding(20)
                 }
             }
-            HStack {
+            HStack(spacing: 12) {
                 Button("Quay lại") { vm.step = .welcome }
                     .buttonStyle(.borderedProminent)
                 Spacer()
+                if captureVM.permissionState == .notDetermined {
+                    PrimaryButton(title: "Bật camera", systemImage: "camera") {
+                        Task {
+                            await captureVM.enableCamera()
+                        }
+                    }
+                } else if captureVM.permissionState == .denied {
+                    HStack(spacing: 8) {
+                        PrimaryButton(title: "Mở Cài đặt hệ thống") { captureVM.openSystemSettings() }
+                        Button("Thử lại") {
+                            Task {
+                                await captureVM.retryCamera()
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                } else if !captureVM.isCameraReady {
+                    cameraConnectionStatus
+                }
                 PrimaryButton(title: "Bắt đầu chụp", systemImage: "camera.fill",
-                              disabledReason: vm.selectedFrameID == nil ? "Chọn khung" : nil) {
-                    vm.startCapture()
-                    vm.beginShooting()
+                              disabledReason: shootDisabledReason) {
+                    shootingTask = Task { await vm.beginShooting() }
                 }
             }
             .padding(20)
+        }
+    }
+
+    private var shootDisabledReason: String? {
+        if vm.isStarting { return "Đang chuẩn bị phiên chụp" }
+        if vm.selectedFrameID == nil { return "Chọn khung" }
+        if captureVM.permissionState != .authorized { return "Cần bật camera trước" }
+        if !captureVM.isCameraReady { return "Chờ camera sẵn sàng" }
+        return nil
+    }
+
+    private var cameraConnectionStatus: some View {
+        HStack(spacing: 8) {
+            if captureVM.isConnectingCamera { ProgressView().tint(.white) }
+            Text(captureVM.cameraPreviewError ?? "Đang chờ khung hình từ camera…")
+                .foregroundStyle(.white)
+            if !captureVM.isConnectingCamera {
+                Button("Thử lại camera") { Task { await captureVM.retryCamera() } }
+            }
         }
     }
 
@@ -124,10 +170,12 @@ public struct FullscreenView: View {
 
     private var liveStep: some View {
         VStack(spacing: 12) {
-            if let service = env.camera as? CameraService {
+            if !captureVM.isCameraReady {
+                cameraConnectionStatus.frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if let service = env.camera as? CameraService {
                 CIPreviewView(cameraService: service,
                               mirror: env.settings.previewMirror,
-                              inFrame: nil)
+                              photoParameters: captureVM.livePhotoParameters, faceAnalysis: env.faceAnalysis)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 Text("Camera không khả dụng").foregroundStyle(.white)
@@ -141,35 +189,46 @@ public struct FullscreenView: View {
                         .font(.title3).foregroundStyle(.white)
                 }
             }
-        }
-        .onChange(of: env.engine.state) { newState in
-            if case .reviewing = newState {
-                vm.openReview()
+            switch env.engine.state {
+            case .ready where env.engine.session?.captureMode == .manual:
+                PrimaryButton(title: "Chụp tiếp", systemImage: "camera",
+                              disabledReason: captureVM.isCameraReady ? nil : "Chờ camera sẵn sàng") {
+                    do { try env.engine.captureNextManual() }
+                    catch { env.showToast(error.localizedDescription, kind: .warning) }
+                }
+            case .paused:
+                PrimaryButton(title: "Tiếp tục", systemImage: "play.fill",
+                              disabledReason: captureVM.isCameraReady ? nil : "Chờ camera sẵn sàng") {
+                    do { try env.engine.resume() }
+                    catch { env.showToast(error.localizedDescription, kind: .warning) }
+                }
+            case .recoverableError(let message, _):
+                Text(message).foregroundStyle(.white)
+                PrimaryButton(title: captureVM.startButtonTitle, systemImage: "arrow.clockwise",
+                              disabledReason: env.engine.hasPhotoToSave || captureVM.isCameraReady ? nil : "Chờ camera sẵn sàng") {
+                    Task { await captureVM.primaryAction() }
+                }
+            default:
+                EmptyView()
             }
+        }
+        .onChange(of: env.engine.state) { _, state in
+            if state == .reviewing { Task { await vm.openReview() } }
+        }
+        .task {
+            if env.engine.state == .reviewing { await vm.openReview() }
         }
     }
 
     // MARK: Review
 
     private var reviewStep: some View {
-        VStack(spacing: 0) {
-            if let reviewVM = vm.reviewVM, let img = reviewVM.previewImage {
-                Image(nsImage: NSImage(cgImage: img, size: NSSize(width: CGFloat(img.width), height: CGFloat(img.height))))
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .padding(20)
+        Group {
+            if let reviewVM = vm.reviewVM {
+                FullscreenReviewContent(reviewVM: reviewVM, fullscreenVM: vm)
             } else {
                 ProgressView().tint(.white)
             }
-            HStack {
-                Spacer()
-                PrimaryButton(title: "Hoàn thành", systemImage: "checkmark.circle.fill") {
-                    Task {
-                        await vm.finish()
-                    }
-                }
-            }
-            .padding(20)
         }
     }
 
@@ -190,6 +249,36 @@ public struct FullscreenView: View {
         }
         .onAppear {
             vm.startIdleTimer()
+        }
+    }
+}
+
+
+private struct FullscreenReviewContent: View {
+    @ObservedObject var reviewVM: ReviewViewModel
+    @ObservedObject var fullscreenVM: FullscreenViewModel
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Group {
+                if let image = reviewVM.previewImage {
+                    Image(decorative: image, scale: 1)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .padding(20)
+                } else {
+                    ProgressView().tint(.white)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            HStack {
+                Spacer()
+                PrimaryButton(title: "Hoàn thành", systemImage: "checkmark.circle.fill",
+                              disabledReason: reviewVM.canExport && !fullscreenVM.isFinishing ? nil : "Chờ ảnh sẵn sàng") {
+                    Task { await fullscreenVM.finish() }
+                }
+            }
+            .padding(20)
         }
     }
 }

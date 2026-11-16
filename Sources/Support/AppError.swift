@@ -1,7 +1,7 @@
 import Foundation
 
 /// Danh mục lỗi chuẩn §18.1 — mỗi lỗi có thông báo tiếng Việt + hành động gợi ý.
-public enum AppError: Error, Equatable {
+public enum AppError: Error, LocalizedError, Equatable {
     // Camera
     case cameraPermissionNotDetermined      // E-CAM-01
     case cameraPermissionDenied             // E-CAM-02
@@ -47,6 +47,9 @@ public enum AppError: Error, Equatable {
     case conflict(expected: Int, actual: Int)
     case invalidState(String)
     case notFound(String)
+    case duplicateName(String)
+
+    public var errorDescription: String? { message }
 
     public var message: String {
         switch self {
@@ -60,7 +63,7 @@ public enum AppError: Error, Equatable {
         case .duplicateShutterRequest: return "Đang có lượt chụp đang xử lý."
         case .captureTimeout: return "Không chụp được ảnh này."
         case .captureCancelled: return "Phiên đã được tạm dừng."
-        case .frameLockedDuringCapture: return "Chỉ có thể đổi khung trong bước chỉnh ảnh."
+        case .frameLockedDuringCapture: return "Phiên đang giữ khung hiện tại. Bạn có thể đổi khung trong Xem và chỉnh ảnh hoặc chuẩn bị phiên mới."
         case .frameFileCorrupt: return "Không đọc được tệp khung."
         case .frameUnconfigured: return "Khung chưa có vị trí đặt ảnh."
         case .invalidSlotGeometry(let issues): return "Ô ảnh không hợp lệ: \(issues.joined(separator: "; "))"
@@ -85,6 +88,7 @@ public enum AppError: Error, Equatable {
         case .conflict: return "Dữ liệu đã thay đổi ở nơi khác. Vui lòng tải lại và thử lại."
         case .invalidState(let d): return "Trạng thái không hợp lệ: \(d)"
         case .notFound(let d): return "Không tìm thấy: \(d)"
+        case .duplicateName(let d): return d
         }
     }
 
@@ -125,6 +129,7 @@ public enum AppError: Error, Equatable {
         case .conflict: return "E-GEN-01"
         case .invalidState: return "E-GEN-02"
         case .notFound: return "E-GEN-03"
+        case .duplicateName: return "E-GEN-04"
         }
     }
 }

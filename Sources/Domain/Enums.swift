@@ -120,7 +120,7 @@ public enum PlacementKind: String, Codable, Sendable, CaseIterable {
 }
 
 public enum TrashRootType: String, Codable, Sendable, CaseIterable {
-    case session, frame, category, preset
+    case session, frame, category, preset, photo
 
     public var label: String {
         switch self {
@@ -128,6 +128,7 @@ public enum TrashRootType: String, Codable, Sendable, CaseIterable {
         case .frame: return "Khung"
         case .category: return "Danh mục"
         case .preset: return "Preset"
+        case .photo: return "Ảnh"
         }
     }
 }

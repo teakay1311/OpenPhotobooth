@@ -51,6 +51,11 @@ public final class TrashRepository: @unchecked Sendable {
         return rows.first.map(Self.item(from:))
     }
 
+    public func getItem(id: String) throws -> TrashItem? {
+        let rows = try db.query("SELECT * FROM trash_items WHERE id=?", [.text(id)])
+        return rows.first.map(Self.item(from:))
+    }
+
     public func setStatus(id: String, status: TrashStatus, error: String? = nil) throws {
         try db.run("UPDATE trash_items SET status=?, last_error=? WHERE id=?",
                    [.text(status.rawValue), error.map { .text($0) } ?? .null, .text(id)])
@@ -79,11 +84,17 @@ public final class TrashRepository: @unchecked Sendable {
 
     @discardableResult
     public func createIntent(opType: String, rootID: String, payloadJSON: String = "{}") throws -> OperationIntentRecord {
+        try db.withTransaction { tx in
+            try createIntent(opType: opType, rootID: rootID, payloadJSON: payloadJSON, tx: tx)
+        }
+    }
+
+    func createIntent(opType: String, rootID: String, payloadJSON: String, tx: SQLiteDatabase.TransactionHandle) throws -> OperationIntentRecord {
         let now = Time.nowMs()
         let intent = OperationIntentRecord(id: IDFactory.new(), opType: opType, rootID: rootID,
                                            payloadJSON: payloadJSON, status: .prepared,
                                            createdAtMs: now, updatedAtMs: now, lastError: nil)
-        try db.run("""
+        try tx.run("""
             INSERT INTO operation_intents(id, op_type, root_id, payload_json, status, created_at_ms, updated_at_ms)
             VALUES(?,?,?,?,?,?,?)
             """, [.text(intent.id), .text(opType), .text(rootID), .text(payloadJSON),
@@ -94,6 +105,11 @@ public final class TrashRepository: @unchecked Sendable {
     public func updateIntent(id: String, status: OperationStatus, error: String? = nil) throws {
         try db.run("UPDATE operation_intents SET status=?, last_error=?, updated_at_ms=? WHERE id=?",
                    [.text(status.rawValue), error.map { .text($0) } ?? .null, .int(Time.nowMs()), .text(id)])
+    }
+
+    func finishIntent(id: String, status: OperationStatus, tx: SQLiteDatabase.TransactionHandle) throws {
+        try tx.run("UPDATE operation_intents SET status=?, last_error=NULL, updated_at_ms=? WHERE id=?",
+                   [.text(status.rawValue), .int(Time.nowMs()), .text(id)])
     }
 
     public func pendingIntents(opType: String? = nil) throws -> [OperationIntentRecord] {

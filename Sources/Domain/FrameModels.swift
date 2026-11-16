@@ -140,30 +140,54 @@ public struct FrameSnapshot: Equatable, Codable, Identifiable, Sendable {
     public var snapshotHash: String
     public var geometryVersion: Int
     public var createdAtMs: Int64
+    public var explicitWhite: Bool?
 
     public init(id: String = IDFactory.new(), sourceFrameID: String?, sourceFrameRevisionID: String?,
                 canvasWidth: Int, canvasHeight: Int,
                 background: SnapshotLayer?, foreground: SnapshotLayer?,
                 backgroundColorHex: String, slots: [SnapshotSlot],
-                snapshotHash: String, geometryVersion: Int = 1, createdAtMs: Int64 = Time.nowMs()) {
+                snapshotHash: String, geometryVersion: Int = 1, createdAtMs: Int64 = Time.nowMs(),
+                explicitWhite: Bool? = nil) {
         self.id = id; self.sourceFrameID = sourceFrameID; self.sourceFrameRevisionID = sourceFrameRevisionID
         self.canvasWidth = canvasWidth; self.canvasHeight = canvasHeight
         self.background = background; self.foreground = foreground
         self.backgroundColorHex = backgroundColorHex; self.slots = slots
         self.snapshotHash = snapshotHash; self.geometryVersion = geometryVersion
         self.createdAtMs = createdAtMs
+        self.explicitWhite = explicitWhite
     }
 
     public var requiredCaptureCount: Int {
         Set(slots.map(\.captureIndex)).count
     }
 
+    public var requiredIndices: Set<Int> {
+        Set(slots.map(\.captureIndex))
+    }
+
     public var maxCaptureIndex: Int {
         slots.map(\.captureIndex).max() ?? 0
     }
 
+    public func assigningPhotos(in order: [Int]) throws -> FrameSnapshot {
+        guard order.count == requiredCaptureCount, Set(order).count == order.count else {
+            throw AppError.invalidState("Cần chọn đúng số ảnh khác nhau cho khung")
+        }
+        let assignment = Dictionary(uniqueKeysWithValues: zip(requiredIndices.sorted(), order))
+        var assigned = self
+        assigned.id = IDFactory.new()
+        assigned.createdAtMs = Time.nowMs()
+        assigned.slots = slots.map { slot in
+            var copy = slot
+            copy.captureIndex = assignment[slot.captureIndex] ?? slot.captureIndex
+            return copy
+        }
+        assigned.snapshotHash = assigned.hashForContent()
+        return assigned
+    }
+
     public func hashForContent() -> String {
-        var material = "\(canvasWidth)x\(canvasHeight)|\(backgroundColorHex)|\(background?.assetID ?? "-")|\(foreground?.assetID ?? "-")|\(geometryVersion)"
+        var material = "\(canvasWidth)x\(canvasHeight)|\(backgroundColorHex)|\(background?.assetID ?? "-")|\(foreground?.assetID ?? "-")|\(geometryVersion)|\(explicitWhite ?? false)"
         for s in slots.sorted(by: { $0.zOrder < $1.zOrder }) {
             material += "|\(s.captureIndex),\(s.x),\(s.y),\(s.width),\(s.height),\(s.rotationDegrees),\(s.zOrder),\(s.maskType.rawValue),\(s.cornerRadius),\(s.defaultCropMode.rawValue)"
         }
@@ -206,6 +230,9 @@ public enum FrameValidator {
 
         // F-VAL-03: indices distinct liên tục bắt đầu từ 1, tối đa 12
         let indices = Set(slots.map(\.captureIndex))
+        if indices.count != slots.count {
+            issues.append(ValidationIssue(code: "F-VAL-03", slotID: nil, message: "Chỉ số ảnh bị trùng lặp"))
+        }
         if let out = indices.filter({ !(1...ResourceLimits.maxCaptureIndices).contains($0) }).min() {
             issues.append(ValidationIssue(code: "F-VAL-03", slotID: slots.first { $0.captureIndex == out }?.id, message: "Chỉ số ảnh phải trong 1…\(ResourceLimits.maxCaptureIndices)"))
         }

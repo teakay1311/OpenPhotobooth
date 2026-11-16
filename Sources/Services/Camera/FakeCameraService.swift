@@ -43,7 +43,21 @@ public final class FakeCameraService: CameraServing, @unchecked Sendable {
         }
     }
 
-    public func requestAccessIfNeeded() async -> CameraPermissionState { .authorized }
+    public var configuredPermissionState: CameraPermissionState = .authorized
+    public var requestAccessCallCount = 0
+
+    public func cameraPermissionState() async -> CameraPermissionState {
+        lock.lock(); defer { lock.unlock() }
+        return configuredPermissionState
+    }
+
+    public func requestAccessIfNeeded() async -> CameraPermissionState {
+        lock.lock()
+        requestAccessCallCount += 1
+        let state = configuredPermissionState
+        lock.unlock()
+        return state
+    }
 
     public func discoverDevices() async -> [CameraDescriptor] {
         lock.lock(); defer { lock.unlock() }
@@ -62,9 +76,22 @@ public final class FakeCameraService: CameraServing, @unchecked Sendable {
     public func selectAutoDevice() async throws -> CameraCapabilities {
         let devices = await discoverDevices()
         guard !devices.isEmpty else { throw AppError.noCamera }
-        let preferred = devices.first { $0.isSystemPreferred } ?? devices[0]
-        return try await selectDevice(preferred.uniqueID)
+        let builtIn = devices.filter { $0.kind == .builtIn }
+            .sorted { (a, b) in
+                if a.isSystemPreferred != b.isSystemPreferred { return a.isSystemPreferred }
+                return a.uniqueID < b.uniqueID
+            }
+        let nonBuiltIn = devices.filter { $0.kind != .builtIn }
+            .sorted { (a, b) in
+                if a.isSystemPreferred != b.isSystemPreferred { return a.isSystemPreferred }
+                return a.uniqueID < b.uniqueID
+            }
+        let candidates = builtIn + nonBuiltIn
+        guard let first = candidates.first else { throw AppError.noCamera }
+        return try await selectDevice(first.uniqueID)
     }
+
+    public var isPreviewRunning: Bool { get async { lock.withLock { running && connected } } }
 
     public func startPreview() async throws {
         lock.lock()
@@ -121,6 +148,14 @@ public final class FakeCameraService: CameraServing, @unchecked Sendable {
         return CapturedImagePayload(data: data, actualWidth: Int(frameSize.width), actualHeight: Int(frameSize.height),
                                     orientation: 1, colorProfile: "sRGB", capturedAtMs: Time.nowMs(),
                                     requestID: requestID.uuidString, codec: "jpeg")
+    }
+
+    private var configuredResolution: String = "best"
+
+    public func setResolution(_ resolution: String) async throws {
+        lock.lock()
+        defer { lock.unlock() }
+        configuredResolution = resolution
     }
 
     public func applyControls(_ controls: CameraControls) async throws -> AppliedControls {

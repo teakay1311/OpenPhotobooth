@@ -168,6 +168,18 @@ public final class SQLiteDatabase: @unchecked Sendable {
         public func query(_ sql: String, _ bind: [SQLiteValue] = []) throws -> [SQLiteRow] {
             try SQLiteDatabase.select(on: db, sql, bind)
         }
+        public func scalarInt(_ sql: String, _ bind: [SQLiteValue] = []) throws -> Int64 {
+            let rows = try query(sql, bind)
+            if let f = rows.first?.values.first {
+                switch f {
+                case .int(let v): return v
+                case .real(let v): return Int64(v)
+                case .text(let v): return Int64(v) ?? 0
+                default: return 0
+                }
+            }
+            return 0
+        }
     }
 
     // MARK: internals

@@ -9,11 +9,15 @@ public final class RecoveryService: @unchecked Sendable {
     private let sessions: SessionRepository
     private let trashRepo: TrashRepository
     private let clock: AppClock
+    private let trashService: TrashService
 
     public init(db: SQLiteDatabase, layout: FileLayout, sessions: SessionRepository,
-                trashRepo: TrashRepository, clock: AppClock = SystemClock.shared) {
+                trashRepo: TrashRepository, clock: AppClock = SystemClock.shared,
+                trashService: TrashService? = nil) {
         self.db = db; self.layout = layout; self.sessions = sessions
         self.trashRepo = trashRepo; self.clock = clock
+        self.trashService = trashService ?? TrashService(db: db, layout: layout, trashRepo: trashRepo,
+                                                         assets: AssetStore(db: db, layout: layout), clock: clock)
     }
 
     public struct Report: Equatable {
@@ -27,10 +31,16 @@ public final class RecoveryService: @unchecked Sendable {
     }
 
     public func runOnLaunch() async -> Report {
-        var report = await reconcileIntents()
-        await quarantineStrayPartials(into: &report)
-        await scanOrphanFiles(into: &report)
-        reconcileTrashIntents(into: &report)
+        var report = Report()
+        do {
+            let trash = try trashService.recoverOperations()
+            report = await reconcileIntents(excluding: trash.excludedSessions)
+            report.issues += trash.issues
+            await quarantineStrayPartials(into: &report, excluding: trash.excludedSessions)
+            await scanOrphanFiles(into: &report, excluding: trash.excludedSessions)
+        } catch {
+            report.issues.append("Không thể xác minh vị trí dữ liệu Thùng rác: \(error.localizedDescription)")
+        }
         await checkDatabase(into: &report)
         await countRecoverableSessions(into: &report)
         Log.recovery.info("Recovery: intents=\(report.committedIntents) quarantine=\(report.quarantinedFiles) orphan=\(report.orphanedFiles) sessions=\(report.recoverableSessions)")
@@ -40,10 +50,10 @@ public final class RecoveryService: @unchecked Sendable {
     /// Intent `prepared/files_staged/files_promoted` của savePhoto:
     /// - final file tồn tại + checksum khớp → hoàn tất commit (idempotent theo requestID)
     /// - chỉ có .partial → quarantine, không đánh dấu ảnh hoàn tất
-    func reconcileIntents() async -> Report {
+    func reconcileIntents(excluding sessionsToSkip: Set<String> = []) async -> Report {
         var report = Report()
         guard let intents = try? trashRepo.pendingIntents(opType: "savePhoto") else { return report }
-        for intent in intents {
+        for intent in intents where !sessionsToSkip.contains(intent.rootID) {
             guard let data = intent.payloadJSON.data(using: .utf8),
                   let payload = try? JSONDecoder().decode(SafetySaveService.SavePhotoIntentPayload.self, from: data) else {
                 try? trashRepo.updateIntent(id: intent.id, status: .failed, error: "Payload không đọc được")
@@ -112,45 +122,11 @@ public final class RecoveryService: @unchecked Sendable {
         return report
     }
 
-    /// Intent `op_type="trash"` kẹt (crash giữa move-file và DB transaction, §12.3):
-    /// - DB đã ghi nhận trashed → intent hoàn tất (commit).
-    /// - DB chưa trash nhưng file đã bị move sang Trash/Sessions → trả file về chỗ cũ và đánh dấu intent failed,
-    ///   giữ nhất quán giữa DB và file (không bỏ file mồ côi trong Trash staging).
-    func reconcileTrashIntents(into report: inout Report) {
-        guard let intents = try? trashRepo.pendingIntents(opType: "trash") else { return }
-        let fm = FileManager.default
-        for intent in intents {
-            let rows = (try? db.query("SELECT status FROM sessions WHERE id=?", [.text(intent.rootID)])) ?? []
-            let status = rows.first?["status"].stringValue ?? ""
-            if status == "trashed" || status == "purging" {
-                try? trashRepo.updateIntent(id: intent.id, status: .committed)
-                continue
-            }
-            // Phiên chưa bị trash trong DB: nếu thư mục đã bị move sang Trash → hoàn tác move
-            let trashed = layout.trashSessionsDir.appendingPathComponent(intent.rootID, isDirectory: true)
-            let dest = layout.sessionDir(intent.rootID)
-            if fm.fileExists(atPath: trashed.path) {
-                do {
-                    try? fm.removeItem(at: dest)
-                    try fm.moveItem(at: trashed, to: dest)
-                    try? trashRepo.updateIntent(id: intent.id, status: .failed,
-                                                error: "Trash chưa hoàn tất — đã trả file về vị trí cũ")
-                } catch {
-                    report.issues.append("Không hoàn tác được intent trash cho phiên \(intent.rootID.prefix(8))")
-                }
-            } else {
-                // Không có file session (frame/category/preset trash không move file) — operation chưa bắt đầu,
-                // DB nhất quán → hủy intent.
-                try? trashRepo.updateIntent(id: intent.id, status: .failed, error: "Trash chưa hoàn tất")
-            }
-        }
-    }
-
     /// .partial không có intent → quarantine (không xóa âm thầm).
-    func quarantineStrayPartials(into report: inout Report) async {
+    func quarantineStrayPartials(into report: inout Report, excluding sessionsToSkip: Set<String>) async {
         let fm = FileManager.default
         guard let sessionDirs = try? fm.contentsOfDirectory(at: layout.sessionsDir, includingPropertiesForKeys: nil) else { return }
-        for sessionDir in sessionDirs {
+        for sessionDir in sessionDirs where !sessionsToSkip.contains(sessionDir.lastPathComponent) {
             let originals = sessionDir.appendingPathComponent("Originals")
             guard let files = try? fm.contentsOfDirectory(at: originals, includingPropertiesForKeys: nil) else { continue }
             for file in files where file.pathExtension == "partial" {
@@ -161,10 +137,10 @@ public final class RecoveryService: @unchecked Sendable {
 
     /// File orphan: có trong thư mục session nhưng không có record DB.
     /// Không xóa hàng loạt tự động (§10.3) — chuyển quarantine và báo cáo.
-    func scanOrphanFiles(into report: inout Report) async {
+    func scanOrphanFiles(into report: inout Report, excluding sessionsToSkip: Set<String>) async {
         let fm = FileManager.default
         guard let sessionDirs = try? fm.contentsOfDirectory(at: layout.sessionsDir, includingPropertiesForKeys: nil) else { return }
-        for sessionDir in sessionDirs {
+        for sessionDir in sessionDirs where !sessionsToSkip.contains(sessionDir.lastPathComponent) {
             let sessionID = sessionDir.lastPathComponent
             let originals = sessionDir.appendingPathComponent("Originals")
             guard let files = try? fm.contentsOfDirectory(at: originals, includingPropertiesForKeys: nil) else { continue }

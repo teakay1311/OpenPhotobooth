@@ -64,6 +64,16 @@ public struct PackImportSheet: View {
 
     private var content: some View {
         VStack(spacing: 0) {
+            if vm.partiallyWrittenCount > 0 {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                    Text("Có \(vm.partiallyWrittenCount) mục có thể đã ghi một phần. Kiểm tra khung và danh mục trong Thư viện trước khi nhập lại.")
+                        .font(.caption).foregroundStyle(.primary)
+                }
+                .padding(8)
+                .background(.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
+                .padding(.horizontal, 12).padding(.top, 8)
+            }
             if !vm.warnings.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     ForEach(Array(vm.warnings.enumerated()), id: \.offset) { _, w in
@@ -81,7 +91,9 @@ public struct PackImportSheet: View {
                         ForEach(result.entries, id: \.id) { entry in
                             PackImportRow(entry: entry,
                                           choice: binding(for: entry.frame.frameId),
-                                          result: vm.results?[entry.frame.frameId])
+                                          status: vm.itemStatuses?[entry.frame.frameId],
+                                          result: vm.results?[entry.frame.frameId],
+                                          isLocked: vm.phase == .completed || vm.isImporting)
                         }
                     }
                 }
@@ -103,16 +115,29 @@ public struct PackImportSheet: View {
 
     private var footer: some View {
         HStack {
-            Button("Hủy") { dismiss() }
-            Spacer()
-            if vm.isImporting {
-                ProgressView()
+            if vm.phase == .completed {
+                Spacer()
+                Button("Đóng") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            } else if case .failedBeforeWrite = vm.phase {
+                Button("Đóng") { dismiss() }
+                Spacer()
+                PrimaryButton(title: "Thử lại", systemImage: "arrow.clockwise") {
+                    vm.applyImport()
+                }
+            } else {
+                Button("Hủy") { dismiss() }
+                    .disabled(vm.isImporting)
+                Spacer()
+                if vm.isImporting {
+                    ProgressView().controlSize(.small)
+                }
+                PrimaryButton(title: "Nhập", systemImage: "square.and.arrow.down",
+                              disabledReason: vm.choices.values.allSatisfy({ !$0.selected }) ? "Chọn ít nhất 1 khung" : nil) {
+                    vm.applyImport()
+                }
+                .disabled(vm.isImporting || vm.choices.values.allSatisfy({ !$0.selected }))
             }
-            PrimaryButton(title: "Nhập", systemImage: "square.and.arrow.down",
-                          disabledReason: vm.choices.values.allSatisfy({ !$0.selected }) ? "Chọn ít nhất 1 khung" : nil) {
-                vm.applyImport()
-            }
-            .disabled(vm.isImporting || vm.choices.values.allSatisfy({ !$0.selected }))
         }
         .padding(10)
     }
@@ -121,7 +146,9 @@ public struct PackImportSheet: View {
 struct PackImportRow: View {
     let entry: PackEntry
     @Binding var choice: PackDuplicatePolicy
+    let status: FramePackService.PackItemStatus?
     let result: Result<String, String>?
+    let isLocked: Bool
 
     var body: some View {
         HStack(spacing: 10) {
@@ -146,7 +173,32 @@ struct PackImportRow: View {
             }
             .frame(width: 120)
             .labelsHidden()
-            if let r = result {
+            .disabled(isLocked)
+
+            if let st = status {
+                switch st {
+                case .imported:
+                    HStack(spacing: 4) {
+                        Text("Đã nhập").font(.caption2).foregroundStyle(.green)
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    }
+                case .replaced:
+                    HStack(spacing: 4) {
+                        Text("Đã thay thế").font(.caption2).foregroundStyle(.green)
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    }
+                case .skipped:
+                    Text("Bỏ qua").font(.caption2).foregroundStyle(.secondary)
+                case .unselected:
+                    Text("Không chọn").font(.caption2).foregroundStyle(.secondary)
+                case .failedBeforeWrite(let r):
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
+                        .help("Thất bại trước khi ghi: \(r)")
+                case .partiallyWritten(let r):
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                        .help("Có thể đã ghi một phần: \(r)")
+                }
+            } else if let r = result {
                 switch r {
                 case .success: Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
                 case .failure: Image(systemName: "xmark.circle.fill").foregroundStyle(.red)

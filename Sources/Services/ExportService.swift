@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import CoreImage
 import ImageIO
 import UniformTypeIdentifiers
 
@@ -58,9 +59,13 @@ public final class SessionRenderBuilder: @unchecked Sendable {
             sources[index] = RenderSource(image: image)
             // Vision trên ảnh đã normalize (§8.4) — cacheKey gắn rotation để không dùng
             // kết quả của ảnh xoay cho ảnh chưa xoay (và ngược lại)
-            let detected = await faceAnalysis.detectFaces(cgImage: image,
-                                                           cacheKey: "\(revision.id)|rot\(Int(resolved.photoRotation))")
-            faces[index] = detected
+            if detail.session.defaults.smartFace ?? true {
+                let detected = await faceAnalysis.detectFaces(cgImage: image,
+                                                               cacheKey: "\(revision.id)|rot\(Int(resolved.photoRotation))")
+                faces[index] = detected
+            } else {
+                faces[index] = []
+            }
         }
 
         var placements: [String: PhotoPlacement] = [:]
@@ -85,14 +90,138 @@ public final class SessionRenderBuilder: @unchecked Sendable {
                                                        matteColor: matteColor))
     }
 
-    /// Render cache preview (Thư viện / Review) — key theo §11.1.
-    public func renderPreview(detail: SessionDetail, maxDimension: Int) async -> CGImage? {
-        let snap = detail.snapshot
-        let aspect = Double(snap.canvasWidth) / Double(max(snap.canvasHeight, 1))
-        var w = maxDimension, h = maxDimension
-        if aspect >= 1 { h = Int(Double(maxDimension) / aspect) } else { w = Int(Double(maxDimension) * aspect) }
-        let model = await buildModel(detail: detail, targetWidth: max(1, w), targetHeight: max(1, h))
+    /// A1: Nhánh nghiêm ngặt dùng chung cho Xuất tay, Auto Export và Tạo tệp Chia sẻ.
+    /// Xác nhận từng ảnh hiện hành bắt buộc và mỗi lớp nền/lớp phủ được khai báo đều đọc và giải mã được từ đĩa thật.
+    public func buildModelStrict(detail: SessionDetail, targetWidth: Int, targetHeight: Int,
+                                 transparentBackground: Bool = false,
+                                 matteColor: CGColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)) async throws -> CompositionModel {
+        if detail.needsPhotoSelection { throw AppError.invalidState("Chọn ảnh vào khung trước") }
+        guard detail.hasEnoughPhotos else {
+            throw AppError.notEnoughPhotos(missing: detail.missingCount)
+        }
+        var assetImages: [String: CGImage] = [:]
+        if let bg = detail.snapshot.background {
+            guard let img = try? assets.loadImage(assetID: bg.assetID) else {
+                throw AppError.missingFrameAssets
+            }
+            assetImages[bg.assetID] = img
+        }
+        if let fg = detail.snapshot.foreground {
+            guard let img = try? assets.loadImage(assetID: fg.assetID) else {
+                throw AppError.missingFrameAssets
+            }
+            assetImages[fg.assetID] = img
+        }
+
+        var sources: [Int: RenderSource] = [:]
+        var faces: [Int: [FaceBox]] = [:]
+        let current = detail.currentRevisions()
+        for index in detail.snapshot.requiredIndices {
+            guard let revision = current[index], revision.state == .available else {
+                throw AppError.notEnoughPhotos(missing: 1)
+            }
+            guard let url = try? sessions.fileURL(for: revision),
+                  FileManager.default.fileExists(atPath: url.path),
+                  let raw = ImageNormalizer.uprightImage(url: url) else {
+                throw AppError.ioFailure("Tệp ảnh lượt \(index) bị thiếu hoặc hỏng trên ổ đĩa")
+            }
+            let resolved = ResolvedPhotoParams.resolve(defaults: detail.session.defaults,
+                                                       override: detail.overrides[index])
+            var decoded = ImageNormalizer.applyOutputMirror(raw, mirrored: detail.session.defaults.outputMirror)
+            if resolved.photoRotation.truncatingRemainder(dividingBy: 360) != 0 {
+                decoded = ImageNormalizer.rotate(decoded, degrees: resolved.photoRotation)
+            }
+            let cacheKey = "\(revision.id)|m\(detail.session.defaults.outputMirror ? 1 : 0)|r\(Int(resolved.photoRotation))"
+            sourceImageCache.setObject(decoded, forKey: cacheKey as NSString)
+            sources[index] = RenderSource(image: decoded)
+            if detail.session.defaults.smartFace ?? true {
+                let detected = await faceAnalysis.detectFaces(cgImage: decoded,
+                                                              cacheKey: "\(revision.id)|rot\(Int(resolved.photoRotation))")
+                faces[index] = detected
+            } else {
+                faces[index] = []
+            }
+        }
+
+        var placements: [String: PhotoPlacement] = [:]
+        var cropModes: [String: CropMode] = [:]
+        for slot in detail.snapshot.slots {
+            if let p = detail.placements[slot.id] {
+                placements[slot.id] = p.placement
+                cropModes[slot.id] = p.cropMode
+            }
+        }
+
+        return CompositionModel(snapshot: detail.snapshot,
+                                sources: sources,
+                                faces: faces,
+                                defaults: detail.session.defaults,
+                                overrides: detail.overrides,
+                                placements: placements,
+                                cropModes: cropModes,
+                                assetImages: assetImages,
+                                options: RenderOptions(targetWidth: targetWidth, targetHeight: targetHeight,
+                                                       transparentBackground: transparentBackground,
+                                                       matteColor: matteColor))
+    }
+
+    /// Render cache preview (Thư viện / Review / Sheet xuất) — key theo §11.1, D2-A09.
+    public func renderPreview(detail: SessionDetail, maxDimension: Int, format: ExportImageFormat = .jpeg,
+                              outputSize: (width: Int, height: Int)? = nil) async -> CGImage? {
+        let width = outputSize?.width ?? detail.snapshot.canvasWidth
+        let height = outputSize?.height ?? detail.snapshot.canvasHeight
+        guard width > 0, height > 0, maxDimension > 0 else { return nil }
+        let scale = Double(maxDimension) / Double(max(width, height))
+        let previewWidth = max(1, Int((Double(width) * scale).rounded()))
+        let previewHeight = max(1, Int((Double(height) * scale).rounded()))
+        let model = await buildModel(detail: detail, targetWidth: previewWidth, targetHeight: previewHeight,
+                                     transparentBackground: format == .png)
+        guard !Task.isCancelled else { return nil }
         return try? CompositeRenderer.render(model: model)
+    }
+
+    /// Render preview ảnh đơn (§2, §3.2): toàn ảnh theo tỉ lệ gốc, với hướng/lật thành phẩm và màu đã chỉnh,
+    /// bỏ phần khung và crop riêng của ô. Giới hạn cạnh dài tối đa maxDimension (1100 px).
+    public func renderSinglePhotoPreview(detail: SessionDetail, captureIndex: Int, maxDimension: Int = 1100) async throws -> CGImage {
+        guard let revision = detail.currentRevisions()[captureIndex], revision.state == .available else {
+            throw AppError.notFound("Không tìm thấy ảnh lượt \(captureIndex)")
+        }
+        let resolved = ResolvedPhotoParams.resolve(defaults: detail.session.defaults,
+                                                   override: detail.overrides[captureIndex])
+        let cacheKey = "\(revision.id)|m\(detail.session.defaults.outputMirror ? 1 : 0)|r\(Int(resolved.photoRotation))"
+        var image: CGImage
+        if let cached = sourceImageCache.object(forKey: cacheKey as NSString) {
+            image = cached
+        } else {
+            guard let url = try? sessions.fileURL(for: revision),
+                  FileManager.default.fileExists(atPath: url.path),
+                  let raw = ImageNormalizer.uprightImage(url: url) else {
+                throw AppError.ioFailure("Không thể đọc tệp ảnh lượt \(captureIndex)")
+            }
+            var decoded = ImageNormalizer.applyOutputMirror(raw, mirrored: detail.session.defaults.outputMirror)
+            if resolved.photoRotation.truncatingRemainder(dividingBy: 360) != 0 {
+                decoded = ImageNormalizer.rotate(decoded, degrees: resolved.photoRotation)
+            }
+            sourceImageCache.setObject(decoded, forKey: cacheKey as NSString)
+            image = decoded
+        }
+
+        var ci = CIImage(cgImage: image)
+        let origW = CGFloat(image.width)
+        let origH = CGFloat(image.height)
+        let maxDim = max(origW, origH)
+        if maxDim > CGFloat(maxDimension) {
+            let scale = CGFloat(maxDimension) / maxDim
+            ci = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        }
+
+        // 1. Preset + adjustments (§8.4)
+        ci = ImageColorPipeline.applyColor(ci, resolved: resolved)
+
+        guard let out = CIContextHolder.shared.context.createCGImage(ci, from: ci.extent) else {
+            throw AppError.exportFailed("Không render được ảnh")
+        }
+        return out
     }
 }
 
@@ -136,10 +265,35 @@ public final class ExportService: @unchecked Sendable {
 
     public enum ExportError: Error { case cancelled, failed(String) }
 
+    public static func defaultFilenameBase(date: Date = Date()) -> String {
+        let df = DateFormatter()
+        df.dateFormat = "yyyyMMdd-HHmmss"
+        return "Photobooth-\(df.string(from: date))"
+    }
+
     /// Xuất theo §11.2. Trả về record + URL file thành công.
     @discardableResult
-    public func export(detail: SessionDetail, request: ExportRequest) async throws -> (ExportRecordModel, URL) {
+    public func export(detail: SessionDetail, request: ExportRequest,
+                       parentToken: OperationCoordinator.OperationToken? = nil) async throws -> (ExportRecordModel, URL) {
+        guard request.sessionID == detail.session.id else {
+            throw AppError.invalidState("Session ID không khớp giữa request và dữ liệu phiên")
+        }
+        // Khóa phiên chống xung đột ghi/xóa/đổi khung (DATA-01 / L7)
+        let opToken = try OperationCoordinator.shared.acquire(key: "session:\(request.sessionID)", reason: "ExportService: exporting", parentToken: parentToken)
+        defer { opToken.release() }
+
+        // Xác nhận tính nhất quán với DB dưới khóa (§3.2.1)
+        guard let latestSession = try sessions.getSession(id: request.sessionID),
+              latestSession.status != .trashed else {
+            throw AppError.notFound("Phiên chụp không tồn tại hoặc đã bị xóa")
+        }
+        guard latestSession.revisionNo == detail.session.revisionNo,
+              latestSession.activeFrameSnapshotID == detail.snapshot.id else {
+            throw AppError.invalidState("Dữ liệu phiên đã thay đổi, vui lòng làm mới và thử lại")
+        }
+
         // Bước 1: đủ ảnh required (§11.2.1)
+        if detail.needsPhotoSelection { throw AppError.invalidState("Chọn ảnh vào khung trước") }
         guard detail.hasEnoughPhotos else {
             throw AppError.notEnoughPhotos(missing: detail.missingCount)
         }
@@ -164,11 +318,11 @@ public final class ExportService: @unchecked Sendable {
         let accessing = request.securityScoped && request.destinationFolder.startAccessingSecurityScopedResource()
         defer { if accessing { request.destinationFolder.stopAccessingSecurityScopedResource() } }
 
-        // Bước 2: RenderRequest bất từn từ session revision hiện tại (§17.4)
-        let model = await builder.buildModel(detail: detail, targetWidth: request.width,
-                                             targetHeight: request.height,
-                                             transparentBackground: request.format == .png,
-                                             matteColor: CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+        // Bước 2: RenderRequest bất biến từ session revision hiện tại (§17.4) — A1: strict validation
+        let model = try await builder.buildModelStrict(detail: detail, targetWidth: request.width,
+                                                       targetHeight: request.height,
+                                                       transparentBackground: request.format == .png,
+                                                       matteColor: CGColor(red: 1, green: 1, blue: 1, alpha: 1))
         record.status = .writing
         let cg: CGImage
         do {
@@ -272,33 +426,35 @@ public final class ExportService: @unchecked Sendable {
         return data
     }
 
-    /// Auto Export khi nhấn Hoàn thành (§10.1, mặc định Tắt).
-    public func autoExport(detail: SessionDetail, folderBookmarkID: String?) async -> Result<URL, AppError> {
-        guard let bookmarkID = folderBookmarkID,
-              let stored = try? trashRepo.bookmark(id: bookmarkID) else {
+    func resolveExportFolder(bookmarkID: String?) throws -> URL {
+        guard let bookmarkID, let stored = try trashRepo.bookmark(id: bookmarkID) else {
+            throw AppError.externalFolderPermissionLost
+        }
+        var stale = false
+        let url = (try? URL(resolvingBookmarkData: stored.blob, options: [.withSecurityScope, .withoutUI],
+                           relativeTo: nil, bookmarkDataIsStale: &stale))
+            ?? (try? URL(resolvingBookmarkData: stored.blob, options: [.withoutUI],
+                         relativeTo: nil, bookmarkDataIsStale: &stale))
+        guard let url, !stale else { throw AppError.externalFolderPermissionLost }
+        return url
+    }
+
+    /// Auto Export khi nhấn Hoàn thành (§10.1, mặc định Tắt, A2 + A8).
+    public func autoExport(detail: SessionDetail, folderBookmarkID: String?,
+                           format: ExportImageFormat = .jpeg, quality: Int = 95,
+                           parentToken: OperationCoordinator.OperationToken? = nil) async -> Result<URL, AppError> {
+        guard let folder = try? resolveExportFolder(bookmarkID: folderBookmarkID) else {
             return .failure(.externalFolderPermissionLost)
         }
-        var isStale = false
-        guard let folder = try? URL(resolvingBookmarkData: stored.blob,
-                                    options: .withSecurityScope,
-                                    relativeTo: nil, bookmarkDataIsStale: &isStale) else {
-            return .failure(.externalFolderPermissionLost)
-        }
-        let df = DateFormatter()
-        df.dateFormat = "yyyyMMdd_HHmmss"
-        let base = "Photobooth_\(df.string(from: Date()))"
-        let format = ExportImageFormat(rawValue: UserDefaults.standard.string(forKey: "exportFormat") ?? "jpeg") ?? .jpeg
-        let quality = UserDefaults.standard.integer(forKey: "jpegQuality")
-        let width = UserDefaults.standard.integer(forKey: "exportWidth")
-        let height = UserDefaults.standard.integer(forKey: "exportHeight")
+        let base = Self.defaultFilenameBase()
         let req = ExportRequest(sessionID: detail.session.id, format: format,
-                                quality: quality == 0 ? 95 : quality,
-                                width: width == 0 ? detail.snapshot.canvasWidth : width,
-                                height: height == 0 ? detail.snapshot.canvasHeight : height,
+                                quality: quality,
+                                width: detail.snapshot.canvasWidth,
+                                height: detail.snapshot.canvasHeight,
                                 filenameBase: base, destinationFolder: folder,
                                 securityScoped: true, replaceExisting: false)
         do {
-            let (_, url) = try await export(detail: detail, request: req)
+            let (_, url) = try await export(detail: detail, request: req, parentToken: parentToken)
             return .success(url)
         } catch let e as AppError {
             return .failure(e)

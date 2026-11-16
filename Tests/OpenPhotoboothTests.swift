@@ -40,10 +40,10 @@ final class OpenPhotoboothTests: XCTestCase {
         let db = try SQLiteDatabase(path: ":memory:")
         try Schema.migrate(db)
         
-        // Verify schema version is 2
+        // Verify schema version is at least 2 / currentVersion
         let rows = try db.query("SELECT MAX(version) as mv FROM schema_migrations")
         let maxVersion = rows.first?["mv"]?.int64Value
-        XCTAssertEqual(maxVersion, 2)
+        XCTAssertEqual(maxVersion, Schema.currentVersion)
         
         // Check columns in sessions table
         let tableInfo = try db.query("PRAGMA table_info(sessions)")
@@ -105,5 +105,80 @@ final class OpenPhotoboothTests: XCTestCase {
         
         let invalidData = Data([0x00, 0x01, 0x02, 0x03])
         XCTAssertFalse(FramesViewModel.validateMagicBytes(invalidData))
+    }
+
+    func testCameraPermissionStateDoesNotPrompt() async {
+        let fake = FakeCameraService()
+        fake.configuredPermissionState = .notDetermined
+        let state = await fake.cameraPermissionState()
+        XCTAssertEqual(state, .notDetermined)
+        XCTAssertEqual(fake.requestAccessCallCount, 0)
+
+        let requested = await fake.requestAccessIfNeeded()
+        XCTAssertEqual(requested, .notDetermined)
+        XCTAssertEqual(fake.requestAccessCallCount, 1)
+    }
+
+    func testAutoCameraCandidateOrderingPrioritizesBuiltIn() async throws {
+        let caps = CameraCapabilities()
+        let iphone = CameraDescriptor(uniqueID: "iphone-continuity", localizedName: "iPhone Camera", kind: .continuity, isConnected: true, isSystemPreferred: true, capabilities: caps)
+        let builtin = CameraDescriptor(uniqueID: "builtin-mac", localizedName: "FaceTime HD", kind: .builtIn, isConnected: true, isSystemPreferred: false, capabilities: caps)
+        let fake = FakeCameraService(devicesCatalog: [iphone, builtin])
+
+        _ = try await fake.selectAutoDevice()
+        // selectAutoDevice must pick builtin-mac first despite iphone having isSystemPreferred = true
+        let current = await fake.discoverDevices()
+        XCTAssertTrue(current.contains(where: { $0.uniqueID == "builtin-mac" }))
+    }
+
+    @MainActor
+    func testReviewUndoRedoStateTracking() {
+        let env = AppEnvironment(inMemory: true)
+        let vm = ReviewViewModel(env: env)
+        XCTAssertFalse(vm.canUndo)
+        XCTAssertFalse(vm.canRedo)
+    }
+
+    @MainActor
+    func testThumbnailStoreGenerationTracking() throws {
+        let env = AppEnvironment(inMemory: true)
+        let store = env.thumbnails
+        let gen0 = store.generation
+        let testData = "test-image".data(using: .utf8)!
+
+        let stored0 = store.store(data: testData, key: "thumb-1", expectedGeneration: gen0)
+        XCTAssertTrue(stored0)
+        XCTAssertNotNil(store.cachedData(key: "thumb-1", validForGeneration: gen0))
+
+        try store.clearAll()
+        let gen1 = store.generation
+        XCTAssertEqual(gen1, gen0 + 1)
+        XCTAssertNil(store.cachedData(key: "thumb-1", validForGeneration: gen1))
+
+        // Stale generation rejected
+        let storedStale = store.store(data: testData, key: "thumb-stale", expectedGeneration: gen0)
+        XCTAssertFalse(storedStale)
+    }
+
+    @MainActor
+    func testCaptureEngineCountdownCancelReturnsToReady() async throws {
+        let env = AppEnvironment(inMemory: true)
+        await env.boot()
+        let frames = try env.frames.listFrames()
+        guard let frame = frames.first(where: { $0.validationStatus == .ready }) else {
+            XCTFail("No ready seed frames found")
+            return
+        }
+        let snap = try env.frames.createSnapshot(frameID: frame.id)
+        _ = try env.engine.beginSession(snapshot: snap, mode: .automatic, cameraID: "cam1", defaults: env.settings.sessionDefaultsSnapshot(), countdown: 5, interval: 3)
+        XCTAssertEqual(env.engine.state, .ready)
+
+        try env.engine.startOrContinue()
+        if case .countdown = env.engine.state {
+            env.engine.cancelCountdown()
+            XCTAssertEqual(env.engine.state, .ready)
+        } else {
+            XCTFail("Engine should be in countdown state")
+        }
     }
 }

@@ -127,23 +127,56 @@ public struct ToastOverlay: View {
 
 public struct SessionBanner: View {
     @ObservedObject var env: AppEnvironment
-    var onContinue: () -> Void
-    var onView: () -> Void
+    var onContinue: (String) -> Void
+    var onView: (String) -> Void
+
+    public init(env: AppEnvironment, onContinue: @escaping (String) -> Void, onView: @escaping (String) -> Void) {
+        self.env = env
+        self.onContinue = onContinue
+        self.onView = onView
+    }
+
+    private var disabledReason: String? {
+        if env.engine.hasPhotoToSave {
+            return "Thử lưu lại ảnh của phiên đang mở trước"
+        }
+        if env.engine.isCaptureBusy {
+            return "Chờ hoàn tất lượt chụp hoặc dừng an toàn trước khi tiếp tục phiên khác"
+        }
+        if env.showLeaveCaptureConfirmation {
+            return "Hoàn tất thao tác điều hướng trước khi tiếp tục"
+        }
+        return nil
+    }
 
     public var body: some View {
-        if env.bannerSessionID != nil {
+        if let bannerID = env.bannerSessionID {
             HStack(spacing: 10) {
                 Image(systemName: "clock.arrow.circlepath")
                 Text("Có phiên chưa hoàn thành")
                 Spacer()
-                Button("Tiếp tục", action: onContinue).buttonStyle(.borderedProminent).controlSize(.small)
-                Button("Xem", action: onView).controlSize(.small)
+                Button("Tiếp tục") {
+                    onContinue(bannerID)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(env.isProcessingBannerAction || !env.engine.canAdoptSession || env.showLeaveCaptureConfirmation)
+                .help(disabledReason ?? "Tiếp tục chụp phiên này")
+
+                Button("Xem") {
+                    onView(bannerID)
+                }
+                .controlSize(.small)
+                .disabled(env.isProcessingBannerAction || env.engine.isCaptureBusy || env.engine.hasPhotoToSave || env.showLeaveCaptureConfirmation)
+                .help(disabledReason ?? "Mở xem và chỉnh ảnh phiên này")
+
                 Button {
                     env.dismissBanner()
                 } label: {
                     Image(systemName: "xmark")
                 }
                 .controlSize(.small)
+                .disabled(env.isProcessingBannerAction)
                 .help("Để sau")
             }
             .padding(.horizontal, 12)
@@ -159,7 +192,7 @@ public struct ImageDataView: View {
     public var data: Data?
     public var image: CGImage?
     public var contentMode: ContentMode = .fit
-    @State private var nsImage: NSImage?
+    @State private var decodedImage: NSImage?
 
     public init(data: Data? = nil, image: CGImage? = nil, contentMode: ContentMode = .fit) {
         self.data = data; self.image = image; self.contentMode = contentMode
@@ -167,7 +200,7 @@ public struct ImageDataView: View {
 
     public var body: some View {
         ZStack {
-            if let img = image?.asNSImage ?? decoded {
+            if let img = effectiveImage {
                 Image(nsImage: img)
                     .resizable()
                     .aspectRatio(contentMode: contentMode)
@@ -177,13 +210,30 @@ public struct ImageDataView: View {
                     .foregroundStyle(.tertiary)
             }
         }
+        .task(id: data) {
+            updateDecodedImage()
+        }
     }
 
-    var decoded: NSImage? {
-        if let nsImage { return nsImage }
-        guard let data, let ns = NSImage(data: data) else { return nil }
-        nsImage = ns
-        return ns
+    private var effectiveImage: NSImage? {
+        if let image {
+            return image.asNSImage
+        }
+        if let decodedImage {
+            return decodedImage
+        }
+        if let data {
+            return NSImage(data: data)
+        }
+        return nil
+    }
+
+    private func updateDecodedImage() {
+        guard let data else {
+            decodedImage = nil
+            return
+        }
+        decodedImage = NSImage(data: data)
     }
 }
 
@@ -296,9 +346,13 @@ public struct CIPreviewView: NSViewRepresentable {
     public var cameraService: CameraService?
     public var mirror: Bool
     public var inFrame: InFrameSpec?
+    public var photoParameters: ResolvedPhotoParams?
+    public var faceAnalysis: FaceAnalysisService?
 
-    public init(cameraService: CameraService?, mirror: Bool, inFrame: InFrameSpec? = nil) {
+    public init(cameraService: CameraService?, mirror: Bool, inFrame: InFrameSpec? = nil,
+                photoParameters: ResolvedPhotoParams? = nil, faceAnalysis: FaceAnalysisService? = nil) {
         self.cameraService = cameraService; self.mirror = mirror; self.inFrame = inFrame
+        self.photoParameters = photoParameters; self.faceAnalysis = faceAnalysis
     }
 
     public func makeNSView(context: Context) -> MetalPreviewNSView {
@@ -306,6 +360,8 @@ public struct CIPreviewView: NSViewRepresentable {
         view.cameraService = cameraService
         view.mirror = mirror
         view.inFrame = inFrame
+        view.photoParameters = photoParameters
+        view.faceAnalysis = faceAnalysis
         view.configure()
         return view
     }
@@ -313,6 +369,8 @@ public struct CIPreviewView: NSViewRepresentable {
     public func updateNSView(_ view: MetalPreviewNSView, context: Context) {
         view.mirror = mirror
         view.inFrame = inFrame
+        view.photoParameters = photoParameters
+        view.faceAnalysis = faceAnalysis
         if view.cameraService !== cameraService {
             view.cameraService = cameraService
         }
@@ -323,6 +381,8 @@ public final class MetalPreviewNSView: NSView, MTKViewDelegate {
     var cameraService: CameraService?
     var mirror = true
     var inFrame: InFrameSpec?
+    var photoParameters: ResolvedPhotoParams?
+    var faceAnalysis: FaceAnalysisService?
     private var mtkView: MTKView?
     // CIContext phải cùng MTLDevice với MTKView để render qua CIRRenderDestination —
     // tạo lại trong configure() sau khi có device (P3-21a).
@@ -339,10 +399,17 @@ public final class MetalPreviewNSView: NSView, MTKViewDelegate {
         v.enableSetNeedsDisplay = false
         v.isPaused = false
         v.preferredFramesPerSecond = 30
+        // BUG-CAM-03: Bắt buộc đặt false để drawable.texture có MTLTextureUsageShaderWrite cho Core Image render
+        v.framebufferOnly = false
         v.autoresizingMask = [.width, .height]
         v.clearColor = MTLClearColor(red: 0.05, green: 0.05, blue: 0.07, alpha: 1)
         addSubview(v)
         mtkView = v
+    }
+
+    public override func layout() {
+        super.layout()
+        mtkView?.frame = bounds
     }
 
     public func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
@@ -350,25 +417,52 @@ public final class MetalPreviewNSView: NSView, MTKViewDelegate {
     public func draw(in view: MTKView) {
         guard let drawable = view.currentDrawable, commandQueue != nil else { return }
         guard let service = cameraService, let frame = service.latestPreviewBuffer() else { return }
+        let viewSize = view.drawableSize
+        guard viewSize.width > 0, viewSize.height > 0 else { return }
+
         var ci = CIImage(cvPixelBuffer: frame.buffer)
+        guard ci.extent.width > 0, ci.extent.height > 0, !ci.extent.isInfinite else { return }
+
+        // Chuẩn hóa extent về (0,0) trước khi tính toán
+        if ci.extent.origin != .zero {
+            ci = ci.transformed(by: CGAffineTransform(translationX: -ci.extent.origin.x, y: -ci.extent.origin.y))
+        }
+
         if mirror {
             ci = ci.oriented(.upMirrored)
+            if ci.extent.origin != .zero {
+                ci = ci.transformed(by: CGAffineTransform(translationX: -ci.extent.origin.x, y: -ci.extent.origin.y))
+            }
         }
-        let viewSize = view.drawableSize
+
+        if let params = photoParameters {
+            ci = ImageColorPipeline.applyColor(ci, resolved: params)
+        }
+
         let target: CIImage
         if let spec = inFrame {
             target = Self.composeInFrame(video: ci, spec: spec, size: viewSize)
         } else {
-            // Fit toàn khung camera (không stretch §4.4)
+            // Fit toàn khung camera (aspect-fit, không stretch §4.4, căn giữa BUG-CAM-03)
             let scale = min(viewSize.width / ci.extent.width, viewSize.height / ci.extent.height)
-            let tx = (viewSize.width - ci.extent.width * scale) / 2
-            let ty = (viewSize.height - ci.extent.height * scale) / 2
-            target = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+            let scaledW = ci.extent.width * scale
+            let scaledH = ci.extent.height * scale
+            let tx = (viewSize.width - scaledW) / 2.0
+            let ty = (viewSize.height - scaledH) / 2.0
+
+            let transformed = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
                 .transformed(by: CGAffineTransform(translationX: tx, y: ty))
+
+            // Nền đục kích thước viewSize để xoá pixel cũ và tạo letterbox chuẩn
+            let bg = CIImage(color: CIColor(red: 0.05, green: 0.05, blue: 0.07, alpha: 1.0))
+                .cropped(to: CGRect(origin: .zero, size: viewSize))
+            target = transformed.composited(over: bg).cropped(to: CGRect(origin: .zero, size: viewSize))
         }
+
         guard let commandBuffer = commandQueue?.makeCommandBuffer() else { return }
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
-        ciContext.render(target, to: drawable.texture, commandBuffer: commandBuffer, bounds: target.extent, colorSpace: colorSpace)
+        let destBounds = CGRect(origin: .zero, size: viewSize)
+        ciContext.render(target, to: drawable.texture, commandBuffer: commandBuffer, bounds: destBounds, colorSpace: colorSpace)
         commandBuffer.present(drawable)
         commandBuffer.commit()
     }
@@ -376,19 +470,27 @@ public final class MetalPreviewNSView: NSView, MTKViewDelegate {
     /// Ghép live video vào slot đang chụp, trên composite tĩnh của khung (§8.1).
     static func composeInFrame(video: CIImage, spec: InFrameSpec, size: CGSize) -> CIImage {
         let base = CIImage(cgImage: spec.base)
-        let scale = min(size.width / base.extent.width, size.height / base.extent.height)
-        let tx = (size.width - base.extent.width * scale) / 2
-        let ty = (size.height - base.extent.height * scale) / 2
-        var output = base.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        guard base.extent.width > 0, base.extent.height > 0 else {
+            return CIImage(color: CIColor(red: 0.05, green: 0.05, blue: 0.07, alpha: 1.0)).cropped(to: CGRect(origin: .zero, size: size))
+        }
+        var baseNorm = base
+        if baseNorm.extent.origin != .zero {
+            baseNorm = baseNorm.transformed(by: CGAffineTransform(translationX: -baseNorm.extent.origin.x, y: -baseNorm.extent.origin.y))
+        }
+        let scale = min(size.width / baseNorm.extent.width, size.height / baseNorm.extent.height)
+        let tx = (size.width - baseNorm.extent.width * scale) / 2
+        let ty = (size.height - baseNorm.extent.height * scale) / 2
+        var output = baseNorm.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
             .transformed(by: CGAffineTransform(translationX: tx, y: ty))
-        let canvasH = base.extent.height * scale
+        let canvasH = baseNorm.extent.height * scale
         let canvasTop = ty + canvasH // đỉnh canvas trong hệ CI
         for rectN in spec.slotRects {
-            let w = rectN.width * base.extent.width * scale
-            let h = rectN.height * base.extent.height * scale
-            let x = tx + rectN.origin.x * base.extent.width * scale
-            let y = canvasTop - (rectN.origin.y * base.extent.height * scale) - h
+            let w = rectN.width * baseNorm.extent.width * scale
+            let h = rectN.height * baseNorm.extent.height * scale
+            let x = tx + rectN.origin.x * baseNorm.extent.width * scale
+            let y = canvasTop - (rectN.origin.y * baseNorm.extent.height * scale) - h
             let slotRect = CGRect(x: x, y: y, width: w, height: h)
+            guard slotRect.width > 0, slotRect.height > 0, video.extent.width > 0, video.extent.height > 0 else { continue }
             // Fill video vào slot
             let vScale = max(w / video.extent.width, h / video.extent.height)
             let videoT = video.transformed(by: CGAffineTransform(scaleX: vScale, y: vScale))
@@ -405,6 +507,7 @@ public final class MetalPreviewNSView: NSView, MTKViewDelegate {
                 output = piece.composited(over: output)
             }
         }
-        return output.cropped(to: CGRect(origin: .zero, size: size))
+        let bg = CIImage(color: CIColor(red: 0.05, green: 0.05, blue: 0.07, alpha: 1.0)).cropped(to: CGRect(origin: .zero, size: size))
+        return output.composited(over: bg).cropped(to: CGRect(origin: .zero, size: size))
     }
 }

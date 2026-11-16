@@ -44,7 +44,7 @@ public enum ResourceLimits {
     public static let maxMegapixels: Double = 40
     public static let maxAssetBytes: Int = 100 * 1024 * 1024
     public static let maxCaptureIndices: Int = 12
-    public static let maxSlots: Int = 24
+    public static let maxSlots: Int = 12
     public static let maxPackUncompressedBytes: Int = 1_000_000_000
     public static let maxPackEntries: Int = 3000
 }

@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import AppKit
 import CoreGraphics
+import Combine
 
 /// CaptureViewModel (§2.2): điều phối màn hình Chụp — frame picker, camera stage, quick controls.
 /// State machine thật nằm ở CaptureEngine; VM chỉ ánh xạ state → UI và thực hiện tiền điều kiện.
@@ -15,11 +16,15 @@ public final class CaptureViewModel: ObservableObject {
         case busy
     }
 
-    @Published public private(set) var permissionState: CameraUIState = .notDetermined
-    @Published public private(set) var devices: [CameraDescriptor] = []
-    @Published public var selectedDeviceID: String = "auto"
-    @Published public private(set) var cameraName: String = ""
-    @Published public private(set) var fallbackStillNotice = false
+    private var previewObserver: AnyCancellable?
+    public var permissionState: CameraUIState { env.capturePreview.permission }
+    public var devices: [CameraDescriptor] { env.capturePreview.devices }
+    public var selectedDeviceID: String { env.capturePreview.selection }
+    public var cameraName: String { env.capturePreview.name }
+    public var fallbackStillNotice: Bool { env.capturePreview.isFallback }
+    public var isCameraReady: Bool { env.capturePreview.isReady }
+    public var isConnectingCamera: Bool { env.capturePreview.isConnecting }
+    public var cameraPreviewError: String? { env.capturePreview.error }
 
     @Published public private(set) var frames: [FrameCardModel] = []
     @Published public var searchText: String = ""
@@ -27,13 +32,29 @@ public final class CaptureViewModel: ObservableObject {
     @Published public var showFavoritesOnly: Bool = false
     @Published public var selectedFrameID: String? = nil
 
+    public enum PreviewMode: String, CaseIterable, Identifiable {
+        case camera = "camera"
+        case inFrame = "inFrame"
+        public var id: String { rawValue }
+        public var label: String {
+            switch self {
+            case .camera: return "Camera"
+            case .inFrame: return "Trong khung"
+            }
+        }
+    }
+
+    @Published public var previewMode: PreviewMode = .camera
+    public var userOverrodePreviewMode: Bool = false
+
     @Published public var mode: CaptureMode = .automatic
     @Published public var countdown: Int = 3
     @Published public var interval: Int = 2
     @Published public var selectedPresetID: String = "natural"
-    @Published public var skinSmooth: Double = 0.25
+    @Published public var requestedSelectionCount: Int?
     @Published public var liveFramePreview: Bool = false
 
+    private var stagedPreviewSnapshot: FrameSnapshot?
     @Published public private(set) var previewFrameImage: CGImage? = nil
     @Published public private(set) var lastError: AppError?
 
@@ -42,43 +63,33 @@ public final class CaptureViewModel: ObservableObject {
 
     public init(env: AppEnvironment) {
         self.env = env
+        previewObserver = env.capturePreview.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }
         mode = env.settings.captureMode
         countdown = env.settings.countdown
         interval = env.settings.interval
         selectedPresetID = env.settings.defaultPreset
-        skinSmooth = Double(env.settings.defaultSkinSmooth) / 100.0
         liveFramePreview = env.settings.liveFramePreview
+        previewMode = env.settings.liveFramePreview ? .inFrame : .camera
     }
 
-    // MARK: - Camera states (§2.2, §4.3)
-
-    public func refreshCameraState() async {
-        let state = await env.camera.requestAccessIfNeeded()
-        switch state {
-        case .notDetermined: permissionState = .notDetermined
-        case .authorized:
-            permissionState = .authorized
-            devices = await env.camera.discoverDevices()
-            if devices.isEmpty {
-                permissionState = .noDevice
-            } else if await env.camera.currentDevice == nil {
-                await autoSelectCamera()
-            }
-        case .denied: permissionState = .denied
-        case .restricted: permissionState = .denied
-        }
-        if let current = await env.camera.currentDevice {
-            cameraName = current.localizedName
-            fallbackStillNotice = await env.camera.isFallbackVideoStill
-        } else {
-            cameraName = ""
-        }
+    public func setPreviewMode(_ mode: PreviewMode) {
+        previewMode = mode
+        userOverrodePreviewMode = true
     }
 
-    public func enableCamera() async {
-        _ = await env.camera.requestAccessIfNeeded()
-        await refreshCameraState()
-    }
+    // MARK: - Camera states (§2.2, §4.3, BUG-CAM-01)
+
+    public func refreshCameraState() async { await env.capturePreview.refresh() }
+
+    public func enableCamera() async { await env.capturePreview.refresh(requestAccess: true) }
+
+    public func retryCamera() async { await env.capturePreview.refresh() }
+
+    func resumeDeferredCameraRefresh() async { await env.capturePreview.resumeDeferredRefresh() }
+
+    public func selectCamera(_ id: String) async { await env.capturePreview.choose(id) }
 
     public func openSystemSettings() {
         if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera") {
@@ -86,41 +97,17 @@ public final class CaptureViewModel: ObservableObject {
         }
     }
 
-    public func retryCamera() async {
-        await refreshCameraState()
-    }
-
-    public func autoSelectCamera() async {
-        do {
-            _ = try await env.camera.selectAutoDevice()
-            selectedDeviceID = "auto"
-            if let current = await env.camera.currentDevice { cameraName = current.localizedName }
-        } catch {
-            permissionState = .noDevice
-        }
-    }
-
-    public func selectCamera(_ id: String) async {
-        guard engine.canChangeCamera else { return }
-        selectedDeviceID = id
-        if id == "auto" {
-            await autoSelectCamera()
-        } else {
-            do {
-                _ = try await env.camera.selectDevice(id)
-                if let current = await env.camera.currentDevice { cameraName = current.localizedName }
-            } catch {
-                env.showToast((error as? AppError)?.message ?? "Không chọn được camera", kind: .warning)
+    func observeCameraEvents() async {
+        for await event in env.camera.events {
+            if Task.isCancelled { return }
+            switch event {
+            case .interruptionStarted(let reason), .fatalFailure(let reason):
+                env.capturePreview.interrupted(reason)
+            case .interruptionEnded, .deviceConnected, .deviceDisconnected:
+                await refreshCameraState()
+            default:
+                break
             }
-        }
-    }
-
-    public func startPreviewIfPossible() async {
-        guard permissionState == .authorized else { return }
-        do {
-            try await env.camera.startPreview()
-        } catch {
-            Log.camera.error("Preview lỗi: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -135,19 +122,50 @@ public final class CaptureViewModel: ObservableObject {
             if !searchText.isEmpty,
                !frame.name.localizedCaseInsensitiveContains(searchText) { continue }
             let slots = frame.currentRevisionID.flatMap { (try? env.frames.getSlots(revisionID: $0)) ?? [] } ?? []
-            let thumb = env.thumbnails.cachedData(key: "frame-\(frame.currentRevisionID ?? frame.id)")
-            models.append(FrameCardModel(frame: frame, thumbnail: thumb, slotCount: slots.count))
+            let revID = frame.currentRevisionID ?? frame.id
+            let thumb = env.frameThumbnails.cachedThumbnail(frameID: frame.id, revisionID: revID)
+            models.append(FrameCardModel(frame: frame, thumbnail: thumb, slotCount: Set(slots.map(\.captureIndex)).count))
+            if thumb == nil, let rev = frame.currentRevisionID {
+                let fid = frame.id
+                Task { @MainActor [weak self] in
+                    if let data = await self?.env.frameThumbnails.requestThumbnail(frameID: fid, revisionID: rev) {
+                        if let idx = self?.frames.firstIndex(where: { $0.id == fid && $0.frame.currentRevisionID == rev }) {
+                            self?.frames[idx].thumbnail = data
+                        }
+                    }
+                }
+            }
         }
         frames = models
-        if let sel = selectedFrameID, !frames.contains(where: { $0.id == sel }) {
-            selectedFrameID = nil
+        // Quy tắc chọn khung ưu tiên chuẩn §6.1 / INIT-01:
+        // 1. Snapshot của phiên đang mở (nếu hợp lệ)
+        // 2. Lựa chọn hiện hành (nếu còn hợp lệ trong DB)
+        // 3. Preferred frame từ AppEnvironment (nếu hợp lệ)
+        // 4. Khung built-in sẵn sàng có tên "Dải 3 ảnh"
+        // 5. Khung sẵn sàng đầu tiên theo thứ tự repository
+        let allFrames = (try? env.frames.listFrames()) ?? []
+        let readyFrames = allFrames.filter { $0.validationStatus == .ready }
+
+        let targetCandidate: String?
+        if let snap = engine.snapshot,
+           let sourceID = snap.sourceFrameID, readyFrames.contains(where: { $0.id == sourceID }) {
+            targetCandidate = sourceID
+        } else if let preferred = env.preferredFrameID, readyFrames.contains(where: { $0.id == preferred }) {
+            targetCandidate = preferred
+        } else if let sel = selectedFrameID, readyFrames.contains(where: { $0.id == sel }) {
+            targetCandidate = sel
+        } else if let builtIn3 = readyFrames.first(where: { $0.isBuiltIn && $0.name == "Dải 3 ảnh" }) {
+            targetCandidate = builtIn3.id
+        } else if let firstReady = readyFrames.first {
+            targetCandidate = firstReady.id
+        } else {
+            targetCandidate = nil
         }
-        // Nhận lại khung được chọn từ màn Khung ảnh ("Sử dụng") — StateObject màn Chụp bị hủy
-        // mỗi lần đổi route nên selection phải đến qua env (liên kết dữ liệu §2.3, P2-23).
-        if selectedFrameID == nil,
-           let preferred = env.preferredFrameID,
-           frames.contains(where: { $0.id == preferred }) {
-            selectedFrameID = preferred
+
+        let targetRevisionID = readyFrames.first { $0.id == targetCandidate }?.currentRevisionID
+        if selectedFrameID != targetCandidate || stagedPreviewSnapshot?.sourceFrameRevisionID != targetRevisionID
+            || (previewFrameImage == nil && engine.snapshot != nil) {
+            selectedFrameID = targetCandidate
             regeneratePreview()
         }
     }
@@ -160,52 +178,83 @@ public final class CaptureViewModel: ObservableObject {
     }
 
     public func selectFrame(_ id: String?) {
-        // Đổi khung chỉ khi chưa bắt đầu (I-05 §3.2: sau khi chụp ≥1 ảnh khóa đổi khung tại màn Chụp)
-        guard engine.committedShots.isEmpty else {
-            lastError = .frameLockedDuringCapture
-            env.showToast(AppError.frameLockedDuringCapture.message, kind: .warning)
+        guard let id else { return }
+        do {
+            _ = try env.selectFrameForCapture(id)
+        } catch {
+            lastError = (error as? AppError) ?? .ioFailure(error.localizedDescription)
+            env.showToast(lastError?.message ?? "Không thể chọn khung", kind: .warning)
             return
         }
+        guard selectedFrameID != id else { return }
         selectedFrameID = id
+        if !userOverrodePreviewMode {
+            previewMode = (selectedFrameID != nil && env.settings.liveFramePreview) ? .inFrame : .camera
+        }
         regeneratePreview()
     }
 
     public var selectedFrame: Frame? {
         guard let id = selectedFrameID else { return nil }
-        return frames.first { $0.id == id }?.frame
+        return try? env.frames.getFrame(id: id)
+    }
+
+    public var selectedFrameIndices: [Int] {
+        previewSnapshot?.requiredIndices.sorted() ?? []
+    }
+
+    public var previewSnapshot: FrameSnapshot? {
+        if let snapshot = engine.snapshot { return snapshot }
+        return stagedPreviewSnapshot
+    }
+
+    public var selectionCount: Int? {
+        guard let requestedSelectionCount else { return nil }
+        let minimum = selectedFrameIndices.count
+        guard (1...ResourceLimits.maxCaptureIndices).contains(minimum) else { return nil }
+        return max(minimum, min(requestedSelectionCount, ResourceLimits.maxCaptureIndices))
+    }
+
+    public var livePhotoParameters: ResolvedPhotoParams {
+        ResolvedPhotoParams.resolve(defaults: engine.session?.defaults ?? quickDefaults(), override: nil)
+    }
+
+    private func quickDefaults() -> SessionDefaultsSnapshot {
+        var defaults = env.settings.sessionDefaultsSnapshot()
+        defaults.presetID = selectedPresetID
+        if let preset = BuiltinPreset.byID(selectedPresetID) {
+            defaults.presetName = preset.nameVN
+            defaults.presetResolvedParameters = preset.parameters
+        }
+        return defaults
     }
 
     public func regeneratePreview() {
-        guard let frame = selectedFrame, let revID = frame.currentRevisionID,
-              let rev = try? env.frames.getRevision(id: revID) else {
+        if let frame = selectedFrame {
+            stagedPreviewSnapshot = try? env.frames.createSnapshot(frameID: frame.id, persist: false)
+        } else {
+            stagedPreviewSnapshot = nil
+        }
+        guard let snap = previewSnapshot else {
             previewFrameImage = nil
             return
         }
-        let slots = (try? env.frames.getSlots(revisionID: revID)) ?? []
         var assetImages: [String: CGImage] = [:]
-        if let bg = rev.backgroundAssetID, let img = try? env.assets.loadImage(assetID: bg) {
-            assetImages[bg] = img
-        }
-        if let fg = rev.foregroundAssetID, let img = try? env.assets.loadImage(assetID: fg) {
-            assetImages[fg] = img
+        for layer in [snap.background, snap.foreground].compactMap({ $0 }) {
+            if let image = try? env.assets.loadImage(assetID: layer.assetID) {
+                assetImages[layer.assetID] = image
+            }
         }
         let maxDim = 640
-        let aspect = Double(rev.canvasWidth) / Double(max(rev.canvasHeight, 1))
+        let aspect = Double(snap.canvasWidth) / Double(max(snap.canvasHeight, 1))
         var w = maxDim, h = maxDim
         if aspect >= 1 { h = Int(Double(maxDim) / aspect) } else { w = Int(Double(maxDim) * aspect) }
         var sources: [Int: RenderSource] = [:]
-        for idx in Set(slots.map(\.captureIndex)) {
-            if let sample = SampleImageFactory.shared.sample(index: idx, size: CGSize(width: 480, height: 480)) {
-                sources[idx] = RenderSource(image: sample)
+        for index in snap.requiredIndices {
+            if let sample = SampleImageFactory.shared.sample(index: index, size: CGSize(width: 480, height: 480)) {
+                sources[index] = RenderSource(image: sample)
             }
         }
-        let snapSlots = slots.map { SnapshotSlot(from: $0) }
-        let snap = FrameSnapshot(sourceFrameID: frame.id, sourceFrameRevisionID: revID,
-                                 canvasWidth: rev.canvasWidth, canvasHeight: rev.canvasHeight,
-                                 background: rev.backgroundAssetID.map { SnapshotLayer(assetID: $0, placement: rev.backgroundPlacement) },
-                                 foreground: rev.foregroundAssetID.map { SnapshotLayer(assetID: $0, placement: rev.foregroundPlacement) },
-                                 backgroundColorHex: rev.backgroundColorHex,
-                                 slots: snapSlots, snapshotHash: "preview")
         let model = CompositionModel(snapshot: snap, sources: sources, faces: [:],
                                      defaults: env.settings.sessionDefaultsSnapshot(),
                                      overrides: [:], placements: [:],
@@ -217,7 +266,7 @@ public final class CaptureViewModel: ObservableObject {
     // MARK: - Session lifecycle (§3.2)
 
     public var canStartSession: Bool {
-        permissionState == .authorized &&
+        isCameraReady &&
         selectedFrame != nil &&
         selectedFrame?.validationStatus == .ready
     }
@@ -230,8 +279,8 @@ public final class CaptureViewModel: ObservableObject {
         case .persisting: return "Đang lưu"
         case .intermission: return "Tạm dừng"
         case .paused: return "Tiếp tục"
-        case .recoverableError: return "Thử lại lượt"
-        case .reviewing, .completed: return "Xem và chỉnh ảnh"
+        case .recoverableError: return engine.hasPhotoToSave ? "Thử lưu lại" : "Thử chụp lại lượt"
+        case .reviewing, .completed: return engine.session?.pendingSelectionCount == nil ? "Xem và chỉnh ảnh" : "Chọn ảnh vào khung"
         default: return "Bắt đầu chụp"
         }
     }
@@ -241,22 +290,72 @@ public final class CaptureViewModel: ObservableObject {
         case .idle:
             await startNewSession()
         case .ready:
+            if let sid = engine.session?.id,
+               let s = try? env.sessions.getSession(id: sid),
+               s.status == .completed {
+                env.openReview(sessionID: sid, source: .capture)
+                return
+            }
+            guard isCameraReady else { return }
             if engine.committedShots.isEmpty {
                 await startNewSessionIfNeeded()
             } else {
-                try? engine.captureNextManual()
+                // Phân biệt chế độ tự động vs thủ công khi bấm "Chụp tiếp" (CAP-02)
+                do {
+                    if engine.session?.captureMode == .manual {
+                        try engine.captureNextManual()
+                    } else {
+                        try engine.startOrContinue()
+                    }
+                } catch {
+                    lastError = (error as? AppError) ?? .invalidState(error.localizedDescription)
+                    env.showToast(lastError?.message ?? "Không thể tiếp tục chụp", kind: .warning)
+                }
             }
         case .countdown, .intermission:
-            if case .countdown = engine.state { engine.cancelCountdown() } else { engine.pause() }
+            if case .countdown = engine.state {
+                let isRetake = (env.retakeSessionID != nil) || (engine.lastShotContext?.kind == .retake)
+                let retakeID = env.retakeSessionID ?? engine.session?.id
+                let source = env.reviewContext?.sourceRoute ?? .capture
+                engine.cancelCountdown()
+                if isRetake, let retakeID {
+                    env.retakeSessionID = nil
+                    env.openReview(sessionID: retakeID, source: source)
+                }
+            } else {
+                engine.pause()
+            }
         case .paused:
+            guard isCameraReady else { return }
             try? engine.resume()
         case .recoverableError:
+            if engine.hasPhotoToSave {
+                await engine.retryPendingSave()
+                return
+            }
+            guard isCameraReady else { return }
             engine.retryFromError()
-            try? engine.startOrContinue()
+            if case .ready = engine.state {
+                try? engine.startOrContinue()
+            }
         case .reviewing, .completed:
-            if let id = engine.session?.id { env.openReview(sessionID: id) }
+            if let id = engine.session?.id { env.openReview(sessionID: id, source: .capture) }
         default:
             break
+        }
+    }
+
+    /// Xử lý phím Esc hủy đếm ngược hoặc thoát an toàn (AG-2).
+    public func handleExitCommand() {
+        if case .countdown = engine.state {
+            let isRetake = (env.retakeSessionID != nil) || (engine.lastShotContext?.kind == .retake)
+            let retakeID = env.retakeSessionID ?? engine.session?.id
+            let source = env.reviewContext?.sourceRoute ?? .capture
+            engine.cancelCountdown()
+            if isRetake, let retakeID {
+                env.retakeSessionID = nil
+                env.openReview(sessionID: retakeID, source: source)
+            }
         }
     }
 
@@ -264,7 +363,7 @@ public final class CaptureViewModel: ObservableObject {
     public func startNewSession() async {
         guard canStartSession, let frame = selectedFrame else { return }
         // Nếu có phiên paused khác → lựa chọn (§10.3)
-        if let existing = engine.session, engine.state != .idle {
+        if engine.session != nil, engine.state != .idle {
             env.showToast("Đang có phiên hoạt động", kind: .warning)
             return
         }
@@ -273,14 +372,19 @@ public final class CaptureViewModel: ObservableObject {
             guard SafetySaveService.isWritable(env.layout.rootURL) else {
                 throw AppError.diskFull
             }
+            let cameraID = selectedDeviceID == "auto" ? await env.camera.currentDevice?.uniqueID : selectedDeviceID
+            try Task.checkCancellation()
             let snapshot = try env.frames.createSnapshot(frameID: frame.id)
-            let defaults = env.settings.sessionDefaultsSnapshot()
+            var defaults = quickDefaults()
+            defaults.selectionCaptureCount = selectionCount
             _ = try engine.beginSession(snapshot: snapshot, mode: mode,
-                                        cameraID: selectedDeviceID == "auto" ? await env.camera.currentDevice?.uniqueID : selectedDeviceID,
+                                        cameraID: cameraID,
                                         defaults: defaults,
                                         countdown: countdown, interval: interval,
                                         frameName: frame.name)
             try engine.startOrContinue()
+        } catch is CancellationError {
+            return
         } catch let e as AppError {
             lastError = e
             env.showToast(e.message, kind: .warning)
@@ -305,33 +409,247 @@ public final class CaptureViewModel: ObservableObject {
 
     // MARK: - Banner recovery (§3.1.6)
 
-    public func continueBannerSession() async {
-        guard let sessionID = env.bannerSessionID,
-              let detail = try? env.sessions.getDetail(sessionID: sessionID) else { return }
-        if detail.hasEnoughPhotos {
-            env.openReview(sessionID: sessionID)
-        } else {
-            await adoptForCapture(detail: detail)
+    public func continueBannerSession(sessionID: String) async {
+        guard !env.isProcessingBannerAction else { return }
+        guard env.bannerSessionID == sessionID else { return }
+        guard !env.showLeaveCaptureConfirmation else { return }
+        guard env.engine.canAdoptSession else {
+            if env.engine.hasPhotoToSave {
+                env.showToast("Thử lưu lại ảnh của phiên đang mở trước", kind: .warning)
+            } else if env.engine.isCaptureBusy {
+                env.showToast("Chờ hoàn tất lượt chụp trước khi chuyển phiên", kind: .warning)
+            }
+            return
         }
-        env.bannerSessionID = nil
+        env.isProcessingBannerAction = true
+        defer { env.isProcessingBannerAction = false }
+
+        guard let detail = try? env.sessions.getDetail(sessionID: sessionID) else {
+            env.showToast("Không tìm thấy dữ liệu phiên cần phục hồi", kind: .warning)
+            return
+        }
+
+        guard env.route == .capture,
+              env.bannerSessionID == sessionID,
+              !env.showLeaveCaptureConfirmation,
+              env.engine.canAdoptSession else { return }
+
+        if detail.missingIndices.isEmpty {
+            env.openReview(sessionID: sessionID, source: .capture)
+            if env.bannerSessionID == sessionID {
+                env.dismissBanner()
+            }
+        } else {
+            let adopted = await adoptForCapture(detail: detail)
+            if adopted && env.bannerSessionID == sessionID {
+                env.dismissBanner()
+            }
+        }
     }
 
-    public func adoptForCapture(detail: SessionDetail) async {
+    @discardableResult
+    public func adoptForCapture(detail: SessionDetail) async -> Bool {
+        guard env.engine.canAdoptSession else { return false }
         let committed = detail.currentRevisions()
-        env.engine.adoptSession(record: detail.session, snapshot: detail.snapshot, committed: committed)
+        let adopted = env.engine.adoptSession(record: detail.session, snapshot: detail.snapshot, committed: committed)
+        guard adopted else { return false }
         selectedFrameID = detail.snapshot.sourceFrameID
         regeneratePreview()
-        _ = try? await env.camera.startPreview()
+        await refreshCameraState()
+        return true
     }
 
-    public func viewBannerSession() {
-        guard let sessionID = env.bannerSessionID else { return }
-        env.openReview(sessionID: sessionID)
-        env.bannerSessionID = nil
+    public func viewBannerSession(sessionID: String) {
+        guard !env.isProcessingBannerAction else { return }
+        guard env.bannerSessionID == sessionID else { return }
+        guard !env.showLeaveCaptureConfirmation else { return }
+        guard !env.engine.isCaptureBusy, !env.engine.hasPhotoToSave else {
+            env.showToast(env.engine.hasPhotoToSave ? "Thử lưu lại ảnh của phiên đang mở trước" : "Chờ hoàn tất lượt chụp", kind: .warning)
+            return
+        }
+        env.isProcessingBannerAction = true
+        defer { env.isProcessingBannerAction = false }
+
+        guard (try? env.sessions.getDetail(sessionID: sessionID)) != nil else {
+            env.showToast("Không tìm thấy phiên cần xem", kind: .warning)
+            return
+        }
+
+        guard env.route == .capture,
+              env.bannerSessionID == sessionID,
+              !env.showLeaveCaptureConfirmation,
+              !env.engine.isCaptureBusy, !env.engine.hasPhotoToSave else { return }
+
+        env.openReview(sessionID: sessionID, source: .capture)
+        if env.bannerSessionID == sessionID {
+            env.dismissBanner()
+        }
     }
 
     public func dismissBanner() {
         env.bannerSessionID = nil
+    }
+}
+
+/// Dùng chung camera giữa màn Chụp, Cài đặt và Kiosk.
+@MainActor
+final class CapturePreviewCoordinator: ObservableObject {
+    @Published private(set) var permission: CaptureViewModel.CameraUIState = .notDetermined
+    @Published private(set) var devices: [CameraDescriptor] = []
+    @Published private(set) var selection = "auto"
+    @Published private(set) var name = ""
+    @Published private(set) var isFallback = false
+    @Published private(set) var isReady = false
+    @Published private(set) var isConnecting = false
+    @Published private(set) var error: String?
+
+    private unowned let env: AppEnvironment
+    private var pending: Task<Void, Never>?
+    private var generation = 0
+    private var requestingPermission = false
+    private var deferredRefresh = false
+    private var readyPreference: String?
+    private var readyResolution: String?
+
+    init(env: AppEnvironment) { self.env = env }
+
+    private var needsPreview: Bool { env.showFullscreen || env.route == .capture }
+
+    func refresh(requestAccess: Bool = false, forRetake: Bool = false) async {
+        let retakeRoute = forRetake ? env.route : nil
+        guard needsPreview || retakeRoute != nil else { return }
+        if env.engine.isCaptureBusy {
+            deferredRefresh = needsPreview
+            return
+        }
+        deferredRefresh = false
+        if let pending, !pending.isCancelled, !requestAccess || requestingPermission {
+            await pending.value
+            return
+        }
+        await enqueue(requestAccess: requestAccess, explicitSelection: nil, retakeRoute: retakeRoute)
+    }
+
+    func resumeDeferredRefresh() async {
+        guard deferredRefresh else { return }
+        await refresh()
+    }
+
+    func choose(_ id: String) async {
+        guard env.engine.canChangeCamera else { return }
+        env.settings.cameraSelection = id
+        selection = id
+        isReady = false
+        await enqueue(requestAccess: false, explicitSelection: id)
+    }
+
+    func interrupted(_ message: String) {
+        isReady = false
+        error = message
+        pending?.cancel()
+    }
+
+    private func enqueue(requestAccess: Bool, explicitSelection: String?, retakeRoute: ScreenRoute? = nil) async {
+        let previous = pending
+        previous?.cancel()
+        generation += 1
+        let token = generation
+        requestingPermission = requestAccess
+        let task = Task { [weak self] in
+            await previous?.value
+            guard let self, !Task.isCancelled else { return }
+            await self.prepare(requestAccess: requestAccess, explicitSelection: explicitSelection, retakeRoute: retakeRoute)
+        }
+        pending = task
+        await task.value
+        if generation == token {
+            pending = nil
+            requestingPermission = false
+            isConnecting = false
+        }
+    }
+
+    private func prepare(requestAccess: Bool, explicitSelection: String?, retakeRoute: ScreenRoute?) async {
+        var mayStartPreview: Bool { needsPreview || retakeRoute == env.route }
+        guard env.engine.canChangeCamera, mayStartPreview || explicitSelection != nil else { return }
+        let camera = env.camera
+        let status = requestAccess ? await camera.requestAccessIfNeeded() : await camera.cameraPermissionState()
+        guard !Task.isCancelled else { return }
+        switch status {
+        case .notDetermined: permission = .notDetermined
+        case .denied, .restricted: permission = .denied
+        case .authorized: permission = .authorized
+        }
+        guard status == .authorized else {
+            isReady = false
+            name = ""
+            error = nil
+            return
+        }
+
+        let preferred = explicitSelection ?? env.settings.cameraSelection
+        let resolution = env.settings.cameraResolution
+        if isReady, readyPreference == preferred, readyResolution == resolution, await camera.isPreviewRunning { return }
+        guard !Task.isCancelled else { return }
+
+        isReady = false
+        isConnecting = true
+        error = nil
+        do {
+            let discovered = await camera.discoverDevices()
+            try Task.checkCancellation()
+            devices = discovered
+            guard !discovered.isEmpty else { throw AppError.noCamera }
+            guard env.engine.canChangeCamera else { return }
+
+            var actualSelection = preferred
+            if preferred == "auto" {
+                _ = try await camera.selectAutoDevice()
+            } else if discovered.contains(where: { $0.uniqueID == preferred }) {
+                do {
+                    _ = try await camera.selectDevice(preferred)
+                } catch {
+                    try Task.checkCancellation()
+                    guard explicitSelection == nil, env.engine.canChangeCamera else { throw error }
+                    _ = try await camera.selectAutoDevice()
+                    actualSelection = "auto"
+                }
+            } else if explicitSelection != nil {
+                throw AppError.noCamera
+            } else {
+                _ = try await camera.selectAutoDevice()
+                actualSelection = "auto"
+            }
+            try Task.checkCancellation()
+            let device = await camera.currentDevice
+            let fallback = await camera.isFallbackVideoStill
+            try Task.checkCancellation()
+            selection = actualSelection
+            name = device?.localizedName ?? ""
+            isFallback = fallback
+            if actualSelection != preferred {
+                env.showToast("Camera đã lưu không khả dụng, tạm dùng Tự động", kind: .warning)
+            }
+            guard mayStartPreview, env.engine.canChangeCamera else { return }
+            try await camera.setResolution(resolution)
+            try Task.checkCancellation()
+            guard mayStartPreview, env.engine.canChangeCamera else { return }
+            try await camera.startPreview()
+            try Task.checkCancellation()
+            guard mayStartPreview else { return }
+            readyPreference = preferred
+            readyResolution = resolution
+            isReady = true
+            Log.camera.info("Preview đã nhận frame đầu tiên: \(self.name, privacy: .public)")
+        } catch is CancellationError {
+            return
+        } catch {
+            guard !Task.isCancelled else { return }
+            let message = (error as? AppError)?.message ?? error.localizedDescription
+            self.error = message
+            if error as? AppError == .noCamera, devices.isEmpty { permission = .noDevice }
+            Log.camera.error("Preview lỗi: \(message, privacy: .public)")
+        }
     }
 }
 

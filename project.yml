@@ -28,6 +28,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: vn.openphotobooth.app
         PRODUCT_NAME: Open Photobooth
+        PRODUCT_MODULE_NAME: OpenPhotobooth
+        ENABLE_TESTABILITY: "YES"
         MARKETING_VERSION: "1.2.0"
         CURRENT_PROJECT_VERSION: "1"
         INFOPLIST_FILE: Resources/Info.plist
@@ -49,6 +51,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: vn.openphotobooth.tests
         GENERATE_INFOPLIST_FILE: "YES"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Open Photobooth.app/Contents/MacOS/Open Photobooth"
+        BUNDLE_LOADER: "$(TEST_HOST)"
         OTHER_LDFLAGS: "$(inherited) -lsqlite3"
 
 schemes:

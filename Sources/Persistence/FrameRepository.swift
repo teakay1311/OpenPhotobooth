@@ -97,49 +97,83 @@ public final class FrameRepository: @unchecked Sendable {
     }
 
     /// Lưu revision mới (bất biến) + slots + cập nhật current_revision_id trong MỘT transaction (§6.5).
+    /// BUG-FRM-01: Luôn cấp ID mới cho revision và từng slot để caller không bị đụng UNIQUE constraint.
     /// FK vòng frames.current_revision_id → revision cùng frame được đảm bảo tại đây (§16.2.1).
     public func commitRevision(frameID: String, draft: FrameRevision, slots: [FrameSlot]) throws -> FrameRevision {
+        try commitRevision(frameID: frameID, draft: draft, slots: slots, replacing: nil, stagedOwnerID: nil)
+    }
+
+    func commitRevision(frameID: String, draft: FrameRevision, slots: [FrameSlot],
+                        replacing expectedRevisionID: String?, stagedOwnerID: String?) throws -> FrameRevision {
         try db.withTransaction { tx in
-            let nextNo = try tx.query("SELECT COALESCE(MAX(revision_no),0)+1 n FROM frame_revisions WHERE frame_id=?", [.text(frameID)])
-                .first?["n"]?.intValue ?? 1
-            let revision = FrameRevision(id: draft.id, frameID: frameID, revisionNo: nextNo,
-                                         canvasWidth: draft.canvasWidth, canvasHeight: draft.canvasHeight,
-                                         backgroundAssetID: draft.backgroundAssetID,
-                                         foregroundAssetID: draft.foregroundAssetID,
-                                         backgroundColorHex: draft.backgroundColorHex,
-                                         backgroundPlacement: draft.backgroundPlacement,
-                                         foregroundPlacement: draft.foregroundPlacement,
-                                         geometryVersion: draft.geometryVersion)
-            try tx.run("""
-                INSERT INTO frame_revisions(id, frame_id, revision_no, canvas_width, canvas_height,
-                    background_asset_id, foreground_asset_id, background_color, background_placement,
-                    foreground_placement, geometry_version, created_at_ms)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-                """, [.text(revision.id), .text(frameID), .int(Int64(nextNo)),
-                      .int(Int64(revision.canvasWidth)), .int(Int64(revision.canvasHeight)),
-                      revision.backgroundAssetID.map { .text($0) } ?? .null,
-                      revision.foregroundAssetID.map { .text($0) } ?? .null,
-                      .text(revision.backgroundColorHex),
-                      .text(revision.backgroundPlacement.rawValue),
-                      .text(revision.foregroundPlacement.rawValue),
-                      .int(Int64(revision.geometryVersion)), .int(revision.createdAtMs)])
-            // Xóa slot cũ của revision draft (nếu có) rồi insert lại theo z-order chuẩn hóa
-            try tx.run("DELETE FROM frame_slots WHERE frame_revision_id=?", [.text(revision.id)])
-            for (i, slot) in slots.enumerated() {
-                try tx.run("""
-                    INSERT INTO frame_slots(id, frame_revision_id, capture_index, x, y, width, height,
-                        rotation_degrees, z_order, mask_type, corner_radius, default_crop_mode)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-                    """, [.text(slot.id), .text(revision.id), .int(Int64(slot.captureIndex)),
-                          .real(slot.x), .real(slot.y), .real(slot.width), .real(slot.height),
-                          .real(slot.rotationDegrees), .int(Int64(i)),
-                          .text(slot.maskType.rawValue), .real(slot.cornerRadius),
-                          .text(slot.defaultCropMode.rawValue)])
-            }
-            try tx.run("UPDATE frames SET current_revision_id=?, updated_at_ms=? WHERE id=?",
-                       [.text(revision.id), .int(Time.nowMs()), .text(frameID)])
-            return revision
+            try writeRevision(frameID: frameID, draft: draft, slots: slots,
+                              replacing: expectedRevisionID, stagedOwnerID: stagedOwnerID, tx: tx)
         }
+    }
+
+    private func writeRevision(frameID: String, draft: FrameRevision, slots: [FrameSlot],
+                               replacing expectedRevisionID: String? = nil, stagedOwnerID: String?,
+                               tx: SQLiteDatabase.TransactionHandle) throws -> FrameRevision {
+        if let expectedRevisionID {
+            let current = try tx.query("SELECT current_revision_id FROM frames WHERE id=? AND lifecycle='active'",
+                                       [.text(frameID)]).first?["current_revision_id"]?.stringValue
+            guard current == expectedRevisionID else {
+                throw AppError.invalidState("Khung ảnh đã thay đổi khi đang cập nhật")
+            }
+        }
+        let nextNo = try tx.query("SELECT COALESCE(MAX(revision_no),0)+1 n FROM frame_revisions WHERE frame_id=?", [.text(frameID)])
+            .first?["n"]?.intValue ?? 1
+        let newRevID = IDFactory.new()
+        let revision = FrameRevision(id: newRevID, frameID: frameID, revisionNo: nextNo,
+                                     canvasWidth: draft.canvasWidth, canvasHeight: draft.canvasHeight,
+                                     backgroundAssetID: draft.backgroundAssetID,
+                                     foregroundAssetID: draft.foregroundAssetID,
+                                     backgroundColorHex: draft.backgroundColorHex,
+                                     backgroundPlacement: draft.backgroundPlacement,
+                                     foregroundPlacement: draft.foregroundPlacement,
+                                     geometryVersion: draft.geometryVersion)
+        try tx.run("""
+            INSERT INTO frame_revisions(id, frame_id, revision_no, canvas_width, canvas_height,
+                background_asset_id, foreground_asset_id, background_color, background_placement,
+                foreground_placement, geometry_version, created_at_ms)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            """, [.text(revision.id), .text(frameID), .int(Int64(nextNo)),
+                  .int(Int64(revision.canvasWidth)), .int(Int64(revision.canvasHeight)),
+                  revision.backgroundAssetID.map { .text($0) } ?? .null,
+                  revision.foregroundAssetID.map { .text($0) } ?? .null,
+                  .text(revision.backgroundColorHex),
+                  .text(revision.backgroundPlacement.rawValue),
+                  .text(revision.foregroundPlacement.rawValue),
+                  .int(Int64(revision.geometryVersion)), .int(revision.createdAtMs)])
+        // Xóa slot cũ của revision (nếu có) rồi insert lại với ID mới cho từng slot
+        try tx.run("DELETE FROM frame_slots WHERE frame_revision_id=?", [.text(revision.id)])
+        for (i, slot) in slots.enumerated() {
+            let slotID = IDFactory.new()
+            try tx.run("""
+                INSERT INTO frame_slots(id, frame_revision_id, capture_index, x, y, width, height,
+                    rotation_degrees, z_order, mask_type, corner_radius, default_crop_mode)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """, [.text(slotID), .text(revision.id), .int(Int64(slot.captureIndex)),
+                      .real(slot.x), .real(slot.y), .real(slot.width), .real(slot.height),
+                      .real(slot.rotationDegrees), .int(Int64(i)),
+                      .text(slot.maskType.rawValue), .real(slot.cornerRadius),
+                      .text(slot.defaultCropMode.rawValue)])
+        }
+        if let stagedOwnerID {
+            for (assetID, purpose) in [(revision.backgroundAssetID, "background"),
+                                       (revision.foregroundAssetID, "foreground")] {
+                guard let assetID else { continue }
+                try tx.run("""
+                    INSERT OR IGNORE INTO asset_references(asset_id, owner_type, owner_id, purpose)
+                    VALUES(?, 'frame_revision', ?, ?)
+                    """, [.text(assetID), .text(revision.id), .text(purpose)])
+            }
+            try tx.run("DELETE FROM asset_references WHERE owner_type='frame_revision' AND owner_id=?",
+                       [.text(stagedOwnerID)])
+        }
+        try tx.run("UPDATE frames SET current_revision_id=?, updated_at_ms=? WHERE id=?",
+                   [.text(revision.id), .int(Time.nowMs()), .text(frameID)])
+        return revision
     }
 
     /// Cập nhật validation_status (ready chỉ khi revision pass validator — §16.2.5).
@@ -190,6 +224,61 @@ public final class FrameRepository: @unchecked Sendable {
         }
     }
 
+    /// Tạo frame đã cấu hình ô từ ảnh import (§4.1, §4.2): lưu asset, revision, slots và set validation_status='ready'.
+    public func createConfiguredFrame(name: String, imageData: Data, mediaType: String,
+                                      role: AssetKind, categoryID: String?,
+                                      slots: [FrameSlot]) throws -> Frame {
+        guard let image = CGImage.createFrom(data: imageData) else { throw AppError.frameFileCorrupt }
+        let owner = "draft-\(IDFactory.new())"
+        let asset = try assets.store(data: imageData, mediaType: mediaType,
+                                     purpose: role.rawValue, ownerType: "frame_revision", ownerID: owner)
+        defer { try? assets.removeReferences(ownerType: "frame_revision", ownerID: owner) }
+        let draft = FrameRevision(frameID: "", revisionNo: 1, canvasWidth: image.width, canvasHeight: image.height,
+                                  backgroundAssetID: role == .frameBackground ? asset.id : nil,
+                                  foregroundAssetID: role == .frameForeground ? asset.id : nil,
+                                  backgroundPlacement: .aspectFill, foregroundPlacement: .stretchToCanvas)
+        return try createConfiguredFrame(name: name, categoryID: categoryID, draft: draft, slots: slots,
+                                         stagedOwnerID: owner)
+    }
+
+    func createConfiguredFrame(name: String, categoryID: String?, draft: FrameRevision,
+                               slots: [FrameSlot], stagedOwnerID: String, explicitWhite: Bool = false) throws -> Frame {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let issues = FrameValidator.validate(revision: draft, slots: slots)
+        guard !name.isEmpty, issues.isEmpty else {
+            throw AppError.invalidState(issues.first?.message ?? "Tên khung không được để trống")
+        }
+        if let foregroundID = draft.foregroundAssetID {
+            let overlay = try assets.loadImage(assetID: foregroundID)
+            let blocked = try PNGAutoAlignmentService.blockedSlots(overlay: overlay, draft: draft, slots: slots)
+            guard blocked.isEmpty else {
+                throw AppError.invalidState("Lớp phủ che kín ô \(blocked.map(String.init).joined(separator: ", "))")
+            }
+        }
+        let id = try db.withTransaction { tx in
+            let category = try categoryID.flatMap { id in
+                try tx.query("SELECT id FROM categories WHERE id=? AND lifecycle='active'", [.text(id)]).first?["id"]?.stringValue
+            }
+            let frame = Frame(name: name, categoryID: category)
+            try tx.run("""
+                INSERT INTO frames(id, name, category_id, current_revision_id, is_favorite, is_built_in,
+                    validation_status, lifecycle, created_at_ms, updated_at_ms)
+                VALUES(?,?,?,NULL,0,0,'unconfigured','active',?,?)
+                """, [.text(frame.id), .text(name), category.map(SQLiteValue.text) ?? .null,
+                      .int(frame.createdAtMs), .int(frame.updatedAtMs)])
+            let revision = try writeRevision(frameID: frame.id, draft: draft, slots: slots,
+                                             stagedOwnerID: stagedOwnerID, tx: tx)
+            if explicitWhite {
+                try tx.run("INSERT INTO app_state(key,value) VALUES(?,?)",
+                           [.text("explicit_white_\(revision.id)"), .text("1")])
+            }
+            try tx.run("UPDATE frames SET validation_status='ready' WHERE id=?", [.text(frame.id)])
+            return frame.id
+        }
+        guard let frame = try getFrame(id: id) else { throw AppError.notFound("Khung vừa lưu") }
+        return frame
+    }
+
     /// Tạo frame trống (không asset) — khung trắng tối giản hợp lệ với background color.
     public func createEmptyFrame(name: String, categoryID: String?, canvasWidth: Int = 1200, canvasHeight: Int = 1800) throws -> Frame {
         let frame = Frame(name: name, categoryID: categoryID)
@@ -207,7 +296,14 @@ public final class FrameRepository: @unchecked Sendable {
     // MARK: - Metadata actions
 
     public func renameFrame(id: String, to name: String) throws {
-        try db.run("UPDATE frames SET name=?, updated_at_ms=? WHERE id=?", [.text(name), .int(Time.nowMs()), .text(id)])
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw AppError.invalidState("Tên khung không được để trống")
+        }
+        guard let frame = try getFrame(id: id), frame.lifecycle == .active else {
+            throw AppError.notFound("Khung \(id) không tồn tại hoặc không ở trạng thái active")
+        }
+        try db.run("UPDATE frames SET name=?, updated_at_ms=? WHERE id=?", [.text(trimmed), .int(Time.nowMs()), .text(id)])
     }
 
     public func setFavorite(id: String, _ favorite: Bool) throws {
@@ -215,12 +311,42 @@ public final class FrameRepository: @unchecked Sendable {
                    [.int(favorite ? 1 : 0), .int(Time.nowMs()), .text(id)])
     }
 
+    /// Gán yêu thích theo lô có giao dịch nguyên tử (§5, FRM-03).
+    /// Chỉ cập nhật các khung có cờ false sang true; giữ nguyên updated_at_ms của hàng đã có sao.
+    @discardableResult
+    public func setFavorites(frameIDs: [String], isFavorite: Bool = true) throws -> Int {
+        guard !frameIDs.isEmpty else { return 0 }
+        var updatedCount = 0
+        try db.withTransaction { tx in
+            let sortedIDs = frameIDs.sorted()
+            for id in sortedIDs {
+                let rows = try tx.query("SELECT id, is_favorite, lifecycle FROM frames WHERE id=?", [.text(id)])
+                guard let row = rows.first, row["lifecycle"]?.stringValue == "active" else {
+                    throw AppError.notFound("Khung \(id) không tồn tại hoặc không ở trạng thái active")
+                }
+            }
+            let now = Time.nowMs()
+            let targetVal: Int64 = isFavorite ? 1 : 0
+            for id in sortedIDs {
+                let rows = try tx.query("SELECT is_favorite FROM frames WHERE id=?", [.text(id)])
+                guard let row = rows.first else { continue }
+                let currentFav = (row["is_favorite"]?.int64Value ?? 0) == 1
+                if currentFav != isFavorite {
+                    try tx.run("UPDATE frames SET is_favorite=?, updated_at_ms=? WHERE id=?",
+                               [.int(targetVal), .int(now), .text(id)])
+                    updatedCount += 1
+                }
+            }
+        }
+        return updatedCount
+    }
+
     public func setCategory(frameID: String, categoryID: String?) throws {
         try db.run("UPDATE frames SET category_id=?, updated_at_ms=? WHERE id=?",
                    [categoryID.map { .text($0) } ?? .null, .int(Time.nowMs()), .text(frameID)])
     }
 
-    /// Nhân bản frame: revision/slots mới với ID mới, asset dùng chung bằng reference (§2.3).
+    /// Nhân bản frame: revision/slots mới với ID mới, asset dùng chung bằng reference (§2.3, D2-A07).
     public func duplicateFrame(id: String) throws -> Frame {
         guard let frame = try getFrame(id: id), let revID = frame.currentRevisionID,
               let rev = try getRevision(id: revID) else {
@@ -232,12 +358,10 @@ public final class FrameRepository: @unchecked Sendable {
         draft.id = newRevID
         var newSlots = slots
         for i in newSlots.indices { newSlots[i].id = IDFactory.new() }
+        let newName = Self.uniqueName(base: frame.name + " (bản sao)", existing: try listFrames().map(\.name))
+        let copy = Frame(name: newName, categoryID: frame.categoryID)
+        var committedRev: FrameRevision? = nil
         do {
-            // Trỏ asset references sang revision mới (không copy bytes)
-            if let bg = rev.backgroundAssetID { try assets.addReference(assetID: bg, ownerType: "frame_revision", ownerID: newRevID, purpose: "background") }
-            if let fg = rev.foregroundAssetID { try assets.addReference(assetID: fg, ownerType: "frame_revision", ownerID: newRevID, purpose: "foreground") }
-            let newName = Self.uniqueName(base: frame.name + " (bản sao)", existing: try listFrames().map(\.name))
-            let copy = Frame(name: newName, categoryID: frame.categoryID)
             try db.run("""
                 INSERT INTO frames(id, name, category_id, current_revision_id, is_favorite, is_built_in,
                     validation_status, lifecycle, created_at_ms, updated_at_ms)
@@ -245,11 +369,27 @@ public final class FrameRepository: @unchecked Sendable {
                 """, [.text(copy.id), .text(newName), frame.categoryID.map { .text($0) } ?? .null,
                       .null, .int(0), .int(frame.isBuiltIn ? 1 : 0),
                       .int(copy.createdAtMs), .int(copy.updatedAtMs)])
-            _ = try commitRevision(frameID: copy.id, draft: draft, slots: newSlots)
-            return copy
+            let committed = try commitRevision(frameID: copy.id, draft: draft, slots: newSlots)
+            committedRev = committed
+            // D2-A07: Trỏ asset references sang ID revision THẬT đã được cấp trong giao dịch commitRevision
+            if let bg = rev.backgroundAssetID {
+                try assets.addReference(assetID: bg, ownerType: "frame_revision", ownerID: committed.id, purpose: "background")
+            }
+            if let fg = rev.foregroundAssetID {
+                try assets.addReference(assetID: fg, ownerType: "frame_revision", ownerID: committed.id, purpose: "foreground")
+            }
+            // D2-A09: Sao chép explicit white metadata sang revision mới
+            if let explicit = try? db.query("SELECT value FROM app_state WHERE key=?", [.text("explicit_white_\(revID)")]).first?["value"]?.stringValue {
+                try? db.run("INSERT OR REPLACE INTO app_state(key, value) VALUES(?, ?)", [.text("explicit_white_\(committed.id)"), .text(explicit)])
+            }
+            return (try? getFrame(id: copy.id)) ?? copy
         } catch {
-            // Dọn refs mồ côi cho revision chưa được tạo (chống rò rỉ storage qua GC)
-            try? assets.removeReferences(ownerType: "frame_revision", ownerID: newRevID)
+            if let committed = committedRev {
+                try? assets.removeReferences(ownerType: "frame_revision", ownerID: committed.id)
+            }
+            try? db.run("DELETE FROM frame_slots WHERE frame_revision_id IN (SELECT id FROM frame_revisions WHERE frame_id=?)", [.text(copy.id)])
+            try? db.run("DELETE FROM frame_revisions WHERE frame_id=?", [.text(copy.id)])
+            try? db.run("DELETE FROM frames WHERE id=?", [.text(copy.id)])
             throw error
         }
     }
@@ -265,11 +405,13 @@ public final class FrameRepository: @unchecked Sendable {
     // MARK: - Snapshot (§6.5)
 
     /// Tạo FrameSnapshot bất biến từ frame revision + lưu DB + asset references owner frame_snapshot.
-    public func createSnapshot(frameID: String) throws -> FrameSnapshot {
+    public func createSnapshot(frameID: String, persist: Bool = true) throws -> FrameSnapshot {
         guard let frame = try getFrame(id: frameID), let revID = frame.currentRevisionID,
               let rev = try getRevision(id: revID) else {
             throw AppError.frameUnconfigured
         }
+        let explicit = try? db.query("SELECT value FROM app_state WHERE key=?", [.text("explicit_white_\(revID)")]).first?["value"]?.stringValue
+        let isExplicitWhite = (explicit == "1" || explicit == "true")
         let slots = try getSlots(revisionID: revID)
         let slotsN = slots.map { SnapshotSlot(from: $0) }
         var snapshot = FrameSnapshot(sourceFrameID: frameID, sourceFrameRevisionID: revID,
@@ -278,8 +420,10 @@ public final class FrameRepository: @unchecked Sendable {
                                      foreground: rev.foregroundAssetID.map { SnapshotLayer(assetID: $0, placement: rev.foregroundPlacement) },
                                      backgroundColorHex: rev.backgroundColorHex,
                                      slots: slotsN,
-                                     snapshotHash: "")
+                                     snapshotHash: "",
+                                     explicitWhite: isExplicitWhite)
         snapshot.snapshotHash = snapshot.hashForContent()
+        guard persist else { return snapshot }
         let data = try Self.jsonEncoder.encode(snapshot)
         do {
             let sql = """
@@ -356,6 +500,12 @@ public final class FrameRepository: @unchecked Sendable {
     public func renameCategory(id: String, to name: String) throws {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard (1...80).contains(trimmed.count) else { throw AppError.invalidState("Tên danh mục phải 1–80 ký tự") }
+        // D2-A06: Bỏ qua chính ID đang sửa khi kiểm trùng tên (COLLATE NOCASE)
+        let dup = try db.query("SELECT id FROM categories WHERE name = ? COLLATE NOCASE AND id <> ? AND lifecycle='active'",
+                               [.text(trimmed), .text(id)])
+        if !dup.isEmpty {
+            throw AppError.duplicateName("Tên danh mục '\(trimmed)' đã tồn tại")
+        }
         try db.run("UPDATE categories SET name=?, updated_at_ms=? WHERE id=?", [.text(trimmed), .int(Time.nowMs()), .text(id)])
     }
 

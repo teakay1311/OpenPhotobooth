@@ -25,7 +25,7 @@ Open Photobooth là ứng dụng Photobooth bản địa (native) dành riêng c
 3. **Bắt đầu chụp**: Bấm nút **Chụp** hoặc phím `Space`. Có thể hủy bất kỳ lúc nào bằng phím `Esc`.
 
 ### 2.2. Chế độ Toàn màn hình (Fullscreen Kiosk)
-- Bật từ góc trên màn hình hoặc phím tắt `Ctrl + Cmd + F`.
+- Bật từ nút **Toàn màn hình** ở góc trên thanh công cụ màn Chụp ảnh.
 - Chế độ kiosk tối ưu cho sự kiện / tiệc cưới, tự động quay về màn hình chờ sau khi hoàn tất.
 
 ### 2.3. Màn hình Xem lại & Chỉnh sửa (Review)
@@ -34,7 +34,7 @@ Open Photobooth là ứng dụng Photobooth bản địa (native) dành riêng c
   - **Fill (Lấp đầy)**: Cắt tràn ô ảnh mà không méo tỉ lệ.
   - **Fit (Vừa khung)**: Hiển thị trọn vẹn toàn bộ ảnh trong ô.
   - **Auto Face (Nhận diện mặt)**: Tự động căn giữa khuôn mặt vào tâm ô ảnh.
-- **Chụp lại (Retake)**: Có thể chọn chụp lại 1 ô bất kỳ mà không ảnh hưởng các ô khác, hoặc chụp lại toàn bộ phiên.
+- **Chụp lại (Retake)**: Chọn một ô ảnh bất kỳ trên dải ảnh và bấm "Chụp lại" để chụp lại đúng ô đó (áp dụng cho cả phiên vừa chụp lẫn bất kỳ phiên nào mở lại từ Thư viện); các ô ảnh khác được giữ nguyên. Sau khi chụp lại thành công, ứng dụng tự động quay về đúng phiên trong màn hình Xem và chỉnh ảnh.
 - **Đổi khung trong Review**: Có thể đổi sang khung khác khi đang xem lại; các ảnh đã chụp sẽ được tự động giữ nguyên và gán vào các ô tương ứng.
 
 ### 2.4. Xuất ảnh (Export) và Chia sẻ (Share)

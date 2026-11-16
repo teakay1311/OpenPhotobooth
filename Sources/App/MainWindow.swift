@@ -29,20 +29,73 @@ public struct MainWindow: View {
                 }
                 .transition(.opacity)
             }
-            // Overlay toast + banner không chặn hit-test
-            VStack {
-                if env.recoveryReport?.hasProblems == true {
-                    RecoveryBanner(env: env)
-                }
-                Spacer()
-                ToastOverlay(env: env)
+        }
+        .overlay(alignment: .top) {
+            if env.recoveryReport?.hasProblems == true {
+                RecoveryBanner(env: env)
             }
-            .allowsHitTesting(true)
+        }
+        .overlay(alignment: .bottom) {
+            if env.toast != nil {
+                ToastOverlay(env: env)
+                    .allowsHitTesting(false)
+            }
         }
         .animation(.easeInOut(duration: 0.18), value: env.route)
+        .frame(minWidth: 1024, minHeight: 680)
         // Áp dụng giao diện sau khi NSApp sẵn sàng (không chạm NSApp trong App.init — P3-21b)
         .onAppear {
             env.settings.applyAppearance(env.settings.appearance)
+        }
+        .confirmationDialog(
+            "Đang trong quá trình chụp ảnh",
+            isPresented: $env.showLeaveCaptureConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Ở lại", role: .cancel) {
+                env.stayInCapture()
+            }
+            Button("Tạm dừng và rời màn hình", role: .destructive) {
+                env.confirmLeaveCapture()
+            }
+        } message: {
+            Text("Bạn có chắc chắn muốn rời màn hình Chụp? Phiên chụp hiện tại sẽ được tạm dừng an toàn.")
+        }
+        .confirmationDialog(
+            "Có thay đổi chưa lưu",
+            isPresented: $env.showFrameEditorLeaveConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Lưu") {
+                if env.frameEditorSaveHandler?() == true {
+                    env.confirmLeaveFrameEditor()
+                }
+            }
+            Button("Bỏ thay đổi", role: .destructive) {
+                env.confirmLeaveFrameEditor()
+            }
+            Button("Hủy", role: .cancel) {
+                env.cancelLeaveFrameEditor()
+            }
+        } message: {
+            Text("Lưu / Bỏ thay đổi / Hủy")
+        }
+        .confirmationDialog(
+            "Chưa thể lưu hoàn tất các chỉnh sửa",
+            isPresented: $env.showReviewLeaveConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Thử lưu lại") {
+                env.retryLeaveReviewSave()
+            }
+            Button("Bỏ phần chưa lưu", role: .destructive) {
+                env.confirmLeaveReviewDiscard()
+            }
+            Button("Ở lại", role: .cancel) {
+                env.cancelLeaveReview()
+            }
+        } message: {
+            Text("Không thể lưu các chỉnh sửa vào cơ sở dữ liệu. Bạn có muốn thử lưu lại, bỏ qua các thay đổi chưa lưu hay ở lại màn hình Xem lại?")
         }
     }
 
@@ -51,14 +104,14 @@ public struct MainWindow: View {
     @ViewBuilder private var sidebar: some View {
         List(selection: Binding<ScreenRoute?>(
             get: { env.route },
-            set: { newValue in if let route = newValue { env.route = route } }
+            set: { newValue in if let route = newValue { env.requestNavigation(to: route) } }
         )) {
             Section("Open Photobooth") {
-                Label("Chụp ảnh", systemImage: "camera.viewfinder").tag(ScreenRoute.capture as ScreenRoute?)
-                Label("Khung ảnh", systemImage: "photo.on.rectangle.angled").tag(ScreenRoute.frames as ScreenRoute?)
-                Label("Thư viện", systemImage: "photo.stack").tag(ScreenRoute.library as ScreenRoute?)
-                Label("Thùng rác", systemImage: "trash").tag(ScreenRoute.trash as ScreenRoute?)
-                Label("Cài đặt", systemImage: "gearshape").tag(ScreenRoute.settings as ScreenRoute?)
+                Label("Chụp ảnh", systemImage: "camera.viewfinder").tag(ScreenRoute.capture)
+                Label("Khung ảnh", systemImage: "photo.on.rectangle.angled").tag(ScreenRoute.frames)
+                Label("Thư viện", systemImage: "photo.stack").tag(ScreenRoute.library)
+                Label("Thùng rác", systemImage: "trash").tag(ScreenRoute.trash)
+                Label("Cài đặt", systemImage: "gearshape").tag(ScreenRoute.settings)
             }
         }
         .listStyle(.sidebar)

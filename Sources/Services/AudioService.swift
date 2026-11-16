@@ -6,9 +6,11 @@ import AppKit
 @MainActor
 public final class AudioService: ObservableObject {
     private let settings: SettingsStore
+    private let playback: ((String, Float) -> Void)?
 
-    public init(settings: SettingsStore) {
+    public init(settings: SettingsStore, playback: ((String, Float) -> Void)? = nil) {
         self.settings = settings
+        self.playback = playback
     }
 
     private var sounds: [String: NSSound] = [:]
@@ -23,6 +25,11 @@ public final class AudioService: ObservableObject {
 
     private func play(_ name: String) {
         guard settings.soundEnabled else { return }
+        if let playback {
+            playback(name, Float(settings.soundVolume) / 100.0)
+            return
+        }
+        #if !PHOTOBOOTH_QA_HOST
         if let s = sounds[name] {
             s.volume = Float(settings.soundVolume) / 100.0
             s.play()
@@ -32,6 +39,7 @@ public final class AudioService: ObservableObject {
         sound.volume = Float(settings.soundVolume) / 100.0
         sounds[name] = sound
         sound.play()
+        #endif
     }
 
     public func handle(_ event: Event) {

@@ -32,7 +32,6 @@ public final class SettingsStore: ObservableObject {
         "soundFinish": true,
         "defaultPreset": "natural",
         "presetIntensity": 100,
-        "defaultSkinSmooth": 25,
         "smartFace": true,
         "defaultCrop": CropMode.autoFace.rawValue,
         "previewQuality": "auto",
@@ -97,7 +96,11 @@ public final class SettingsStore: ObservableObject {
     }
     public var outputMirror: Bool {
         get { defaults.bool(forKey: "outputMirror") }
-        set { defaults.set(newValue, forKey: "outputMirror") }
+        set {
+            guard newValue != outputMirror else { return }
+            objectWillChange.send()
+            defaults.set(newValue, forKey: "outputMirror")
+        }
     }
     public var rotation: Int {
         get { defaults.integer(forKey: "rotation") }
@@ -155,10 +158,6 @@ public final class SettingsStore: ObservableObject {
     public var presetIntensity: Int {   // 0..100 UI; nội bộ /100
         get { defaults.integer(forKey: "presetIntensity") }
         set { defaults.set(newValue, forKey: "presetIntensity") }
-    }
-    public var defaultSkinSmooth: Int { // 0..100
-        get { defaults.integer(forKey: "defaultSkinSmooth") }
-        set { defaults.set(newValue, forKey: "defaultSkinSmooth") }
     }
     public var smartFace: Bool {
         get { defaults.bool(forKey: "smartFace") }
@@ -236,8 +235,10 @@ public final class SettingsStore: ObservableObject {
             presetResolvedParameters: params,
             presetIntensity: Double(presetIntensity) / 100.0,
             color: .neutral,
-            skinSmooth: Double(defaultSkinSmooth) / 100.0,
-            outputMirror: outputMirror)
+            skinSmooth: 0,
+            outputMirror: outputMirror,
+            rotation: rotation,
+            smartFace: smartFace)
     }
 
     /// Đặt lại toàn bộ cài đặt (không xóa dữ liệu §15.2 Dữ liệu).

@@ -10,6 +10,7 @@ public struct FramesView: View {
     @State private var renameText = ""
     @State private var newCategoryName = ""
     @State private var showPackExport = false
+    @State private var exportTargetFrameIDs: [String] = []
 
     public init(env: AppEnvironment) {
         self.env = env
@@ -17,24 +18,32 @@ public struct FramesView: View {
     }
 
     public var body: some View {
-        NavigationSplitView {
-            categorySidebar
-        } detail: {
+        HStack(spacing: 0) {
+            categorySidebar.frame(width: 200)
+            Divider()
             VStack(spacing: 0) {
                 toolbar
-                HStack(spacing: 0) {
-                    gridArea
-                    .frame(maxWidth: .infinity)
-                    if vm.selection.count == 1 {
-                        Divider()
-                        inspectorView
-                            .frame(width: 300)
-                    } else if !vm.selection.isEmpty {
-                        Divider()
-                        batchBar.frame(width: 300)
+                GeometryReader { geometry in
+                    if vm.selection.isEmpty {
+                        gridArea.frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    } else if geometry.size.width < 700 {
+                        VStack(spacing: 0) {
+                            gridArea.frame(maxWidth: .infinity, maxHeight: .infinity)
+                            Divider()
+                            selectionPanel
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .frame(maxHeight: min(300, geometry.size.height * 0.42))
+                        }
+                    } else {
+                        HStack(spacing: 0) {
+                            gridArea.frame(maxWidth: .infinity)
+                            Divider()
+                            selectionPanel.frame(width: 300)
+                        }
                     }
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .onAppear { vm.reload() }
         .onChange(of: env.route) { r in
@@ -47,20 +56,39 @@ public struct FramesView: View {
             }
         }
         .sheet(isPresented: $showPackExport) { packExportSheet }
+        .sheet(isPresented: $vm.showImportSheet) {
+            FrameImportSheet(env: env, urls: vm.importQueueURLs, categoryID: vm.selectedCategoryID) {
+                vm.reload()
+            }
+        }
+    }
+
+    @ViewBuilder private var selectionPanel: some View {
+        if vm.selection.count == 1 {
+            inspectorView
+        } else {
+            ScrollView { batchBar }
+        }
     }
 
     // MARK: Sidebar danh mục
 
     private var categorySidebar: some View {
-        List(selection: Binding(get: { vm.selectedCategoryID },
-                                set: { vm.selectedCategoryID = $0; vm.reload() })) {
+        List(selection: Binding<String?>(
+            get: { vm.selectedCategoryID ?? "__all__" },
+            set: { value in
+                guard let value else { return }
+                vm.selectedCategoryID = value == "__all__" ? nil : value
+                vm.reload()
+            }
+        )) {
             Section("Danh mục") {
                 Label("Tất cả", systemImage: "square.grid.2x2")
-                    .tag(String?.none)
+                    .tag("__all__")
                 Label("Yêu thích", systemImage: "star.fill")
-                    .tag(String?.some("__favorites__"))
+                    .tag("__favorites__")
                 Label("Chưa phân loại", systemImage: "tray")
-                    .tag(String?.some("unclassified"))
+                    .tag("unclassified")
                 ForEach(vm.categories) { cat in
                     HStack {
                         Text(cat.name)
@@ -76,7 +104,7 @@ public struct FramesView: View {
                         .menuStyle(.borderlessButton)
                         .frame(width: 24)
                     }
-                    .tag(String?.some(cat.id))
+                    .tag(cat.id)
                 }
                 Button {
                     promptNewCategory()
@@ -98,8 +126,22 @@ public struct FramesView: View {
         input.stringValue = cat.name
         alert.accessoryView = input
         if alert.runModal() == .alertFirstButtonReturn {
-            try? env.frames.renameCategory(id: cat.id, to: input.stringValue)
-            vm.reload()
+            let trimmed = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                env.showToast("Tên danh mục không được để trống", kind: .warning)
+                return
+            }
+            if trimmed.count > 80 {
+                env.showToast("Tên danh mục không được vượt quá 80 ký tự", kind: .warning)
+                return
+            }
+            do {
+                try env.frames.renameCategory(id: cat.id, to: trimmed)
+                vm.reload()
+                env.showToast("Đã đổi tên danh mục")
+            } catch {
+                env.showToast("\((error as? AppError)?.message ?? error.localizedDescription)", kind: .warning)
+            }
         }
     }
 
@@ -118,6 +160,23 @@ public struct FramesView: View {
     // MARK: Toolbar
 
     private var toolbar: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) {
+                toolbarActions
+                toolbarFilters
+                Spacer(minLength: 0)
+            }
+            VStack(alignment: .leading, spacing: 8) {
+                toolbarActions
+                toolbarFilters
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+    }
+
+    private var toolbarActions: some View {
         HStack(spacing: 10) {
             Button {
                 vm.importViaOpenPanel()
@@ -130,19 +189,23 @@ public struct FramesView: View {
             } label: {
                 Label("Nhập Frame Pack", systemImage: "shippingbox")
             }
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private var toolbarFilters: some View {
+        HStack(spacing: 10) {
             TextField("Tìm kiếm", text: $vm.searchText)
                 .textFieldStyle(.roundedBorder)
-                .frame(width: 200)
+                .frame(minWidth: 100, idealWidth: 180, maxWidth: 240)
                 .onChange(of: vm.searchText) { _ in vm.reload() }
             Picker("Sắp xếp", selection: $vm.sortNewest) {
                 Text("Mới nhất").tag(true)
                 Text("Cũ nhất").tag(false)
             }
-            .frame(width: 130)
+            .fixedSize(horizontal: true, vertical: false)
             .onChange(of: vm.sortNewest) { _ in vm.reload() }
-            Spacer()
         }
-        .padding(12)
     }
 
     private func importPack() {
@@ -190,7 +253,10 @@ public struct FramesView: View {
                                             Button(c.name) { vm.moveToCategory([card.id], categoryID: c.id) }
                                         }
                                     }
-                                    Button("Xuất gói") { showPackExport = true }
+                                    Button("Xuất gói") {
+                                        exportTargetFrameIDs = [card.id]
+                                        showPackExport = true
+                                    }
                                     Divider()
                                     Button("Chuyển vào Thùng rác", role: .destructive) { vm.trash(card.id) }
                                 }
@@ -211,15 +277,16 @@ public struct FramesView: View {
     }
 
     private func useFrame(_ card: FrameCardModel) {
-        guard card.frame.validationStatus == .ready else {
+        do {
+            let frame = try env.selectFrameForCapture(card.id)
+            env.requestNavigation(to: .capture)
+            env.showToast("Đã chọn khung \(frame.name) — quay lại màn Chụp")
+        } catch AppError.frameUnconfigured {
             env.showToast("Khung chưa thiết lập (E-FRM-02) — mở Frame Editor", kind: .warning)
             env.openFrameEditor(frameID: card.id)
-            return
+        } catch {
+            env.showToast((error as? AppError)?.message ?? error.localizedDescription, kind: .warning)
         }
-        // Ghi vào env để màn Chụp nhận lại sau khi route đổi (StateObject màn Chụp bị hủy khi chuyển route)
-        env.preferredFrameID = card.id
-        env.route = .capture
-        env.showToast("Đã chọn khung \(card.frame.name) — quay lại màn Chụp")
     }
 
     private func promptRename(_ card: FrameCardModel) {
@@ -231,7 +298,12 @@ public struct FramesView: View {
         input.stringValue = card.frame.name
         alert.accessoryView = input
         if alert.runModal() == .alertFirstButtonReturn {
-            vm.rename(card.id, to: input.stringValue)
+            let trimmed = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                env.showToast("Tên khung không được để trống", kind: .warning)
+                return
+            }
+            vm.rename(card.id, to: trimmed)
         }
     }
 
@@ -261,7 +333,10 @@ public struct FramesView: View {
                         Button("Chỉnh bố cục") { env.openFrameEditor(frameID: card.id) }
                         Button("Đổi tên") { promptRename(card) }
                         Button("Nhân bản") { vm.duplicate(card.id) }
-                        Button("Xuất gói") { showPackExport = true }
+                        Button("Xuất gói") {
+                            exportTargetFrameIDs = [card.id]
+                            showPackExport = true
+                        }
                         Button("Chuyển vào Thùng rác", role: .destructive) { vm.trash(card.id) }
                             .help("Xóa mềm — giữ 30 ngày trong Thùng rác nội bộ")
                     }
@@ -275,7 +350,7 @@ public struct FramesView: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Đã chọn \(vm.selection.count) khung").font(.headline)
             Button("Yêu thích tất cả") {
-                for id in vm.selection { vm.toggleFavorite(id) }
+                vm.favoriteSelection()
             }
             Menu("Di chuyển vào danh mục") {
                 Button("Chưa phân loại") { vm.moveToCategory(Array(vm.selection), categoryID: nil) }
@@ -317,7 +392,7 @@ public struct FramesView: View {
     }
 
     private var packExportSheet: some View {
-        PackExportSheet(env: env, framesVM: vm)
+        PackExportSheet(env: env, framesVM: vm, initialSelectedIDs: exportTargetFrameIDs)
     }
 }
 
@@ -337,7 +412,9 @@ struct FrameLibraryCard: View {
                 .overlay(RoundedRectangle(cornerRadius: 8)
                     .strokeBorder(selected ? Color.accentColor : Color.secondary.opacity(0.25), lineWidth: selected ? 3 : 1))
             HStack {
-                Text(card.frame.name).lineLimit(1).font(.caption.weight(.medium))
+                Text(card.frame.name).lineLimit(2).font(.caption.weight(.medium))
+                    .help(card.frame.name)
+                    .layoutPriority(1)
                 Spacer()
                 if card.frame.validationStatus != .ready {
                     Text("Chưa thiết lập").font(.caption2).foregroundStyle(.orange)
@@ -358,20 +435,42 @@ struct FrameLibraryCard: View {
     }
 }
 
-/// Xuất Frame Pack (§13.3).
+/// Xuất Frame Pack (§13.3, §4, FRM-02).
 struct PackExportSheet: View {
     @ObservedObject var env: AppEnvironment
     @ObservedObject var framesVM: FramesViewModel
+    let initialSelectedIDs: [String]
     @Environment(\.dismiss) private var dismiss
     @State private var packName = "Khung của tôi"
-    @State private var selected: Set<String> = []
+    @State private var selected: Set<String>
+    @State private var isExporting = false
+    @State private var errorMessage: String? = nil
+
+    init(env: AppEnvironment, framesVM: FramesViewModel, initialSelectedIDs: [String] = []) {
+        self.env = env
+        self.framesVM = framesVM
+        self.initialSelectedIDs = initialSelectedIDs
+        let validIDs = initialSelectedIDs.filter { id in framesVM.frames.contains { $0.id == id } }
+        if initialSelectedIDs.isEmpty {
+            _selected = State(initialValue: Set(framesVM.frames.map(\.id)))
+        } else {
+            _selected = State(initialValue: Set(validIDs))
+        }
+    }
 
     var body: some View {
         VStack(spacing: 12) {
             Text("Xuất Frame Pack").font(.headline)
+            if let err = errorMessage {
+                Text(err)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .padding(.horizontal)
+            }
             HStack {
                 Text("Tên gói:")
                 TextField("Tên", text: $packName).textFieldStyle(.roundedBorder)
+                    .disabled(isExporting)
             }
             .padding(.horizontal)
             List(framesVM.frames, selection: $selected) { card in
@@ -383,30 +482,55 @@ struct PackExportSheet: View {
                 }
             }
             .frame(minHeight: 240)
+            .disabled(isExporting)
             HStack {
                 Button("Hủy") { dismiss() }
+                    .disabled(isExporting)
                 Spacer()
+                if isExporting {
+                    ProgressView().controlSize(.small)
+                }
                 Button("Xuất…") { exportPack() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(selected.isEmpty || packName.isEmpty)
+                    .disabled(selected.isEmpty || packName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isExporting)
             }
             .padding()
         }
         .frame(width: 460, height: 420)
-        .onAppear { selected = Set(framesVM.frames.map(\.id)) }
+        .onAppear {
+            if !initialSelectedIDs.isEmpty {
+                let validIDs = initialSelectedIDs.filter { id in framesVM.frames.contains { $0.id == id } }
+                if validIDs.isEmpty {
+                    errorMessage = "Khung được chọn không còn tồn tại hoặc không hợp lệ"
+                }
+            }
+        }
     }
 
     private func exportPack() {
+        let trimmedName = packName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty, !selected.isEmpty, !isExporting else { return }
+        isExporting = true
+        errorMessage = nil
+        let targetIDs = Array(selected)
+
         let panel = NSSavePanel()
         panel.allowedContentTypes = [UTType(filenameExtension: "photoframepack") ?? .data]
-        panel.nameFieldStringValue = "\(packName).photoframepack"
+        panel.nameFieldStringValue = "\(trimmedName).photoframepack"
         panel.begin { response in
-            guard response == .OK, let url = panel.url else { return }
+            guard response == .OK, let url = panel.url else {
+                Task { @MainActor in
+                    self.isExporting = false
+                }
+                return
+            }
             Task { @MainActor in
-                // Ghi trực tiếp vào URL người dùng đã chọn (đã được panel cấp quyền sandbox)
-                let ok = framesVM.exportPack(frameIDs: Array(selected), name: packName, saveTo: url)
+                let ok = framesVM.exportPack(frameIDs: targetIDs, name: trimmedName, saveTo: url)
                 if ok {
                     dismiss()
+                } else {
+                    self.isExporting = false
+                    self.errorMessage = "Xuất gói không thành công. Vui lòng kiểm tra lại trạng thái khung."
                 }
             }
         }

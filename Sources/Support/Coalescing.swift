@@ -114,4 +114,14 @@ public final class Debouncer: @unchecked Sendable {
         activeTask = task
         lock.unlock()
     }
+
+    public func cancel() {
+        lock.lock()
+        workItem?.cancel()
+        workItem = nil
+        activeTask?.cancel()
+        activeTask = nil
+        generation += 1
+        lock.unlock()
+    }
 }

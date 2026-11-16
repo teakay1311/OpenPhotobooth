@@ -2,24 +2,72 @@ import Foundation
 
 // MARK: - Mô hình màu §8, §16.4
 
-/// Thang nội bộ versioned: exposure/contrast/saturation/temperature/tint ∈ -1..1, sharpness ∈ 0..1.
+extension Double {
+    func safeColorClamped(_ range: ClosedRange<Double>) -> Double {
+        guard self.isFinite else { return 0 }
+        return min(max(self, range.lowerBound), range.upperBound)
+    }
+}
+
+/// Thang nội bộ versioned: exposure/contrast/highlights/shadows/saturation/temperature/tint/vibrance ∈ -1..1, sharpness ∈ 0..1.
 /// KHÔNG lưu thang UI -100..100 vào JSON xử lý thấp.
 public struct ColorParameterSet: Codable, Equatable, Sendable {
     public var exposure: Double
     public var contrast: Double
+    public var highlights: Double
+    public var shadows: Double
     public var saturation: Double
     public var temperature: Double
     public var tint: Double
+    public var vibrance: Double
     public var sharpness: Double
 
-    public init(exposure: Double = 0, contrast: Double = 0, saturation: Double = 0,
-                temperature: Double = 0, tint: Double = 0, sharpness: Double = 0) {
-        self.exposure = exposure.clamped(-1...1)
-        self.contrast = contrast.clamped(-1...1)
-        self.saturation = saturation.clamped(-1...1)
-        self.temperature = temperature.clamped(-1...1)
-        self.tint = tint.clamped(-1...1)
-        self.sharpness = sharpness.clamped(0...1)
+    public init(exposure: Double = 0, contrast: Double = 0,
+                highlights: Double = 0, shadows: Double = 0,
+                saturation: Double = 0, temperature: Double = 0,
+                tint: Double = 0, vibrance: Double = 0,
+                sharpness: Double = 0) {
+        self.exposure = exposure.safeColorClamped(-1...1)
+        self.contrast = contrast.safeColorClamped(-1...1)
+        self.highlights = highlights.safeColorClamped(-1...1)
+        self.shadows = shadows.safeColorClamped(-1...1)
+        self.saturation = saturation.safeColorClamped(-1...1)
+        self.temperature = temperature.safeColorClamped(-1...1)
+        self.tint = tint.safeColorClamped(-1...1)
+        self.vibrance = vibrance.safeColorClamped(-1...1)
+        self.sharpness = sharpness.safeColorClamped(0...1)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case exposure, contrast, highlights, shadows, saturation, temperature, tint, vibrance, sharpness
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let exp = try c.decodeIfPresent(Double.self, forKey: .exposure) ?? 0.0
+        let con = try c.decodeIfPresent(Double.self, forKey: .contrast) ?? 0.0
+        let high = try c.decodeIfPresent(Double.self, forKey: .highlights) ?? 0.0
+        let shad = try c.decodeIfPresent(Double.self, forKey: .shadows) ?? 0.0
+        let sat = try c.decodeIfPresent(Double.self, forKey: .saturation) ?? 0.0
+        let temp = try c.decodeIfPresent(Double.self, forKey: .temperature) ?? 0.0
+        let tnt = try c.decodeIfPresent(Double.self, forKey: .tint) ?? 0.0
+        let vib = try c.decodeIfPresent(Double.self, forKey: .vibrance) ?? 0.0
+        let sharp = try c.decodeIfPresent(Double.self, forKey: .sharpness) ?? 0.0
+        self.init(exposure: exp, contrast: con, highlights: high, shadows: shad,
+                  saturation: sat, temperature: temp, tint: tnt, vibrance: vib, sharpness: sharp)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(exposure, forKey: .exposure)
+        try c.encode(contrast, forKey: .contrast)
+        try c.encode(highlights, forKey: .highlights)
+        try c.encode(shadows, forKey: .shadows)
+        try c.encode(saturation, forKey: .saturation)
+        try c.encode(temperature, forKey: .temperature)
+        try c.encode(tint, forKey: .tint)
+        try c.encode(vibrance, forKey: .vibrance)
+        try c.encode(sharpness, forKey: .sharpness)
     }
 
     public static let neutral = ColorParameterSet()
@@ -44,19 +92,63 @@ extension Comparable {
 public struct ColorOverrides: Codable, Equatable, Sendable {
     public var exposure: Double?
     public var contrast: Double?
+    public var highlights: Double?
+    public var shadows: Double?
     public var saturation: Double?
     public var temperature: Double?
     public var tint: Double?
+    public var vibrance: Double?
     public var sharpness: Double?
 
-    public init(exposure: Double? = nil, contrast: Double? = nil, saturation: Double? = nil,
-                temperature: Double? = nil, tint: Double? = nil, sharpness: Double? = nil) {
-        self.exposure = exposure; self.contrast = contrast; self.saturation = saturation
-        self.temperature = temperature; self.tint = tint; self.sharpness = sharpness
+    public init(exposure: Double? = nil, contrast: Double? = nil,
+                highlights: Double? = nil, shadows: Double? = nil,
+                saturation: Double? = nil, temperature: Double? = nil,
+                tint: Double? = nil, vibrance: Double? = nil,
+                sharpness: Double? = nil) {
+        self.exposure = exposure?.safeColorClamped(-1...1)
+        self.contrast = contrast?.safeColorClamped(-1...1)
+        self.highlights = highlights?.safeColorClamped(-1...1)
+        self.shadows = shadows?.safeColorClamped(-1...1)
+        self.saturation = saturation?.safeColorClamped(-1...1)
+        self.temperature = temperature?.safeColorClamped(-1...1)
+        self.tint = tint?.safeColorClamped(-1...1)
+        self.vibrance = vibrance?.safeColorClamped(-1...1)
+        self.sharpness = sharpness?.safeColorClamped(0...1)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case exposure, contrast, highlights, shadows, saturation, temperature, tint, vibrance, sharpness
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.exposure = try c.decodeIfPresent(Double.self, forKey: .exposure)?.safeColorClamped(-1...1)
+        self.contrast = try c.decodeIfPresent(Double.self, forKey: .contrast)?.safeColorClamped(-1...1)
+        self.highlights = try c.decodeIfPresent(Double.self, forKey: .highlights)?.safeColorClamped(-1...1)
+        self.shadows = try c.decodeIfPresent(Double.self, forKey: .shadows)?.safeColorClamped(-1...1)
+        self.saturation = try c.decodeIfPresent(Double.self, forKey: .saturation)?.safeColorClamped(-1...1)
+        self.temperature = try c.decodeIfPresent(Double.self, forKey: .temperature)?.safeColorClamped(-1...1)
+        self.tint = try c.decodeIfPresent(Double.self, forKey: .tint)?.safeColorClamped(-1...1)
+        self.vibrance = try c.decodeIfPresent(Double.self, forKey: .vibrance)?.safeColorClamped(-1...1)
+        self.sharpness = try c.decodeIfPresent(Double.self, forKey: .sharpness)?.safeColorClamped(0...1)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encodeIfPresent(exposure, forKey: .exposure)
+        try c.encodeIfPresent(contrast, forKey: .contrast)
+        try c.encodeIfPresent(highlights, forKey: .highlights)
+        try c.encodeIfPresent(shadows, forKey: .shadows)
+        try c.encodeIfPresent(saturation, forKey: .saturation)
+        try c.encodeIfPresent(temperature, forKey: .temperature)
+        try c.encodeIfPresent(tint, forKey: .tint)
+        try c.encodeIfPresent(vibrance, forKey: .vibrance)
+        try c.encodeIfPresent(sharpness, forKey: .sharpness)
     }
 
     public var isEmpty: Bool {
-        self == ColorOverrides()
+        exposure == nil && contrast == nil && highlights == nil && shadows == nil &&
+        saturation == nil && temperature == nil && tint == nil && vibrance == nil && sharpness == nil
     }
 }
 
@@ -68,19 +160,56 @@ public struct PhotoOverride: Codable, Equatable, Sendable {
     public var color: ColorOverrides?
     public var skinSmooth: Double?
     public var photoRotation: Double?
+    public var explicitNoPreset: Bool?
 
     public init(presetID: String? = nil, presetParameters: ColorParameterSet? = nil,
                 presetIntensity: Double? = nil, color: ColorOverrides? = nil,
-                skinSmooth: Double? = nil, photoRotation: Double? = nil) {
+                skinSmooth: Double? = nil, photoRotation: Double? = nil,
+                explicitNoPreset: Bool? = nil) {
         self.presetID = presetID
         self.presetParameters = presetParameters
         self.presetIntensity = presetIntensity
         self.color = color
         self.skinSmooth = skinSmooth
         self.photoRotation = photoRotation
+        self.explicitNoPreset = explicitNoPreset
     }
 
-    public var isEmpty: Bool { self == PhotoOverride() }
+    private enum CodingKeys: String, CodingKey {
+        case presetID, presetParameters, presetIntensity, color, skinSmooth, photoRotation, explicitNoPreset
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encodeIfPresent(presetID, forKey: .presetID)
+        try values.encodeIfPresent(presetParameters, forKey: .presetParameters)
+        try values.encodeIfPresent(presetIntensity, forKey: .presetIntensity)
+        try values.encodeIfPresent(color, forKey: .color)
+        try values.encodeIfPresent(photoRotation, forKey: .photoRotation)
+        try values.encodeIfPresent(explicitNoPreset, forKey: .explicitNoPreset)
+    }
+
+    public var isEmpty: Bool {
+        presetID == nil && presetParameters == nil && presetIntensity == nil
+            && (color?.isEmpty ?? true) && photoRotation == nil && explicitNoPreset == nil
+    }
+}
+
+/// Bộ chỉnh màu được sao chép trong bộ nhớ ứng dụng (§4.1).
+public struct CopiedColorAdjustments: Codable, Equatable, Sendable {
+    public let presetID: String?
+    public let presetParameters: ColorParameterSet
+    public let presetIntensity: Double
+    public let isExplicitNoPreset: Bool
+    public let color: ColorParameterSet
+
+    public init(presetID: String?, presetParameters: ColorParameterSet, presetIntensity: Double, isExplicitNoPreset: Bool, color: ColorParameterSet) {
+        self.presetID = presetID
+        self.presetParameters = presetParameters
+        self.presetIntensity = presetIntensity
+        self.isExplicitNoPreset = isExplicitNoPreset
+        self.color = color
+    }
 }
 
 /// Snapshot mặc định của phiên: freeze AppDefault tại thời điểm tạo phiên (§8.3).
@@ -94,10 +223,15 @@ public struct SessionDefaultsSnapshot: Codable, Equatable, Sendable {
     public var color: ColorParameterSet
     public var skinSmooth: Double
     public var outputMirror: Bool
+    public var rotation: Int?
+    public var smartFace: Bool?
+    public var selectionCaptureCount: Int? = nil
+    public var selectedCaptureOrder: [Int]? = nil
 
     public init(parameterVersion: Int = 1, presetID: String?, presetName: String?,
                 presetResolvedParameters: ColorParameterSet, presetIntensity: Double,
-                color: ColorParameterSet, skinSmooth: Double, outputMirror: Bool) {
+                color: ColorParameterSet, skinSmooth: Double, outputMirror: Bool,
+                rotation: Int? = 0, smartFace: Bool? = true) {
         self.parameterVersion = parameterVersion
         self.presetID = presetID
         self.presetName = presetName
@@ -106,6 +240,45 @@ public struct SessionDefaultsSnapshot: Codable, Equatable, Sendable {
         self.color = color
         self.skinSmooth = skinSmooth.clamped(0...1)
         self.outputMirror = outputMirror
+        self.rotation = rotation
+        self.smartFace = smartFace
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case parameterVersion, presetID, presetName, presetResolvedParameters
+        case presetIntensity, color, skinSmooth, outputMirror, rotation, smartFace
+        case selectionCaptureCount, selectedCaptureOrder
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        parameterVersion = try c.decodeIfPresent(Int.self, forKey: .parameterVersion) ?? 1
+        presetID = try c.decodeIfPresent(String.self, forKey: .presetID)
+        presetName = try c.decodeIfPresent(String.self, forKey: .presetName)
+        presetResolvedParameters = try c.decodeIfPresent(ColorParameterSet.self, forKey: .presetResolvedParameters) ?? .neutral
+        presetIntensity = (try c.decodeIfPresent(Double.self, forKey: .presetIntensity) ?? 1.0).clamped(0...1)
+        color = try c.decodeIfPresent(ColorParameterSet.self, forKey: .color) ?? .neutral
+        skinSmooth = (try c.decodeIfPresent(Double.self, forKey: .skinSmooth) ?? 0.0).clamped(0...1)
+        outputMirror = try c.decodeIfPresent(Bool.self, forKey: .outputMirror) ?? false
+        rotation = try c.decodeIfPresent(Int.self, forKey: .rotation) ?? 0
+        smartFace = try c.decodeIfPresent(Bool.self, forKey: .smartFace) ?? true
+        selectionCaptureCount = try c.decodeIfPresent(Int.self, forKey: .selectionCaptureCount)
+        selectedCaptureOrder = try c.decodeIfPresent([Int].self, forKey: .selectedCaptureOrder)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(parameterVersion, forKey: .parameterVersion)
+        try values.encodeIfPresent(presetID, forKey: .presetID)
+        try values.encodeIfPresent(presetName, forKey: .presetName)
+        try values.encode(presetResolvedParameters, forKey: .presetResolvedParameters)
+        try values.encode(presetIntensity, forKey: .presetIntensity)
+        try values.encode(color, forKey: .color)
+        try values.encode(outputMirror, forKey: .outputMirror)
+        try values.encodeIfPresent(rotation, forKey: .rotation)
+        try values.encodeIfPresent(smartFace, forKey: .smartFace)
+        try values.encodeIfPresent(selectionCaptureCount, forKey: .selectionCaptureCount)
+        try values.encodeIfPresent(selectedCaptureOrder, forKey: .selectedCaptureOrder)
     }
 }
 
@@ -119,29 +292,38 @@ public struct ResolvedPhotoParams: Equatable, Sendable {
     public var photoRotation: Double
 
     public static func resolve(defaults: SessionDefaultsSnapshot, override: PhotoOverride?) -> ResolvedPhotoParams {
+        let baseRotation = Double(defaults.rotation ?? 0)
         guard let o = override else {
             return ResolvedPhotoParams(presetID: defaults.presetID,
                                        presetParameters: defaults.presetResolvedParameters,
                                        presetIntensity: defaults.presetIntensity,
                                        color: defaults.color,
                                        skinSmooth: defaults.skinSmooth,
-                                       photoRotation: 0)
+                                       photoRotation: baseRotation)
         }
+        let isExplicitNone = o.explicitNoPreset == true
+        let resolvedPresetID = isExplicitNone ? nil : (o.presetID ?? defaults.presetID)
+        let resolvedPresetParams = isExplicitNone ? .neutral : (o.presetParameters ?? defaults.presetResolvedParameters)
+        let resolvedIntensity = isExplicitNone ? 0.0 : (o.presetIntensity ?? defaults.presetIntensity)
+
         let c = o.color
         let mergedColor = ColorParameterSet(
             exposure: c?.exposure ?? defaults.color.exposure,
             contrast: c?.contrast ?? defaults.color.contrast,
+            highlights: c?.highlights ?? defaults.color.highlights,
+            shadows: c?.shadows ?? defaults.color.shadows,
             saturation: c?.saturation ?? defaults.color.saturation,
             temperature: c?.temperature ?? defaults.color.temperature,
             tint: c?.tint ?? defaults.color.tint,
+            vibrance: c?.vibrance ?? defaults.color.vibrance,
             sharpness: c?.sharpness ?? defaults.color.sharpness)
         return ResolvedPhotoParams(
-            presetID: o.presetID ?? defaults.presetID,
-            presetParameters: o.presetParameters ?? defaults.presetResolvedParameters,
-            presetIntensity: o.presetIntensity ?? defaults.presetIntensity,
+            presetID: resolvedPresetID,
+            presetParameters: resolvedPresetParams,
+            presetIntensity: resolvedIntensity,
             color: mergedColor,
             skinSmooth: o.skinSmooth ?? defaults.skinSmooth,
-            photoRotation: o.photoRotation ?? 0)
+            photoRotation: o.photoRotation ?? baseRotation)
     }
 }
 

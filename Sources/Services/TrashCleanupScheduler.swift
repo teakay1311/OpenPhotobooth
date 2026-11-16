@@ -9,6 +9,13 @@ public final class TrashCleanupScheduler: @unchecked Sendable {
     private var timer: DispatchSourceTimer?
     private let lock = NSLock()
     private var running = false
+    private var hasWarnedFrozen = false
+
+    public var isRunning: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return timer != nil
+    }
 
     public init(trashService: TrashService, trashRepo: TrashRepository,
                 clockSanity: ClockSanityMonitor, clock: AppClock = SystemClock.shared) {
@@ -52,12 +59,27 @@ public final class TrashCleanupScheduler: @unchecked Sendable {
         clockSanity.observe(clock: clock)
         if clockSanity.isAutoPurgeFrozen && !manual {
             Log.trash.warning("Tự động dọn rác bị đóng băng do đồng hồ bất thường (E-TRS-04)")
+            lock.lock()
+            let shouldWarn = !hasWarnedFrozen
+            hasWarnedFrozen = true
+            lock.unlock()
+            if shouldWarn {
+                EventBus.shared.post(.settingsChanged(key: "trashAutoCleanFrozen"))
+            }
             return nil
+        } else if !clockSanity.isAutoPurgeFrozen {
+            lock.lock()
+            hasWarnedFrozen = false
+            lock.unlock()
         }
         let now = Time.nowMs(clock)
         guard let expired = try? trashRepo.expired(nowMs: now, limit: 20) else { return nil }
         guard !expired.isEmpty else { return TrashService.PurgeReport() }
         // Batch nhỏ + yield cho CameraService (§12.5)
-        return trashService.purgeAll(items: expired)
+        let report = trashService.purgeAll(items: expired, onlyExpired: true)
+        if report.success > 0 {
+            EventBus.shared.post(.trashChanged)
+        }
+        return report
     }
 }

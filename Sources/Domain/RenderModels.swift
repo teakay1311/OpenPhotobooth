@@ -54,13 +54,21 @@ public struct RenderOptions: Equatable, Sendable {
 
 public enum ColorHex {
     public static func toCGColor(_ hex: String) -> CGColor {
-        var value: UInt64 = 0xFFFFFFFF
         let raw = hex.hasPrefix("#") ? String(hex.dropFirst()) : hex
+        if raw.count == 6 {
+            var rgb: UInt64 = 0
+            Scanner(string: raw).scanHexInt64(&rgb)
+            let r = CGFloat((rgb >> 16) & 0xFF) / 255.0
+            let g = CGFloat((rgb >> 8) & 0xFF) / 255.0
+            let b = CGFloat(rgb & 0xFF) / 255.0
+            return CGColor(red: r, green: g, blue: b, alpha: 1.0)
+        }
+        var value: UInt64 = 0xFFFFFFFF
         Scanner(string: raw).scanHexInt64(&value)
-        let r = CGFloat((value >> 24) & 0xFF) / 255
-        let g = CGFloat((value >> 16) & 0xFF) / 255
-        let b = CGFloat((value >> 8) & 0xFF) / 255
-        let a = CGFloat(value & 0xFF) / 255
+        let r = CGFloat((value >> 24) & 0xFF) / 255.0
+        let g = CGFloat((value >> 16) & 0xFF) / 255.0
+        let b = CGFloat((value >> 8) & 0xFF) / 255.0
+        let a = CGFloat(value & 0xFF) / 255.0
         return CGColor(red: r, green: g, blue: b, alpha: a)
     }
 
