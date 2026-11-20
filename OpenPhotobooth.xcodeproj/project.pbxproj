@@ -100,6 +100,7 @@
 		E94C3E33A31655A4413C34DE /* CommonViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B170420BE7FA2DE58F9D4889 /* CommonViews.swift */; };
 		F15BED66413201B41B222257 /* Fixtures in Resources */ = {isa = PBXBuildFile; fileRef = ABA02FE0CA6D8076992C2AD0 /* Fixtures */; };
 		F37EF2219C10D3DE4F856846 /* LaunchErrorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CDB92887F3F9CEFCF3426C24 /* LaunchErrorView.swift */; };
+		F40D6448912E8FC58149C9A4 /* AuditVerifiedFixTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F1D592B342C0F62412EA619 /* AuditVerifiedFixTests.swift */; };
 		F43594004311350E7809F065 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2621AB7F885DE8210EA77CE3 /* Assets.xcassets */; };
 		F5DE21E60C13607F75DBAF83 /* SmartFraming.swift in Sources */ = {isa = PBXBuildFile; fileRef = D024749CDF96A023BBFB20E8 /* SmartFraming.swift */; };
 		F9CA48544835DC3B8602CAB9 /* AuditCompleteStateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7E7DED16D085B82441E8D7B /* AuditCompleteStateTests.swift */; };
@@ -141,6 +142,7 @@
 		28D79AFC16CC3F50BA6F5DB2 /* AuditExportStaleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuditExportStaleTests.swift; sourceTree = "<group>"; };
 		2BEDA45431F060B751B8F39C /* FrameEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrameEditorView.swift; sourceTree = "<group>"; };
 		2E605E48A34928660EB18FA0 /* OpenPhotoboothApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OpenPhotoboothApp.swift; sourceTree = "<group>"; };
+		2F1D592B342C0F62412EA619 /* AuditVerifiedFixTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuditVerifiedFixTests.swift; sourceTree = "<group>"; };
 		2F80F9F5BC4CB5E99A1000AE /* FrameImportSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrameImportSheet.swift; sourceTree = "<group>"; };
 		33CE8A8CF28C2D45C2917551 /* AuditStateRegressionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuditStateRegressionTests.swift; sourceTree = "<group>"; };
 		3D153DEBA0B31AB22720C547 /* AuditPendingEditTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuditPendingEditTests.swift; sourceTree = "<group>"; };
@@ -420,6 +422,7 @@
 				738238B8CBEDB5ACAFED4B6E /* AuditSameFrameTests.swift */,
 				9AB2791C795A79A0766816C6 /* AuditShareStaleTests.swift */,
 				33CE8A8CF28C2D45C2917551 /* AuditStateRegressionTests.swift */,
+				2F1D592B342C0F62412EA619 /* AuditVerifiedFixTests.swift */,
 				04FA4116337843F1A5010E6F /* CaptureAuditTests.swift */,
 				E17F2696ABF61B8C8B9FE25C /* CapturePhotoSelectionTests.swift */,
 				A1C4B6F58727C282E7D3B060 /* ComprehensiveVerificationTests.swift */,
@@ -605,6 +608,7 @@
 				5606F9118D48E1D8DF074587 /* AuditSameFrameTests.swift in Sources */,
 				75866296687B6334C248CA43 /* AuditShareStaleTests.swift in Sources */,
 				662181DCB9F677D49490099B /* AuditStateRegressionTests.swift in Sources */,
+				F40D6448912E8FC58149C9A4 /* AuditVerifiedFixTests.swift in Sources */,
 				00674F243AB07D3EE0EE0A08 /* CaptureAuditTests.swift in Sources */,
 				4B528D0763D4E555893B1B9B /* CapturePhotoSelectionTests.swift in Sources */,
 				6AA8F9D9CF890D291AC088E7 /* ComprehensiveVerificationTests.swift in Sources */,
@@ -774,7 +778,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Resources/OpenPhotobooth.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEAD_CODE_STRIPPING = YES;
 				ENABLE_TESTABILITY = YES;
 				INFOPLIST_FILE = Resources/Info.plist;
@@ -782,7 +786,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.2.0;
+				MARKETING_VERSION = 1.2.1;
 				PRODUCT_BUNDLE_IDENTIFIER = vn.openphotobooth.app;
 				PRODUCT_MODULE_NAME = OpenPhotobooth;
 				PRODUCT_NAME = "Open Photobooth";
@@ -884,7 +888,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Resources/OpenPhotobooth.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEAD_CODE_STRIPPING = YES;
 				ENABLE_TESTABILITY = YES;
 				INFOPLIST_FILE = Resources/Info.plist;
@@ -892,7 +896,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.2.0;
+				MARKETING_VERSION = 1.2.1;
 				PRODUCT_BUNDLE_IDENTIFIER = vn.openphotobooth.app;
 				PRODUCT_MODULE_NAME = OpenPhotobooth;
 				PRODUCT_NAME = "Open Photobooth";

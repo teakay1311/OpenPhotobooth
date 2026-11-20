@@ -111,12 +111,17 @@ public struct ExportSheet: View {
                 Text(warning).foregroundStyle(.orange).font(.caption)
             }
             if let url = vm.lastResultURL {
-                HStack {
-                    Image(systemName: vm.historySaveFailed ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
-                        .foregroundStyle(vm.historySaveFailed ? .orange : .green)
-                    Text("Đã lưu tệp: \(url.lastPathComponent)")
-                    Spacer()
-                    Button("Hiện trong Finder") { vm.revealResult() }
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Image(systemName: vm.historySaveFailed ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
+                            .foregroundStyle(vm.historySaveFailed ? .orange : .green)
+                        Text("Đã lưu tệp: \(url.lastPathComponent)")
+                        Spacer()
+                        Button("Hiện trong Finder") { vm.revealResult() }
+                    }
+                    if let warning = vm.historyWarning {
+                        Text(warning).foregroundStyle(.orange).font(.caption)
+                    }
                 }
                 .padding(.horizontal)
             }

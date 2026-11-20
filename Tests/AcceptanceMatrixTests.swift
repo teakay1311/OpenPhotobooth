@@ -599,10 +599,34 @@ final class AcceptanceMatrixTests: XCTestCase {
             """)
         await sheet.runExport()
         let file = try XCTUnwrap(sheet.lastResultURL)
-        let warning = try XCTUnwrap(sheet.errorMessage)
-        XCTAssertTrue(warning.contains("chưa ghi được lịch sử xuất"))
+        let originalHash = try XCTUnwrap(Hashing.sha256Hex(fileURL: file))
+        let warning = try XCTUnwrap(sheet.historyWarning)
+        XCTAssertEqual(warning, "Đã lưu \(file.lastPathComponent), chưa ghi được lịch sử xuất.")
+        XCTAssertNil(sheet.errorMessage)
         XCTAssertTrue(sheet.historySaveFailed)
         XCTAssertTrue(try env.sessions.listExportRecords(sessionID: setup.session.id).isEmpty)
+
+        let next = env.layout.exportsTempDir.appendingPathComponent("next", isDirectory: true)
+        let oneOff = env.layout.exportsTempDir.appendingPathComponent("one-off-next", isDirectory: true)
+        try FileManager.default.createDirectory(at: next, withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(at: oneOff, withIntermediateDirectories: false)
+        sheet.selectFolder(next)
+        XCTAssertEqual(sheet.folderURL, next)
+        XCTAssertEqual(sheet.lastResultURL, file)
+        XCTAssertEqual(sheet.historyWarning, warning)
+        XCTAssertNil(sheet.errorMessage)
+        XCTAssertEqual(Hashing.sha256Hex(fileURL: file), originalHash)
+        XCTAssertTrue(try env.sessions.listExportRecords(sessionID: setup.session.id).isEmpty)
+
+        try env.db.run("""
+            CREATE TEMP TRIGGER fail_next_bookmark BEFORE INSERT ON app_bookmarks
+            BEGIN SELECT RAISE(ABORT, 'QA bookmark failure'); END
+            """)
+        sheet.selectFolder(oneOff)
+        XCTAssertEqual(sheet.folderURL, oneOff)
+        XCTAssertEqual(sheet.lastResultURL, file)
+        XCTAssertEqual(sheet.historyWarning, warning)
+        XCTAssertEqual(sheet.errorMessage, "Không lưu được thư mục mặc định. Bạn vẫn có thể thử xuất lần này.")
         var revealed: [URL] = []
         env.shareService.revealInFinderHook = { revealed.append($0) }
         defer { env.shareService.revealInFinderHook = nil }
@@ -615,8 +639,27 @@ final class AcceptanceMatrixTests: XCTestCase {
         XCTAssertEqual(revealed, [file])
         XCTAssertEqual(sheet.finderWarning, "Tệp xuất đã bị thay thế hoặc chỉnh sửa")
         XCTAssertTrue(sheet.historySaveFailed)
-        XCTAssertEqual(sheet.errorMessage, warning)
+        XCTAssertEqual(sheet.historyWarning, warning)
+        XCTAssertTrue(try env.sessions.listExportRecords(sessionID: setup.session.id).isEmpty)
         print("QA-SHEET-NO-HISTORY correctFileRevealed=true replacementBlocked=true bothWarningsPreserved=true")
+
+        try env.db.run("DROP TRIGGER fail_export_history")
+        try env.db.run("DROP TRIGGER fail_next_bookmark")
+        sheet.selectFolder(next)
+        await sheet.runExport()
+        let newFile = try XCTUnwrap(sheet.lastResultURL)
+        let record = try XCTUnwrap(env.sessions.listExportRecords(sessionID: setup.session.id).first)
+        XCTAssertEqual(newFile.deletingLastPathComponent(), next)
+        XCTAssertEqual(record.destinationDisplayPath, newFile.path)
+        XCTAssertEqual(record.sha256, Hashing.sha256Hex(fileURL: newFile))
+        XCTAssertEqual(record.sessionRevisionNo, detail.session.revisionNo)
+        XCTAssertEqual(record.destinationBookmarkID, env.settings.exportFolderBookmarkID)
+        XCTAssertNotNil(record.destinationBookmarkID)
+        XCTAssertEqual(record.status, .success)
+        XCTAssertNil(sheet.historyWarning)
+        XCTAssertNil(sheet.finderWarning)
+        XCTAssertNil(sheet.errorMessage)
+        print("QA-HISTORY-WARNING retainedAfterFolderSelection=true retainedAfterBookmarkFailure=true newExportClearedWarnings=true")
     }
 
     @MainActor

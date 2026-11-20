@@ -23,6 +23,10 @@ public final class ExportViewModel: ObservableObject {
     @Published private var lastResult: ExportResult?
     public var lastResultURL: URL? { lastResult?.file.url }
     var historySaveFailed: Bool { lastResult?.historySaveFailed == true }
+    var historyWarning: String? {
+        guard let result = lastResult, result.historySaveFailed else { return nil }
+        return AppError.exportHistoryNotSaved(result.file).message
+    }
     @Published public private(set) var errorMessage: String?
     @Published private(set) var finderWarning: String?
     @Published public private(set) var previewImage: CGImage?
@@ -225,7 +229,6 @@ public final class ExportViewModel: ObservableObject {
             lastResult = ExportResult(file: file, folder: folder, historySaveFailed: false)
         case .failure(.exportHistoryNotSaved(let file)):
             lastResult = ExportResult(file: file, folder: folder, historySaveFailed: true)
-            errorMessage = AppError.exportHistoryNotSaved(file).message
         case .failure(.exportPreviewChanged):
             errorMessage = AppError.exportPreviewChanged.message
             updatePreview()
