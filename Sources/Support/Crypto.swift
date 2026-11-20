@@ -17,6 +17,18 @@ public enum Hashing {
         }) {}
         return hasher.finalize().map { String(format: "%02x", $0) }.joined()
     }
+
+    static func sha256Hex(reading handle: FileHandle) throws -> String {
+        var hasher = SHA256()
+        while try autoreleasepool(invoking: {
+            try Task.checkCancellation()
+            guard let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty else { return false }
+            hasher.update(data: chunk)
+            return true
+        }) {}
+        try Task.checkCancellation()
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
 }
 
 /// CRC32 chuẩn ZIP (poly 0xEDB88320).

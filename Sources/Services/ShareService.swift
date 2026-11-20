@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import CoreGraphics
+import Darwin
 
 /// ShareService (§11.4): share cache + NSSharingServicePicker (AirDrop do macOS quản lý).
 /// Không tự viết AirDrop transport; đóng picker không nghĩa recipient đã nhận.
@@ -86,5 +87,105 @@ public final class ShareService: @unchecked Sendable {
     public func exportFileExists(_ record: ExportRecordModel) -> Bool {
         guard let path = record.destinationDisplayPath else { return false }
         return FileManager.default.fileExists(atPath: path)
+    }
+}
+
+/// The file checks shared by the export sheet and the library before revealing an export.
+enum ExportFileVerifier {
+    enum Check: Sendable {
+        case verified(stat)
+        case missingOrInvalid, modified
+    }
+
+    enum Unavailable {
+        case missingOrInvalid, inaccessible
+    }
+
+    static func matchesCurrentVersion(_ url: URL, _ version: stat) throws -> Bool {
+        var current = stat()
+        guard lstat(url.path, &current) == 0 else { throw posixError(errno) }
+        return sameVersion(current, version)
+    }
+
+    static func check(
+        _ url: URL, expectedHash: String?, beforeHash: (@Sendable (URL) throws -> Void)?
+    ) throws -> Check {
+        try Task.checkCancellation()
+        guard !url.path.utf8.contains(0) else { return .missingOrInvalid }
+        var entry = stat()
+        guard lstat(url.path, &entry) == 0 else { throw posixError(errno) }
+        guard entry.st_mode & S_IFMT == S_IFREG else { return .missingOrInvalid }
+        guard let expectedHash, !expectedHash.isEmpty else { return .verified(entry) }
+
+        let fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else {
+            let code = errno
+            if code == ELOOP { return .missingOrInvalid }
+            throw posixError(code)
+        }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+        defer { close(fd) }
+        var opened = stat()
+        guard fstat(fd, &opened) == 0 else { throw posixError(errno) }
+        guard sameVersion(entry, opened) else { return .modified }
+        try beforeHash?(url)
+        let hash = try Hashing.sha256Hex(reading: handle)
+
+        var current = stat()
+        guard lstat(url.path, &current) == 0 else { throw posixError(errno) }
+        guard sameVersion(current, opened), hash.caseInsensitiveCompare(expectedHash) == .orderedSame else {
+            return .modified
+        }
+        return .verified(current)
+    }
+
+    private static func sameVersion(_ a: stat, _ b: stat) -> Bool {
+        a.st_mode & S_IFMT == S_IFREG && b.st_mode & S_IFMT == S_IFREG &&
+        (a.st_dev, a.st_ino, a.st_gen, a.st_size) == (b.st_dev, b.st_ino, b.st_gen, b.st_size) &&
+        (a.st_mtimespec.tv_sec, a.st_mtimespec.tv_nsec) == (b.st_mtimespec.tv_sec, b.st_mtimespec.tv_nsec) &&
+        (a.st_ctimespec.tv_sec, a.st_ctimespec.tv_nsec) == (b.st_ctimespec.tv_sec, b.st_ctimespec.tv_nsec)
+    }
+
+    private static func posixError(_ code: Int32) -> POSIXError {
+        POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+    }
+
+    static func classifyFileError(_ error: Error) -> Unavailable {
+        if (error as? AppError) == .externalFolderPermissionLost { return .inaccessible }
+        let ns = error as NSError
+        var chain: [NSError] = []
+        var current: NSError? = ns
+        while let err = current {
+            chain.append(err)
+            current = err.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+
+        // Ưu tiên không thể truy cập khi có nguyên nhân quyền rõ ràng (§4.3)
+        for err in chain {
+            if err.domain == NSCocoaErrorDomain {
+                if err.code == NSFileReadNoPermissionError {
+                    return .inaccessible
+                }
+            } else if err.domain == NSPOSIXErrorDomain {
+                if err.code == Int(EACCES) || err.code == Int(EPERM) {
+                    return .inaccessible
+                }
+            }
+        }
+
+        // Tệp mất hoặc đường dẫn không còn hợp lệ
+        for err in chain {
+            if err.domain == NSCocoaErrorDomain {
+                if err.code == NSFileNoSuchFileError || err.code == NSFileReadNoSuchFileError {
+                    return .missingOrInvalid
+                }
+            } else if err.domain == NSPOSIXErrorDomain {
+                if err.code == Int(ENOENT) || err.code == Int(ENOTDIR) {
+                    return .missingOrInvalid
+                }
+            }
+        }
+
+        return .inaccessible
     }
 }

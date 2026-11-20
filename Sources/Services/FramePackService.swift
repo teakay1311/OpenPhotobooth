@@ -261,13 +261,7 @@ public final class FramePackService: @unchecked Sendable {
         let extracted = try verifiedAssets(data: data, manifest: result.manifest)
         // Thumbnail + duplicate detection
         var packEntries: [PackEntry] = []
-        let existingFrames = try frames.listFrames()
-        var existingHashes: Set<String> = []
-        for frameID in existingFrames.map(\.id) {
-            if let snap = try? createContentHash(frameID: frameID) {
-                existingHashes.insert(snap)
-            }
-        }
+        let replacements = try replacementOptions(for: result.manifest.frames)
         for packFrame in result.manifest.frames {
             var thumbData: Data? = nil
             var assetCount = 0
@@ -289,11 +283,11 @@ public final class FramePackService: @unchecked Sendable {
                     assetCount += 1
                 }
             }
-            let contentHash = Self.packContentHash(packFrame: packFrame)
-            let isDup = !contentHash.isEmpty && existingHashes.contains(contentHash)
+            let option = replacements[packFrame.frameId]
             packEntries.append(PackEntry(frame: packFrame, thumbnailData: thumbData,
-                                         assetCount: assetCount, isDuplicate: isDup,
-                                         existingFrameID: nil))
+                                         assetCount: assetCount, isDuplicate: option?.isDuplicate == true,
+                                         replacementTarget: option?.target,
+                                         replacementUnavailableReason: option?.reason))
         }
         result = PackValidationResult(manifest: result.manifest, entries: packEntries,
                                       warnings: result.warnings)
@@ -368,22 +362,57 @@ public final class FramePackService: @unchecked Sendable {
         return Hashing.sha256Hex(data)
     }
 
-    func createContentHash(frameID: String) throws -> String? {
-        guard let frame = try frames.getFrame(id: frameID), let revID = frame.currentRevisionID,
-              let rev = try frames.getRevision(id: revID) else { return nil }
+    private func contentHash(frame: Frame, revision rev: FrameRevision) throws -> String? {
+        let revID = rev.id
         let slots = try frames.getSlots(revisionID: revID)
         let explicit = try db.query("SELECT value FROM app_state WHERE key=?", [.text("explicit_white_\(revID)")]).first?["value"].stringValue
-        return Self.packContentHash(packFrame: PackFrame(frameId: frameID, name: frame.name, category: nil,
+        let background = rev.backgroundAssetID.flatMap { assets.assetInfo(assetID: $0)?.sha256 }
+        let foreground = rev.foregroundAssetID.flatMap { assets.assetInfo(assetID: $0)?.sha256 }
+        guard (rev.backgroundAssetID == nil || background != nil),
+              (rev.foregroundAssetID == nil || foreground != nil) else { return nil }
+        return Self.packContentHash(packFrame: PackFrame(frameId: frame.id, name: frame.name, category: nil,
             canvas: PackCanvas(width: rev.canvasWidth, height: rev.canvasHeight),
             slots: slots.map { PackSlot(id: $0.id, captureIndex: $0.captureIndex, x: $0.x, y: $0.y,
                 width: $0.width, height: $0.height, rotationDegrees: $0.rotationDegrees, zOrder: $0.zOrder,
                 mask: $0.maskType.rawValue, cornerRadius: $0.cornerRadius, cropMode: $0.defaultCropMode.rawValue) },
-            assets: PackFrameAssets(background: rev.backgroundAssetID.flatMap { assets.assetInfo(assetID: $0)?.sha256 },
-                                    foreground: rev.foregroundAssetID.flatMap { assets.assetInfo(assetID: $0)?.sha256 },
+            assets: PackFrameAssets(background: background, foreground: foreground,
                                     backgroundImageOrientation: rev.backgroundImageOrientation,
                                     foregroundImageOrientation: rev.foregroundImageOrientation),
             backgroundColor: rev.backgroundColorHex, backgroundPlacement: rev.backgroundPlacement.rawValue,
             foregroundPlacement: rev.foregroundPlacement.rawValue, explicitWhite: explicit == "1" || explicit == "true"))
+    }
+
+    private struct ReplacementOption {
+        let target: PackReplacementTarget?
+        let reason: String?
+        let isDuplicate: Bool
+    }
+
+    private func replacementOptions(for incoming: [PackFrame]) throws -> [String: ReplacementOption] {
+        guard !incoming.isEmpty else { return [:] }
+        let library = try frames.listFrames(includeTrashed: true)
+        let knownIDs = Set(library.map(\.id))
+        var active: [String: PackReplacementTarget] = [:]
+        var hashes: [String: [PackReplacementTarget]] = [:]
+        for frame in library where frame.lifecycle == .active {
+            guard let revisionID = frame.currentRevisionID, let rev = try frames.getRevision(id: revisionID),
+                  rev.frameID == frame.id else { continue }
+            let target = PackReplacementTarget(id: frame.id, revisionID: revisionID, name: frame.name)
+            active[frame.id] = target
+            if let hash = try contentHash(frame: frame, revision: rev), !hash.isEmpty {
+                hashes[hash, default: []].append(target)
+            }
+        }
+        return Dictionary(uniqueKeysWithValues: incoming.map { frame in
+            let matches = hashes[Self.packContentHash(packFrame: frame)] ?? []
+            let target = knownIDs.contains(frame.frameId) ? active[frame.frameId] : (matches.count == 1 ? matches.first : nil)
+            let reason: String?
+            if target != nil { reason = nil }
+            else if knownIDs.contains(frame.frameId) { reason = "Khung gốc không còn khả dụng để thay thế." }
+            else if matches.count > 1 { reason = "Nhiều khung có cùng nội dung. Hãy chọn Bản sao hoặc Bỏ qua." }
+            else { reason = "Không tìm thấy khung đích. Hãy chọn Bản sao hoặc Bỏ qua." }
+            return (frame.frameId, ReplacementOption(target: target, reason: reason, isDuplicate: !matches.isEmpty))
+        })
     }
 
     // MARK: - Import (§13.2, PACK-01..05)
@@ -465,7 +494,19 @@ public final class FramePackService: @unchecked Sendable {
         }
         let extracted = try verifiedAssets(data: data, manifest: validated.manifest)
         var statuses: [String: PackItemStatus] = [:]
-        let existingNames = try frames.listFrames().map(\.name)
+        let replaceIDs = Set(choices.filter { $0.selected && $0.policy == .replace }.map(\.packFrameID))
+        let replacements: [String: ReplacementOption]
+        if result.entries.isEmpty {
+            // The format-only API has no preview. Resolve targets once before any row writes.
+            replacements = try replacementOptions(for: validated.manifest.frames.filter { replaceIDs.contains($0.frameId) })
+        } else {
+            replacements = result.entries.reduce(into: [:]) { options, entry in
+                guard replaceIDs.contains(entry.id) else { return }
+                options[entry.id] = ReplacementOption(target: entry.replacementTarget,
+                    reason: entry.replacementUnavailableReason, isDuplicate: entry.isDuplicate)
+            }
+        }
+        let targetCounts = Dictionary(grouping: replacements.values.compactMap(\.target), by: \.id).mapValues(\.count)
         for choice in choices {
             guard choice.selected else {
                 statuses[choice.packFrameID] = .unselected
@@ -486,12 +527,18 @@ public final class FramePackService: @unchecked Sendable {
                     statuses[choice.packFrameID] = .skipped
                 case .copy:
                     let newID = try importFrame(packFrame: packFrame, extracted: extracted,
-                                                forceNewID: true, existingNames: existingNames,
+                                                target: nil,
                                                 onEnteredWriteZone: { didEnterWriteZone = true })
                     statuses[choice.packFrameID] = .imported(frameID: newID)
                 case .replace:
+                    guard let target = replacements[choice.packFrameID]?.target else {
+                        throw AppError.invalidState(replacements[choice.packFrameID]?.reason ?? "Không tìm thấy khung đích trong bản xem trước.")
+                    }
+                    guard targetCounts[target.id] == 1 else {
+                        throw AppError.invalidState("Nhiều mục đang chọn thay thế cùng một khung.")
+                    }
                     let id = try importFrame(packFrame: packFrame, extracted: extracted,
-                                             forceNewID: false, existingNames: existingNames,
+                                             target: target,
                                              onEnteredWriteZone: { didEnterWriteZone = true })
                     statuses[choice.packFrameID] = .replaced(frameID: id)
                 }
@@ -509,7 +556,7 @@ public final class FramePackService: @unchecked Sendable {
     }
 
     private func importFrame(packFrame: PackFrame, extracted: [String: Data],
-                             forceNewID: Bool, existingNames: [String],
+                             target: PackReplacementTarget?,
                              onEnteredWriteZone: () -> Void) throws -> String {
         func bytes(_ reference: String?) throws -> Data? {
             guard let reference else { return nil }
@@ -544,28 +591,44 @@ public final class FramePackService: @unchecked Sendable {
         if let issue = try FrameRepository.configuredIssues(draft: draft, slots: slots, foreground: overlay).first {
             throw AppError.invalidState(issue.message)
         }
+        let token = try target.map {
+            try OperationCoordinator.shared.acquire(key: "frame:\($0.id)", reason: "Thay thế khung từ Frame Pack")
+        }
+        defer { token?.release() }
+        if let target {
+            guard let current = try frames.getFrame(id: target.id), current.lifecycle == .active,
+                  current.currentRevisionID == target.revisionID else {
+                throw AppError.invalidState("Khung đích đã thay đổi. Hãy mở lại gói để xem trước.")
+            }
+        }
         let ownerKey = "pack-\(IDFactory.new())"
         onEnteredWriteZone()
-        defer { try? assets.removeReferences(ownerType: "frame_revision", ownerID: ownerKey) }
-        for (data, role) in [(background, AssetKind.frameBackground), (foreground, AssetKind.frameForeground)] {
-            guard let data else { continue }
-            let media = try AssetStore.validatedFrameImage(data).mediaType
-            let asset = try assets.store(data: data, mediaType: media, purpose: role.rawValue,
-                ownerType: "frame_revision", ownerID: ownerKey)
-            if role == .frameBackground { draft.backgroundAssetID = asset.id }
-            else { draft.foregroundAssetID = asset.id }
+        do {
+            for (data, role) in [(background, AssetKind.frameBackground), (foreground, AssetKind.frameForeground)] {
+                guard let data else { continue }
+                let media = try AssetStore.validatedFrameImage(data).mediaType
+                let asset = try assets.store(data: data, mediaType: media, purpose: role.rawValue,
+                    ownerType: "frame_revision", ownerID: ownerKey)
+                if role == .frameBackground { draft.backgroundAssetID = asset.id }
+                else { draft.foregroundAssetID = asset.id }
+            }
+            if let target {
+                _ = try frames.saveConfiguredRevision(frameID: target.id, expectedRevisionID: target.revisionID,
+                    name: nil, draft: draft, slots: slots, stagedOwnerID: ownerKey,
+                    explicitWhite: packFrame.explicitWhite == true, categoryName: packFrame.category, parentToken: token)
+                return target.id
+            }
+            let name = FrameRepository.uniqueName(base: packFrame.name, existing: try frames.listFrames().map(\.name))
+            return try frames.createConfiguredFrame(name: name, categoryID: nil, draft: draft, slots: slots,
+                stagedOwnerID: ownerKey, explicitWhite: packFrame.explicitWhite == true,
+                categoryName: packFrame.category).id
+        } catch let importError {
+            // On success the revision transaction already transferred and removed these references.
+            do { try assets.removeReferences(ownerType: "frame_revision", ownerID: ownerKey) }
+            catch let cleanupError {
+                throw AppError.ioFailure("\(importError.localizedDescription) Không dọn được tham chiếu tạm: \(cleanupError.localizedDescription)")
+            }
+            throw importError
         }
-        if !forceNewID, let existing = try frames.listFrames().first(where: {
-            $0.name.lowercased() == packFrame.name.lowercased()
-        }), let revisionID = existing.currentRevisionID {
-            _ = try frames.saveConfiguredRevision(frameID: existing.id, expectedRevisionID: revisionID,
-                name: existing.name, draft: draft, slots: slots, stagedOwnerID: ownerKey,
-                explicitWhite: packFrame.explicitWhite == true, categoryName: packFrame.category)
-            return existing.id
-        }
-        let name = FrameRepository.uniqueName(base: packFrame.name, existing: try frames.listFrames().map(\.name))
-        return try frames.createConfiguredFrame(name: name, categoryID: nil, draft: draft, slots: slots,
-            stagedOwnerID: ownerKey, explicitWhite: packFrame.explicitWhite == true,
-            categoryName: packFrame.category).id
     }
 }

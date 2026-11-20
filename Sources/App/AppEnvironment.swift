@@ -798,8 +798,10 @@ public final class AppEnvironment: ObservableObject {
                     switch exportResult {
                     case .success(let url):
                         showToast("Auto Export xong: \(url.lastPathComponent)")
-                    case .failure(.exportHistoryNotSaved(let url)):
-                        showToast("Auto Export đã lưu \(url.lastPathComponent), chưa ghi được lịch sử", kind: .warning)
+                    case .failure(.exportHistoryNotSaved(let file)):
+                        showToast("Auto Export đã lưu \(file.url.lastPathComponent), chưa ghi được lịch sử", kind: .warning)
+                    case .failure(.exportLocationUnconfirmed):
+                        showToast(AppError.exportLocationUnconfirmed.message, kind: .warning)
                     case .failure(let error):
                         showToast("Auto Export lỗi: \(error.message) — phiên vẫn an toàn trong Thư viện", kind: .warning)
                     }

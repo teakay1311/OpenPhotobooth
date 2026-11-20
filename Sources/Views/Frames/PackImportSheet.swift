@@ -166,14 +166,22 @@ struct PackImportRow: View {
                             .foregroundStyle(.orange)
                     }
                 }
+                if choice == .replace, let target = entry.replacementTarget {
+                    Text("Khung đích: \(target.name)").font(.caption2).foregroundStyle(.secondary)
+                }
             }
             Spacer()
             Picker("", selection: $choice) {
-                ForEach(PackDuplicatePolicy.allCases, id: \.self) { Text($0.label).tag($0) }
+                Text(PackDuplicatePolicy.skip.label).tag(PackDuplicatePolicy.skip)
+                Text(PackDuplicatePolicy.copy.label).tag(PackDuplicatePolicy.copy)
+                if entry.replacementTarget != nil {
+                    Text(PackDuplicatePolicy.replace.label).tag(PackDuplicatePolicy.replace)
+                }
             }
             .frame(width: 120)
             .labelsHidden()
             .disabled(isLocked)
+            .help(entry.replacementUnavailableReason ?? "Chọn cách nhập khung")
 
             if let st = status {
                 switch st {

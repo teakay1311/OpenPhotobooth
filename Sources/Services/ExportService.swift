@@ -3,6 +3,8 @@ import CoreGraphics
 import CoreImage
 import ImageIO
 import UniformTypeIdentifiers
+import CryptoKit
+import Darwin
 
 /// Build CompositionModel từ SessionDetail — DUY NHẤT điểm nạp ảnh + face (I-05).
 /// Ảnh nguồn đã chuẩn hóa orientation + OutputMirror + photoRotation trước khi render.
@@ -305,12 +307,24 @@ public final class SessionRenderBuilder: @unchecked Sendable {
     }
 }
 
+public struct ExportedFile: Equatable, Sendable {
+    public let url: URL
+    public let sha256: String
+}
+
 /// ExportService (§11.2): render → encode → ghi .partial → rename → ExportRecord.
 public final class ExportService: @unchecked Sendable {
     private let sessions: SessionRepository
     private let builder: SessionRenderBuilder
     private let trashRepo: TrashRepository
     private let layout: FileLayout
+
+    enum FileCommitStep {
+        case beforeCoordination, insideCoordination, beforeMetadata, beforeRename, afterRename, beforeHistoryValidation
+    }
+    #if DEBUG
+    var onFileCommitForTesting: (@Sendable (FileCommitStep, URL) throws -> Void)?
+    #endif
 
     public init(sessions: SessionRepository, builder: SessionRenderBuilder,
                 trashRepo: TrashRepository, layout: FileLayout) {
@@ -340,6 +354,26 @@ public final class ExportService: @unchecked Sendable {
         }
     }
 
+    struct DirectoryIdentity: Equatable, Sendable {
+        private let device: dev_t
+        private let inode: ino_t
+        private let generation: UInt32
+
+        fileprivate init(_ info: stat) {
+            device = info.st_dev
+            inode = info.st_ino
+            generation = info.st_gen
+        }
+
+        static func read(_ folder: URL) throws -> Self {
+            let accessing = folder.startAccessingSecurityScopedResource()
+            defer { if accessing { folder.stopAccessingSecurityScopedResource() } }
+            let fd = try ExportDestination.openDirectory(folder)
+            defer { close(fd) }
+            return Self(try ExportDestination.info(fd))
+        }
+    }
+
     public struct ExportRequest: Sendable {
         public var sessionID: String
         public var format: ExportImageFormat
@@ -352,6 +386,7 @@ public final class ExportService: @unchecked Sendable {
         public var replaceExisting: Bool
         var acceptedPreview: PreviewIdentity?
         var destinationBookmark: TrashRepository.BookmarkUse?
+        var selectedFolderIdentity: DirectoryIdentity?
 
         public init(sessionID: String, format: ExportImageFormat, quality: Int,
                     width: Int, height: Int, filenameBase: String,
@@ -377,6 +412,12 @@ public final class ExportService: @unchecked Sendable {
     @discardableResult
     public func export(detail: SessionDetail, request: ExportRequest,
                        parentToken: OperationCoordinator.OperationToken? = nil) async throws -> (ExportRecordModel, URL) {
+        let (record, file) = try await exportFile(detail: detail, request: request, parentToken: parentToken)
+        return (record, file.url)
+    }
+
+    func exportFile(detail: SessionDetail, request: ExportRequest,
+                    parentToken: OperationCoordinator.OperationToken? = nil) async throws -> (ExportRecordModel, ExportedFile) {
         guard request.sessionID == detail.session.id else {
             throw AppError.invalidState("Session ID không khớp giữa request và dữ liệu phiên")
         }
@@ -427,6 +468,24 @@ public final class ExportService: @unchecked Sendable {
         let accessing = request.securityScoped && request.destinationFolder.startAccessingSecurityScopedResource()
         defer { if accessing { request.destinationFolder.stopAccessingSecurityScopedResource() } }
 
+        let destination: ExportDestination
+        do {
+            if let expected = request.selectedFolderIdentity, let bookmark = request.destinationBookmark {
+                guard let resolved = try? resolveExportFolder(bookmarkID: bookmark.id),
+                      (try? DirectoryIdentity.read(resolved)) == expected else {
+                    throw AppError.exportFolderChanged
+                }
+            }
+            destination = try ExportDestination(folder: request.destinationFolder, base: filenameBase,
+                                                ext: request.format.fileExtension, replace: request.replaceExisting,
+                                                selectedFolderIdentity: request.selectedFolderIdentity)
+        } catch AppError.exportFolderChanged {
+            // This selection was rejected before an export was attempted.
+            throw AppError.exportFolderChanged
+        } catch {
+            throw exportWriteFailure(error, record: record, filename: "\(filenameBase).\(request.format.fileExtension)")
+        }
+
         // Bước 2: RenderRequest bất biến từ session revision hiện tại (§17.4) — A1: strict validation
         let model = try await builder.buildModelStrict(detail: detail, targetWidth: request.width,
                                                        targetHeight: request.height,
@@ -454,63 +513,68 @@ public final class ExportService: @unchecked Sendable {
             throw AppError.exportFailed(error.localizedDescription)
         }
 
-        // Bước 5: .partial + verify + atomic swap/rename; an toàn với crash và không xóa đích trước verify
-        let fm = FileManager.default
-        var finalName = "\(filenameBase).\(request.format.fileExtension)"
-        var finalURL = request.destinationFolder.appendingPathComponent(finalName)
-        if fm.fileExists(atPath: finalURL.path) && !request.replaceExisting {
-            var n = 1
-            while fm.fileExists(atPath: request.destinationFolder.appendingPathComponent("\(filenameBase) (\(n)).\(request.format.fileExtension)").path) {
-                n += 1
-                if n > 999 {
-                    throw AppError.exportFileExists
-                }
-            }
-            finalName = "\(filenameBase) (\(n)).\(request.format.fileExtension)"
-            finalURL = request.destinationFolder.appendingPathComponent(finalName)
-        }
-
-        // Tên .partial mang ID của thao tác xuất để tránh xung đột đa tiến trình/luồng
-        let partialURL = request.destinationFolder.appendingPathComponent("\(finalName).\(record.id).partial")
+        let finalName = destination.name
+        let partialName = "\(finalName).\(record.id).partial"
+        #if DEBUG
+        let hook = onFileCommitForTesting
+        #else
+        let hook: (@Sendable (FileCommitStep, URL) throws -> Void)? = nil
+        #endif
+        let output: ExportDestination.Output
         do {
-            try encoded.write(to: partialURL, options: .atomic)
-            guard encoded.count > 0, Hashing.sha256Hex(encoded) == Hashing.sha256Hex(fileURL: partialURL) else {
-                throw AppError.ioFailure("Verify export thất bại")
+            try Task.checkCancellation()
+            let writer = Task.detached(priority: .userInitiated) {
+                try destination.write(encoded, partialName: partialName, hook: hook)
             }
-            if fm.fileExists(atPath: finalURL.path) && request.replaceExisting {
-                // Thay thế nguyên tử an toàn: chỉ hoán đổi sau khi .partial đã xác thực, file cũ không bị xóa trước
-                _ = try fm.replaceItemAt(finalURL, withItemAt: partialURL, backupItemName: nil, options: [])
-            } else {
-                try fm.moveItem(at: partialURL, to: finalURL)
-            }
+            output = try await withTaskCancellationHandler { try await writer.value } onCancel: { writer.cancel() }
         } catch {
-            try? fm.removeItem(at: partialURL)
-            record.status = .failed
-            record.filename = finalName
-            _ = try? sessions.insertExportRecord(record)
-            EventBus.shared.post(.exportFinished(sessionID: request.sessionID, recordID: record.id, success: false))
-            if (error as? AppError)?.code == "E-STO-01" {
-                throw AppError.diskFull
-            }
-            throw AppError.exportFailed(error.localizedDescription)
+            if error is CancellationError { throw error }
+            throw exportWriteFailure(error, record: record, filename: finalName)
         }
 
         // Bước 6: ExportRecord success (file vẫn giữ nếu DB fail — §11.2.6)
-        record.filename = finalName
-        record.destinationDisplayPath = finalURL.path
-        record.destinationBookmarkID = request.destinationBookmark?.id
-        record.sha256 = Hashing.sha256Hex(encoded)
-        record.status = .success
-        record.completedAtMs = Time.nowMs()
+        let file = ExportedFile(url: output.url, sha256: Hashing.sha256Hex(encoded))
+        var completed = record
+        completed.filename = finalName
+        completed.destinationDisplayPath = file.url.path
+        completed.destinationBookmarkID = request.destinationBookmark?.id
+        completed.sha256 = file.sha256
+        completed.status = .success
+        completed.completedAtMs = Time.nowMs()
         do {
-            _ = try sessions.insertExportRecord(record)
+            try sessions.insertExportRecord(completed, verifyOutput: {
+                try hook?(.beforeHistoryValidation, output.url)
+                try destination.verify(output)
+            })
+        } catch AppError.exportLocationUnconfirmed {
+            throw exportWriteFailure(AppError.exportLocationUnconfirmed, record: record, filename: finalName)
         } catch {
+            // A database error can occur even before the verification closure runs.
+            do { try destination.verify(output) }
+            catch { throw exportWriteFailure(error, record: record, filename: finalName) }
             Log.export.error("Ảnh đã lưu nhưng chưa ghi lịch sử xuất: \(error.localizedDescription, privacy: .public)")
             EventBus.shared.post(.exportFinished(sessionID: request.sessionID, recordID: record.id, success: false))
-            throw AppError.exportHistoryNotSaved(finalURL)
+            throw AppError.exportHistoryNotSaved(file)
         }
         EventBus.shared.post(.exportFinished(sessionID: request.sessionID, recordID: record.id, success: true))
-        return (record, finalURL)
+        return (completed, file)
+    }
+
+    private func exportWriteFailure(_ error: Error, record: ExportRecordModel, filename: String) -> AppError {
+        var failed = record
+        failed.status = .failed
+        failed.filename = filename
+        _ = try? sessions.insertExportRecord(failed)
+        EventBus.shared.post(.exportFinished(sessionID: record.sessionID, recordID: record.id, success: false))
+        if let appError = error as? AppError {
+            switch appError {
+            case .diskFull, .exportFileExists, .exportFailed, .exportLocationUnconfirmed, .exportFolderChanged:
+                return appError
+            default: break
+            }
+        }
+        if (error as? POSIXError)?.code == .ENOSPC { return .diskFull }
+        return .exportFailed(error.localizedDescription)
     }
 
     /// Chuẩn hóa tên file: bỏ ký tự tạo thư mục con hoặc cấm trên APFS, trim, fallback tên mặc định.
@@ -575,5 +639,252 @@ public final class ExportService: @unchecked Sendable {
         } catch {
             return .failure(.exportFailed(error.localizedDescription))
         }
+    }
+}
+
+/// Keep selection, staging and the final rename relative to the same opened export folder.
+private final class ExportDestination: @unchecked Sendable {
+    struct Output: Sendable {
+        let url: URL
+        let version: stat
+    }
+
+    let name: String
+    private let url: URL
+    private let directory: Int32
+    private let expected: stat?
+
+    init(folder: URL, base: String, ext: String, replace: Bool,
+         selectedFolderIdentity: ExportService.DirectoryIdentity?) throws {
+        guard !base.utf8.contains(0) else {
+            throw AppError.exportFailed("Tên tệp hoặc thư mục xuất không hợp lệ.")
+        }
+        let fd: Int32
+        do {
+            fd = try Self.openDirectory(folder)
+        } catch let error as POSIXError where selectedFolderIdentity != nil && [.ENOENT, .ENOTDIR, .EACCES, .EPERM].contains(error.code) {
+            throw AppError.exportFolderChanged
+        }
+        do {
+            if let selectedFolderIdentity, ExportService.DirectoryIdentity(try Self.info(fd)) != selectedFolderIdentity {
+                throw AppError.exportFolderChanged
+            }
+            var name = "\(base).\(ext)"
+            var entry = try Self.entry(in: fd, name: name)
+            if replace {
+                if let entry, !Self.isRegular(entry) {
+                    throw AppError.exportFailed("Đích trùng tên không phải tệp thường. Hãy chọn tên khác hoặc tắt ghi đè.")
+                }
+            } else {
+                var suffix = 0
+                while entry != nil {
+                    suffix += 1
+                    guard suffix <= 999 else { throw AppError.exportFileExists }
+                    name = "\(base) (\(suffix)).\(ext)"
+                    entry = try Self.entry(in: fd, name: name)
+                }
+            }
+            self.directory = fd
+            self.name = name
+            self.url = folder.appendingPathComponent(name)
+            self.expected = entry
+        } catch {
+            close(fd)
+            throw error
+        }
+    }
+
+    deinit { close(directory) }
+
+    func write(_ encoded: Data, partialName: String,
+               hook: (@Sendable (ExportService.FileCommitStep, URL) throws -> Void)?) throws -> Output {
+        try Task.checkCancellation()
+        let fd = openat(directory, partialName, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode_t(0o666))
+        guard fd >= 0 else { throw Self.posix(errno) }
+        defer {
+            if let partial = try? Self.entry(in: directory, name: partialName),
+               let opened = try? Self.info(fd), Self.sameItem(partial, opened) {
+                _ = unlinkat(directory, partialName, 0)
+            }
+            close(fd)
+        }
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+        try handle.write(contentsOf: encoded)
+        try handle.seek(toOffset: 0)
+        var hash = SHA256()
+        while let chunk = try handle.read(upToCount: 1 << 20), !chunk.isEmpty { hash.update(data: chunk) }
+        guard !encoded.isEmpty, hash.finalize() == SHA256.hash(data: encoded) else {
+            throw AppError.ioFailure("Verify export thất bại")
+        }
+
+        try hook?(.beforeCoordination, url)
+        if let expected {
+            let coordinator = NSFileCoordinator()
+            var coordinationError: NSError?
+            var result: Result<Output, Error>?
+            coordinator.coordinate(writingItemAt: url, options: .forReplacing, error: &coordinationError) { coordinatedURL in
+                result = Result {
+                    try hook?(.insideCoordination, self.url)
+                    try self.requireSameFolder(coordinatedURL)
+                    try self.requireUnchanged(expected)
+                    let old = openat(self.directory, self.name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+                    guard old >= 0 else { throw Self.posix(errno) }
+                    defer { close(old) }
+                    let metadata = try Self.info(old)
+                    guard Self.sameVersion(metadata, expected) else { throw Self.destinationChanged }
+                    try hook?(.beforeMetadata, self.url)
+                    try Self.copyMetadata(from: old, metadata: metadata, to: fd)
+                    return try self.commit(partialName, fd: fd, flags: UInt32(RENAME_NOFOLLOW_ANY), hook: hook)
+                }
+            }
+            if let result { return try result.get() }
+            try requireSameFolder(url)
+            throw coordinationError ?? Self.destinationChanged as NSError
+        } else {
+            return try commit(partialName, fd: fd, flags: UInt32(RENAME_NOFOLLOW_ANY | RENAME_EXCL), hook: hook)
+        }
+    }
+
+    private func commit(_ partial: String, fd: Int32, flags: UInt32,
+                        hook: (@Sendable (ExportService.FileCommitStep, URL) throws -> Void)?) throws -> Output {
+        try hook?(.beforeRename, url)
+        try Task.checkCancellation()
+        guard let staged = try Self.entry(in: directory, name: partial), Self.isRegular(staged),
+              Self.sameItem(staged, try Self.info(fd)) else { throw Self.destinationChanged }
+        try requireSameFolder(url)
+        if let expected { try requireUnchanged(expected) }
+        // Non-swap rename cannot displace a directory. The final entry is never followed;
+        // a process bypassing file coordination can still change it after the check.
+        guard renameatx_np(directory, partial, directory, name, flags) == 0 else {
+            let code = errno
+            if code == EEXIST { throw AppError.exportFileExists }
+            if code == EISDIR || code == ELOOP { throw Self.destinationChanged }
+            throw Self.posix(code)
+        }
+        do {
+            // Capture the version after rename because rename may change ctime.
+            let output = Output(url: url, version: try Self.info(fd))
+            try hook?(.afterRename, url)
+            try verify(output)
+            return output
+        } catch {
+            throw AppError.exportLocationUnconfirmed
+        }
+    }
+
+    func verify(_ output: Output) throws {
+        do { try requireSameFolder(output.url) }
+        catch { throw AppError.exportLocationUnconfirmed }
+        var current = stat()
+        guard lstat(output.url.path, &current) == 0, Self.sameVersion(current, output.version) else {
+            throw AppError.exportLocationUnconfirmed
+        }
+    }
+
+    private func requireUnchanged(_ expected: stat) throws {
+        guard let current = try Self.entry(in: directory, name: name), Self.sameVersion(current, expected) else {
+            throw Self.destinationChanged
+        }
+    }
+
+    private func requireSameFolder(_ coordinatedURL: URL) throws {
+        let current = open(coordinatedURL.deletingLastPathComponent().path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard current >= 0 else {
+            let code = errno
+            if code == ENOENT || code == ENOTDIR { throw AppError.exportFolderChanged }
+            throw Self.posix(code)
+        }
+        defer { close(current) }
+        guard Self.sameItem(try Self.info(current), try Self.info(directory)) else {
+            throw AppError.exportFolderChanged
+        }
+        guard coordinatedURL.lastPathComponent == name else { throw Self.destinationChanged }
+    }
+
+    private static var destinationChanged: AppError {
+        .exportFailed("Tệp đích đã thay đổi. Hãy kiểm tra và xuất lại.")
+    }
+
+    static func openDirectory(_ folder: URL) throws -> Int32 {
+        guard folder.isFileURL, !folder.path.utf8.contains(0) else {
+            throw AppError.exportFailed("Tên tệp hoặc thư mục xuất không hợp lệ.")
+        }
+        let fd = open(folder.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard fd >= 0 else { throw posix(errno) }
+        return fd
+    }
+
+    private static func entry(in directory: Int32, name: String) throws -> stat? {
+        var value = stat()
+        if fstatat(directory, name, &value, AT_SYMLINK_NOFOLLOW) == 0 { return value }
+        let code = errno
+        if code == ENOENT { return nil }
+        throw posix(code)
+    }
+
+    static func info(_ fd: Int32) throws -> stat {
+        var value = stat()
+        guard fstat(fd, &value) == 0 else { throw posix(errno) }
+        return value
+    }
+
+    private static func isRegular(_ info: stat) -> Bool { info.st_mode & S_IFMT == S_IFREG }
+
+    private static func sameItem(_ a: stat, _ b: stat) -> Bool {
+        a.st_dev == b.st_dev && a.st_ino == b.st_ino && a.st_gen == b.st_gen
+    }
+
+    private static func sameVersion(_ a: stat, _ b: stat) -> Bool {
+        isRegular(a) && sameItem(a, b) && a.st_size == b.st_size &&
+        a.st_mtimespec.tv_sec == b.st_mtimespec.tv_sec && a.st_mtimespec.tv_nsec == b.st_mtimespec.tv_nsec &&
+        a.st_ctimespec.tv_sec == b.st_ctimespec.tv_sec && a.st_ctimespec.tv_nsec == b.st_ctimespec.tv_nsec
+    }
+
+    private static func copyMetadata(from old: Int32, metadata: stat, to staged: Int32) throws {
+        var birth = metadata.st_birthtimespec
+        if birth.tv_sec != 0 || birth.tv_nsec != 0 {
+            var attributes = attrlist()
+            attributes.bitmapcount = UInt16(ATTR_BIT_MAP_COUNT)
+            attributes.commonattr = UInt32(ATTR_CMN_CRTIME)
+            guard fsetattrlist(staged, &attributes, &birth, MemoryLayout<timespec>.size, 0) == 0 else { throw posix(errno) }
+        }
+        for key in ["com.apple.FinderInfo", "com.apple.metadata:_kMDItemUserTags", "com.apple.metadata:kMDItemFinderComment"] {
+            guard var bytes = try attribute(key, fd: old) else { continue }
+            if key == "com.apple.FinderInfo" {
+                // Only the label/color bits belong to the old image, not its Finder type or flags.
+                guard bytes.count == 32 else { throw AppError.ioFailure("Nhãn Finder của tệp đích không hợp lệ") }
+                let label = bytes[9] & 0x0e
+                bytes = Data(repeating: 0, count: 32)
+                bytes[9] = label
+            }
+            let status = bytes.withUnsafeBytes { fsetxattr(staged, key, $0.baseAddress, $0.count, 0, 0) }
+            guard status == 0 else { throw posix(errno) }
+        }
+        guard fchmod(staged, metadata.st_mode & mode_t(0o777)) == 0 else { throw posix(errno) }
+        if let acl = acl_get_fd_np(old, ACL_TYPE_EXTENDED) {
+            defer { acl_free(UnsafeMutableRawPointer(acl)) }
+            guard acl_set_fd_np(staged, acl, ACL_TYPE_EXTENDED) == 0 else { throw posix(errno) }
+        } else {
+            let code = errno
+            guard [ENOENT, ENOATTR, ENOTSUP].contains(code) else { throw posix(code) }
+        }
+    }
+
+    private static func attribute(_ key: String, fd: Int32) throws -> Data? {
+        let count = fgetxattr(fd, key, nil, 0, 0, 0)
+        if count < 0 {
+            let code = errno
+            if code == ENOATTR || code == ENOTSUP { return nil }
+            throw posix(code)
+        }
+        var bytes = Data(count: count)
+        let read = bytes.withUnsafeMutableBytes { fgetxattr(fd, key, $0.baseAddress, $0.count, 0, 0) }
+        guard read >= 0 else { throw posix(errno) }
+        guard read == count else { throw destinationChanged }
+        return bytes
+    }
+
+    private static func posix(_ code: Int32) -> POSIXError {
+        POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
     }
 }

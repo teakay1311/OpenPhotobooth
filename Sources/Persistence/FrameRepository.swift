@@ -184,18 +184,20 @@ public final class FrameRepository: @unchecked Sendable {
     }
 
     @discardableResult
-    func saveConfiguredRevision(frameID: String, expectedRevisionID: String, name: String,
+    func saveConfiguredRevision(frameID: String, expectedRevisionID: String, name: String?,
                                 draft: FrameRevision, slots: [FrameSlot], stagedOwnerID: String,
-                                explicitWhite: Bool, categoryID: String? = nil, categoryName: String? = nil) throws -> FrameRevision {
-        let token = try OperationCoordinator.shared.acquire(key: "frame:\(frameID)", reason: "Lưu bố cục khung")
+                                explicitWhite: Bool, categoryID: String? = nil, categoryName: String? = nil,
+                                parentToken: OperationCoordinator.OperationToken? = nil) throws -> FrameRevision {
+        let token = try OperationCoordinator.shared.acquire(key: "frame:\(frameID)", reason: "Lưu bố cục khung", parentToken: parentToken)
         defer { token.release() }
-        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else { throw AppError.invalidState("Tên khung không được để trống") }
+        let name = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard name?.isEmpty != true else { throw AppError.invalidState("Tên khung không được để trống") }
         try requireConfigured(draft, slots: slots)
         return try db.withTransaction { tx in
             let revision = try writeRevision(frameID: frameID, draft: draft, slots: slots,
                 replacing: expectedRevisionID, stagedOwnerID: stagedOwnerID, tx: tx)
-            try tx.run("UPDATE frames SET name=?, validation_status='ready' WHERE id=?", [.text(name), .text(frameID)])
+            try tx.run("UPDATE frames SET name=COALESCE(?, name), validation_status='ready' WHERE id=?",
+                       [name.map(SQLiteValue.text) ?? .null, .text(frameID)])
             if let categoryID = try resolveCategory(categoryName, tx: tx) ?? categoryID {
                 try tx.run("UPDATE frames SET category_id=? WHERE id=?", [.text(categoryID), .text(frameID)])
             }

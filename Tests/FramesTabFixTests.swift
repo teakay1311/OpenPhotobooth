@@ -216,6 +216,142 @@ final class FramesTabFixTests: XCTestCase {
         XCTAssertEqual(sessionDetail.snapshot.id, snap.id)
     }
 
+    private func configuredPackFrame(_ name: String, repo: FrameRepository, categoryID: String? = nil) throws -> Frame {
+        let slot = FrameSlot(captureIndex: 1, x: 0.17, y: 0.21, width: 0.6, height: 0.5, defaultCropMode: .fit)
+        return try repo.createConfiguredFrame(name: name, imageData: createDummyImage(width: 512, height: 512),
+            mediaType: "image/png", role: .frameBackground, categoryID: categoryID, slots: [slot])
+    }
+
+    func testPackReplaceUsesPinnedIDAndKeepsExistingSessionSnapshot() async throws {
+        let a = try configuredPackFrame("QA original name", repo: env.frames)
+        let pack = try env.packService.buildPack(name: "QA pinned identity", frameIDs: [a.id])
+        try env.frames.renameFrame(id: a.id, to: "QA renamed A")
+        let four = try XCTUnwrap(env.frames.listReadyFrames().first { $0.name == "Lưới 4 ảnh" })
+        let b = try env.frames.duplicateFrame(id: four.id)
+        try env.frames.renameFrame(id: b.id, to: a.name)
+        let bRevision = try XCTUnwrap(env.frames.getFrame(id: b.id)?.currentRevisionID)
+        var draft = try XCTUnwrap(env.frames.getRevision(id: XCTUnwrap(env.frames.getFrame(id: a.id)?.currentRevisionID)))
+        var slots = try env.frames.getSlots(revisionID: draft.id)
+        slots[0].x = 0.26
+        draft = try env.frames.commitRevision(frameID: a.id, draft: draft, slots: slots)
+        let oldSnapshot = try env.frames.createSnapshot(frameID: a.id)
+        let oldSession = try env.sessions.createSession(snapshot: oldSnapshot, mode: .manual, cameraID: nil,
+            defaults: env.settings.sessionDefaultsSnapshot())
+        let img = createDummyImage(width: 400, height: 400)
+        _ = try await env.safetySave.savePhoto(sessionID: oldSession.id, captureIndex: 1, payloadData: img,
+            requestID: UUID().uuidString, width: 400, height: 400, orientation: 1, codec: "png", colorProfile: nil)
+        let oldDetail = try XCTUnwrap(env.sessions.getDetail(sessionID: oldSession.id))
+        let previewBefore = await env.renderBuilder.renderPreview(detail: oldDetail, maxDimension: 300)
+        let oldPixels = try ExportService.encode(cg: XCTUnwrap(previewBefore), format: .png, quality: 95)
+
+        let preview = try env.packService.loadPack(data: pack)
+        XCTAssertEqual(preview.entries.first?.existingFrameID, a.id)
+        XCTAssertEqual(preview.entries.first?.replacementTarget?.revisionID, draft.id)
+        let result = try env.packService.applyImportDetailed(result: preview,
+            choices: [.init(packFrameID: a.id, policy: .replace, selected: true)], data: pack)
+        XCTAssertEqual(result[a.id], .replaced(frameID: a.id))
+        let updated = try XCTUnwrap(env.frames.getFrame(id: a.id))
+        XCTAssertEqual(updated.name, "QA renamed A")
+        XCTAssertNotEqual(updated.currentRevisionID, draft.id)
+        XCTAssertEqual(try env.frames.getFrame(id: b.id)?.currentRevisionID, bRevision)
+        XCTAssertEqual(try env.frames.getSlots(revisionID: bRevision).count, 4)
+
+        let freshSnapshot = try env.frames.createSnapshot(frameID: a.id)
+        XCTAssertEqual(freshSnapshot.sourceFrameRevisionID, updated.currentRevisionID)
+        XCTAssertEqual(try XCTUnwrap(freshSnapshot.slots.first).x, 0.17, accuracy: 0.001)
+        let reopened = try XCTUnwrap(env.sessions.getDetail(sessionID: oldSession.id))
+        XCTAssertEqual(reopened.snapshot, oldSnapshot)
+        XCTAssertEqual(reopened.currentRevisions(), oldDetail.currentRevisions())
+        let previewAfter = await env.renderBuilder.renderPreview(detail: reopened, maxDimension: 300)
+        XCTAssertEqual(try ExportService.encode(cg: XCTUnwrap(previewAfter), format: .png, quality: 95), oldPixels)
+        let request = ExportService.ExportRequest(sessionID: oldSession.id, format: .png, quality: 95,
+            width: 512, height: 512, filenameBase: "old-session", destinationFolder: tempDir)
+        let (record, output) = try await env.exportService.export(detail: reopened, request: request)
+        XCTAssertEqual(record.sha256, Hashing.sha256Hex(fileURL: output))
+        XCTAssertNil(try env.db.integrityCheck())
+        XCTAssertTrue(try env.db.foreignKeyCheck().isEmpty)
+    }
+
+    func testPackReplaceRequiresUniqueTargetAndNeverCreatesImplicitCopy() throws {
+        let sender = AppEnvironment(inMemory: true)
+        let first = try configuredPackFrame("External A", repo: sender.frames)
+        let second = try sender.frames.duplicateFrame(id: first.id)
+        let pack = try sender.packService.buildPack(name: "External pack", frameIDs: [first.id, second.id])
+        let initialCount = try env.frames.listFrames().count
+        let preview = try env.packService.loadPack(data: pack)
+        let firstReplace = FramePackService.ImportChoice(packFrameID: first.id, policy: .replace, selected: true)
+        let secondReplace = FramePackService.ImportChoice(packFrameID: second.id, policy: .replace, selected: true)
+
+        let missing = try env.packService.applyImportDetailed(result: preview, choices: [firstReplace], data: pack)
+        guard case .failedBeforeWrite = missing[first.id] else { return XCTFail("Missing target must fail") }
+        XCTAssertEqual(try env.frames.listFrames().count, initialCount)
+        let copy = try env.packService.applyImportDetailed(result: preview,
+            choices: [.init(packFrameID: first.id, policy: .copy, selected: true)], data: pack)
+        guard case .imported(let localID) = copy[first.id] else { return XCTFail("Explicit copy should import") }
+        XCTAssertNotEqual(localID, first.id)
+        let unique = try env.packService.loadPack(data: pack)
+        XCTAssertEqual(unique.entries.map(\.existingFrameID), [localID, localID])
+        let previous = try XCTUnwrap(env.frames.getFrame(id: localID)?.currentRevisionID)
+        let conflicting = try env.packService.applyImportDetailed(result: unique, choices: [firstReplace, secondReplace], data: pack)
+        for id in [first.id, second.id] {
+            guard case .failedBeforeWrite = conflicting[id] else { return XCTFail("Shared target must fail for both rows") }
+        }
+        XCTAssertEqual(try env.frames.getFrame(id: localID)?.currentRevisionID, previous)
+        let success = try env.packService.applyImportDetailed(result: unique, choices: [firstReplace], data: pack)
+        XCTAssertEqual(success[first.id], .replaced(frameID: localID))
+        let stale = try env.packService.applyImportDetailed(result: unique, choices: [firstReplace], data: pack)
+        guard case .failedBeforeWrite = stale[first.id] else { return XCTFail("Stale preview must not resolve again") }
+
+        _ = try env.frames.duplicateFrame(id: localID)
+        let ambiguous = try env.packService.loadPack(data: pack)
+        XCTAssertTrue(ambiguous.entries.allSatisfy { $0.isDuplicate && $0.existingFrameID == nil })
+        let rejected = try env.packService.applyImportDetailed(result: ambiguous, choices: [firstReplace], data: pack)
+        guard case .failedBeforeWrite = rejected[first.id] else { return XCTFail("Ambiguous hash must fail") }
+        XCTAssertEqual(try env.frames.listFrames().count, initialCount + 2)
+    }
+
+    func testPackReplaceRollbackLeavesOldRevisionAndSharedSnapshotReferences() async throws {
+        let category = try env.frames.createCategory(name: "QA pack category")
+        let target = try configuredPackFrame("QA rollback target", repo: env.frames, categoryID: category.id)
+        let shared = try env.frames.duplicateFrame(id: target.id)
+        let snapshot = try env.frames.createSnapshot(frameID: target.id)
+        let session = try env.sessions.createSession(snapshot: snapshot, mode: .manual, cameraID: nil,
+            defaults: env.settings.sessionDefaultsSnapshot())
+        _ = try await env.safetySave.savePhoto(sessionID: session.id, captureIndex: 1, payloadData: createDummyImage(width: 400, height: 400),
+            requestID: UUID().uuidString, width: 400, height: 400, orientation: 1, codec: "png", colorProfile: nil)
+        let pack = try env.packService.buildPack(name: "QA rollback", frameIDs: [target.id])
+        let preview = try env.packService.loadPack(data: pack)
+        let revision = try XCTUnwrap(env.frames.getFrame(id: target.id)?.currentRevisionID)
+        let slots = try env.frames.getSlots(revisionID: revision)
+        let references = try env.db.query("SELECT * FROM asset_references ORDER BY asset_id, owner_type, owner_id, purpose")
+        try env.db.run("""
+            CREATE TEMP TRIGGER fail_pack_replace BEFORE INSERT ON frame_slots
+            WHEN (SELECT frame_id FROM frame_revisions WHERE id=NEW.frame_revision_id) = '\(target.id)'
+            BEGIN SELECT RAISE(ABORT, 'QA replacement transaction failed'); END
+            """)
+        let choice = FramePackService.ImportChoice(packFrameID: target.id, policy: .replace, selected: true)
+        let failed = try env.packService.applyImportDetailed(result: preview, choices: [choice], data: pack)
+        guard case .partiallyWritten(let reason) = failed[target.id] else { return XCTFail("Expected staged write failure") }
+        XCTAssertTrue(reason.contains("QA replacement transaction failed"))
+        XCTAssertEqual(try env.frames.getFrame(id: target.id)?.currentRevisionID, revision)
+        XCTAssertEqual(try env.frames.getFrame(id: target.id)?.categoryID, category.id)
+        XCTAssertEqual(try env.frames.getSlots(revisionID: revision), slots)
+        XCTAssertEqual(try env.db.query("SELECT * FROM asset_references ORDER BY asset_id, owner_type, owner_id, purpose"), references)
+        let detail = try XCTUnwrap(env.sessions.getDetail(sessionID: session.id))
+        XCTAssertEqual(detail.snapshot, snapshot)
+        let render = await env.renderBuilder.renderPreview(detail: detail, maxDimension: 300)
+        XCTAssertNotNil(render)
+        let sharedSnapshot = try env.frames.createSnapshot(frameID: shared.id, persist: false)
+        XCTAssertEqual(snapshot.background?.assetID, sharedSnapshot.background?.assetID)
+        XCTAssertFalse(try env.assets.loadData(assetID: XCTUnwrap(sharedSnapshot.background?.assetID)).isEmpty)
+        XCTAssertNil(try env.db.integrityCheck())
+        XCTAssertTrue(try env.db.foreignKeyCheck().isEmpty)
+        try env.db.run("DROP TRIGGER fail_pack_replace")
+        try env.trashService.trashFrame(frameID: target.id)
+        let trashed = try env.packService.applyImportDetailed(result: preview, choices: [choice], data: pack)
+        guard case .failedBeforeWrite = trashed[target.id] else { return XCTFail("Trashed target must not be written") }
+    }
+
     // MARK: - F04: Xuất đúng khung từ lối vào context menu
     func testF04_ExportTargetInitializationAndManifestFiltering() async throws {
         let ready = try env.frames.listReadyFrames()

@@ -156,7 +156,7 @@ public struct LibraryView: View {
             .disabled(!canShare)
 
         Button("Hiện file xuất trong Finder") {
-            vm.revealRecentExport(sessionID: card.id)
+            Task { await vm.revealRecentExport(sessionID: card.id) }
         }
         Divider()
         Button("Xoá cả phiên…", role: .destructive) { sessionToDelete = card }
@@ -285,7 +285,7 @@ struct SessionCardView: View {
             .disabled(!canShare)
 
             Button("Hiện file xuất trong Finder") {
-                vm.revealRecentExport(sessionID: card.id)
+                Task { await vm.revealRecentExport(sessionID: card.id) }
             }
             Divider()
             Button("Xoá cả phiên…", role: .destructive) { onDeleteSession() }

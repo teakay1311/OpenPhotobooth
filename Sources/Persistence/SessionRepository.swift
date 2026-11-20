@@ -1215,7 +1215,20 @@ public final class SessionRepository: @unchecked Sendable {
 
     @discardableResult
     public func insertExportRecord(_ record: ExportRecordModel) throws -> ExportRecordModel {
-        try db.run("""
+        try insertExportRecord(record, run: db.run)
+    }
+
+    /// Verify the output after entering the database queue and immediately before INSERT.
+    func insertExportRecord(_ record: ExportRecordModel, verifyOutput: () throws -> Void) throws {
+        try db.withTransaction { tx in
+            try verifyOutput()
+            _ = try insertExportRecord(record, run: tx.run)
+        }
+    }
+
+    private func insertExportRecord(_ record: ExportRecordModel,
+                                    run: (String, [SQLiteValue]) throws -> Void) throws -> ExportRecordModel {
+        try run("""
             INSERT INTO export_records(id, session_id, session_revision_no, format, filename,
                 destination_display_path, destination_bookmark_id, width, height, quality, sha256, status, created_at_ms, completed_at_ms)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)

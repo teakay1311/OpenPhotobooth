@@ -16,12 +16,15 @@ public final class ExportViewModel: ObservableObject {
         }
     }
     @Published public var filename: String = ""
-    @Published public var folderURL: URL?
+    @Published private var selectedFolder: FolderSelection?
+    public var folderURL: URL? { selectedFolder?.url }
     @Published public var replaceExisting = false
     @Published public private(set) var isExporting = false
-    @Published public private(set) var lastResultURL: URL?
-    @Published private(set) var historySaveFailed = false
+    @Published private var lastResult: ExportResult?
+    public var lastResultURL: URL? { lastResult?.file.url }
+    var historySaveFailed: Bool { lastResult?.historySaveFailed == true }
     @Published public private(set) var errorMessage: String?
+    @Published private(set) var finderWarning: String?
     @Published public private(set) var previewImage: CGImage?
     @Published public private(set) var isPreviewLoading = false
 
@@ -29,10 +32,31 @@ public final class ExportViewModel: ObservableObject {
     public var review: ReviewViewModel?
     private var previewTask: Task<Void, Never>?
     private var acceptedPreview: ExportService.PreviewIdentity?
-    private var destinationBookmark: TrashRepository.BookmarkUse?
-    private var resultBookmark: TrashRepository.BookmarkUse?
+    private var finderRequestID: UUID?
+    private var finderRequestTask: Task<Void, Never>?
+    #if DEBUG
+    var onFinderHashForTesting: (@Sendable (URL) throws -> Void)?
+    #endif
     var canExportPreview: Bool { acceptedPreview != nil && !isPreviewLoading }
     var previewUnavailable: Bool { !isPreviewLoading && previewImage == nil }
+
+    private struct ExportResult {
+        let file: ExportedFile
+        let folder: FolderSelection
+        let historySaveFailed: Bool
+    }
+
+    private struct FolderSelection {
+        let url: URL
+        let identity: ExportService.DirectoryIdentity
+        var bookmark: TrashRepository.BookmarkUse?
+
+        init(url: URL, bookmark: TrashRepository.BookmarkUse? = nil) throws {
+            self.url = url
+            self.identity = try ExportService.DirectoryIdentity.read(url)
+            self.bookmark = bookmark
+        }
+    }
 
     public init(env: AppEnvironment) {
         self.env = env
@@ -44,13 +68,13 @@ public final class ExportViewModel: ObservableObject {
         width = detail.snapshot.canvasWidth
         height = detail.snapshot.canvasHeight
         filename = ExportService.defaultFilenameBase()
+        selectedFolder = nil
         if let bookmarkID = env.settings.exportFolderBookmarkID {
             do {
                 let use = try env.trashRepo.useBookmark(id: bookmarkID)
-                folderURL = try env.exportService.resolveExportFolder(bookmarkID: use.id)
-                destinationBookmark = use
+                let url = try env.exportService.resolveExportFolder(bookmarkID: use.id)
+                selectedFolder = try FolderSelection(url: url, bookmark: use)
             } catch {
-                folderURL = nil
                 errorMessage = "Không còn quyền truy cập thư mục mặc định. Hãy chọn lại."
             }
         }
@@ -141,32 +165,43 @@ public final class ExportViewModel: ObservableObject {
         panel.prompt = "Chọn thư mục"
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
-            Task { @MainActor in
-                self.folderURL = url
-                self.destinationBookmark = nil
-                do {
-                    let id = try self.env.saveDefaultExportFolder(url)
-                    self.destinationBookmark = try self.env.trashRepo.useBookmark(id: id)
-                    self.errorMessage = nil
-                } catch {
-                    self.errorMessage = "Không lưu được thư mục mặc định. Bạn vẫn có thể thử xuất lần này."
-                }
+            Task { @MainActor in self.selectFolder(url) }
+        }
+    }
+
+    func selectFolder(_ url: URL) {
+        guard !isExporting else { return }
+        do {
+            var selection = try FolderSelection(url: url)
+            errorMessage = nil
+            let bookmarkID: String
+            do {
+                bookmarkID = try env.saveDefaultExportFolder(url)
+            } catch {
+                selectedFolder = selection
+                errorMessage = "Không lưu được thư mục mặc định. Bạn vẫn có thể thử xuất lần này."
+                return
             }
+            selection.bookmark = try env.trashRepo.useBookmark(id: bookmarkID)
+            selectedFolder = selection
+        } catch {
+            selectedFolder = nil
+            errorMessage = AppError.exportFolderChanged.message
         }
     }
 
     public func runExport() async {
         guard !isExporting, let review, let detail = currentDetail() else { return }
-        lastResultURL = nil
-        historySaveFailed = false
-        resultBookmark = nil
+        cancelResultReveal()
+        lastResult = nil
+        finderWarning = nil
         errorMessage = nil
         guard let acceptedPreview, acceptedPreview == previewIdentity(detail) else {
             errorMessage = AppError.exportPreviewChanged.message
             updatePreview()
             return
         }
-        guard let folder = folderURL else {
+        guard let folder = selectedFolder else {
             errorMessage = "Chọn thư mục xuất"
             return
         }
@@ -179,34 +214,96 @@ public final class ExportViewModel: ObservableObject {
         var request = ExportService.ExportRequest(
             sessionID: detail.session.id, format: format, quality: quality,
             width: width, height: height, filenameBase: filename,
-            destinationFolder: folder, securityScoped: true, replaceExisting: replaceExisting)
+            destinationFolder: folder.url, securityScoped: true, replaceExisting: replaceExisting)
         request.acceptedPreview = acceptedPreview
-        request.destinationBookmark = destinationBookmark
-        let result = await review.runExport(request: request)
+        request.destinationBookmark = folder.bookmark
+        request.selectedFolderIdentity = folder.identity
+        let result = await review.runExportFile(request: request)
         isExporting = false
         switch result {
-        case .success(let url):
-            lastResultURL = url
-            resultBookmark = request.destinationBookmark
-        case .failure(.exportHistoryNotSaved(let url)):
-            historySaveFailed = true
-            lastResultURL = url
-            resultBookmark = request.destinationBookmark
-            errorMessage = AppError.exportHistoryNotSaved(url).message
+        case .success(let file):
+            lastResult = ExportResult(file: file, folder: folder, historySaveFailed: false)
+        case .failure(.exportHistoryNotSaved(let file)):
+            lastResult = ExportResult(file: file, folder: folder, historySaveFailed: true)
+            errorMessage = AppError.exportHistoryNotSaved(file).message
         case .failure(.exportPreviewChanged):
             errorMessage = AppError.exportPreviewChanged.message
             updatePreview()
+        case .failure(.exportFolderChanged):
+            selectedFolder = nil
+            errorMessage = AppError.exportFolderChanged.message
         case .failure(let error):
             errorMessage = error.message   // không đóng sheet, không ghi success giả (§2.9)
         }
     }
 
-    public func revealResult() {
-        guard let url = lastResultURL else { return }
-        let folder = resultBookmark.flatMap { try? env.exportService.resolveExportFolder(bookmarkID: $0.id) }
-        let accessing = folder?.startAccessingSecurityScopedResource() == true
-        defer { if accessing { folder?.stopAccessingSecurityScopedResource() } }
-        env.shareService.revealInFinder(url)
+    func cancelResultReveal() {
+        finderRequestID = nil
+        finderRequestTask?.cancel()
+        finderRequestTask = nil
+    }
+
+    @discardableResult
+    public func revealResult() -> Task<Void, Never>? {
+        guard let result = lastResult else { return nil }
+        cancelResultReveal()
+        finderWarning = nil
+        let requestID = UUID()
+        finderRequestID = requestID
+        let task = Task<Void, Never> { [weak self] in
+            await self?.reveal(result, requestID: requestID)
+        }
+        finderRequestTask = task
+        return task
+    }
+
+    private func reveal(_ result: ExportResult, requestID: UUID) async {
+        guard finderRequestID == requestID, !Task.isCancelled else { return }
+        defer { if finderRequestID == requestID { finderRequestTask = nil } }
+        let bookmark = result.folder.bookmark
+        defer { withExtendedLifetime(bookmark) {} }
+        do {
+            let resolvedFolder = try bookmark.map { try env.exportService.resolveExportFolder(bookmarkID: $0.id) }
+            let folder = resolvedFolder ?? result.folder.url
+            let url = resolvedFolder?.appendingPathComponent(result.file.url.lastPathComponent) ?? result.file.url
+            let accessing = folder.startAccessingSecurityScopedResource()
+            defer { if accessing { folder.stopAccessingSecurityScopedResource() } }
+            let sha256 = result.file.sha256
+            #if DEBUG
+            let beforeHash = onFinderHashForTesting
+            #else
+            let beforeHash: (@Sendable (URL) throws -> Void)? = nil
+            #endif
+            let check = Task.detached(priority: .userInitiated) {
+                try ExportFileVerifier.check(url, expectedHash: sha256, beforeHash: beforeHash)
+            }
+            let checked = try await withTaskCancellationHandler {
+                try await check.value
+            } onCancel: {
+                check.cancel()
+            }
+            guard finderRequestID == requestID, !Task.isCancelled else { return }
+            switch checked {
+            case .verified(let version):
+                if try ExportFileVerifier.matchesCurrentVersion(url, version) {
+                    env.shareService.revealInFinder(url)
+                } else {
+                    finderWarning = "Tệp xuất đã bị thay thế hoặc chỉnh sửa"
+                }
+            case .modified:
+                finderWarning = "Tệp xuất đã bị thay thế hoặc chỉnh sửa"
+            case .missingOrInvalid:
+                finderWarning = "Không còn tìm thấy tệp xuất tại vị trí đã lưu"
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            guard finderRequestID == requestID, !Task.isCancelled else { return }
+            switch ExportFileVerifier.classifyFileError(error) {
+            case .inaccessible: finderWarning = "Không thể truy cập tệp xuất"
+            case .missingOrInvalid: finderWarning = "Không còn tìm thấy tệp xuất tại vị trí đã lưu"
+            }
+        }
     }
 }
 

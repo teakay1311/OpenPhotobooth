@@ -299,7 +299,7 @@ final class LibraryTabFixTests: XCTestCase {
         let vm = LibraryViewModel(env: env)
 
         // 1. Không có bản xuất thành công
-        vm.revealRecentExport(sessionID: sID)
+        await vm.revealRecentExport(sessionID: sID)
         // Toast "Chưa có bản xuất thành công"
 
         // 2. Tạo 1 bản thành công cũ (tệp thật tồn tại)
@@ -362,7 +362,7 @@ final class LibraryTabFixTests: XCTestCase {
             revealedURL = url
         }
 
-        vm.revealRecentExport(sessionID: sID)
+        await vm.revealRecentExport(sessionID: sID)
         XCTAssertEqual(revealedURL?.path, realFile.path, "Finder phải mở tệp thành công cũ hơn khi tệp mới nhất bị mất")
 
         // 5. Kiểm tra phân loại lỗi qua metadata probe:
@@ -390,6 +390,134 @@ final class LibraryTabFixTests: XCTestCase {
 
         env.shareService.revealInFinderHook = nil
     }
+
+    func testFinderSkipsAnotherSessionsOverwriteAndUsesMatchingHistory() async throws {
+        let firstID = try await seedTestSession(slotsCount: 1, committedShots: 1)
+        let secondID = try await seedTestSession(slotsCount: 1, committedShots: 1)
+        let first = try XCTUnwrap(env.sessions.getDetail(sessionID: firstID))
+        let second = try XCTUnwrap(env.sessions.getDetail(sessionID: secondID))
+        let bookmarkID = try env.saveDefaultExportFolder(tempDir)
+        let folder = try env.exportService.resolveExportFolder(bookmarkID: bookmarkID)
+        var request = ExportService.ExportRequest(sessionID: firstID, format: .png, quality: 95,
+            width: 400, height: 400, filenameBase: "retained", destinationFolder: folder, securityScoped: true)
+        request.destinationBookmark = try env.trashRepo.useBookmark(id: bookmarkID)
+        let (retained, retainedURL) = try await env.exportService.export(detail: first, request: request)
+        request.filenameBase = "shared"
+        let (old, sharedURL) = try await env.exportService.export(detail: first, request: request)
+        request.sessionID = secondID
+        request.width = 520
+        request.replaceExisting = true
+        let (new, newURL) = try await env.exportService.export(detail: second, request: request)
+        XCTAssertEqual(sharedURL, newURL)
+        XCTAssertNotEqual(old.sha256, new.sha256)
+        XCTAssertEqual(new.sha256, Hashing.sha256Hex(fileURL: sharedURL))
+        let vm = LibraryViewModel(env: env)
+        var received: [URL] = []
+        env.shareService.revealInFinderHook = { received.append($0) }
+        defer { env.shareService.revealInFinderHook = nil }
+
+        await vm.revealExport(record: old)
+        XCTAssertTrue(received.isEmpty)
+        XCTAssertEqual(env.toast?.text, "Tệp xuất đã bị thay thế hoặc chỉnh sửa")
+        await vm.revealRecentExport(sessionID: firstID)
+        XCTAssertEqual(received.last?.path, retainedURL.path)
+        XCTAssertEqual(received.last.flatMap { Hashing.sha256Hex(fileURL: $0) }, retained.sha256)
+        await vm.revealRecentExport(sessionID: secondID)
+        XCTAssertEqual(received.map(\.path), [retainedURL.path, newURL.path])
+        XCTAssertEqual(try env.sessions.listExportRecords(sessionID: firstID), [old, retained])
+        XCTAssertEqual(try env.sessions.listExportRecords(sessionID: secondID), [new])
+        print("QA-FINDER firstSessionSHA=\(retained.sha256 ?? "") rejectedSHA=\(new.sha256 ?? "") fallbackVerified=true")
+    }
+
+    func testFinderRejectsModifiedFilesAndSymlinksAndPrioritizesPermissionErrors() async throws {
+        let sessionID = try await seedTestSession(slotsCount: 1, committedShots: 1)
+        let original = createDummyImageData()
+        let edited = createDummyImageData(color: CGColor(red: 0, green: 1, blue: 0, alpha: 1))
+        let file = tempDir.appendingPathComponent("edited.png")
+        try original.write(to: file)
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.truncate(atOffset: 0)
+        try handle.write(contentsOf: edited)
+        try handle.close()
+        let editedRecord = ExportRecordModel(sessionID: sessionID, sessionRevisionNo: 1, format: .png,
+            filename: file.lastPathComponent, destinationDisplayPath: file.path, width: 200, height: 200,
+            sha256: Hashing.sha256Hex(original), status: .success, createdAtMs: 500)
+        let vm = LibraryViewModel(env: env)
+        var received: [URL] = []
+        env.shareService.revealInFinderHook = { received.append($0) }
+        defer { env.shareService.revealInFinderHook = nil }
+        await vm.revealExport(record: editedRecord)
+        XCTAssertTrue(received.isEmpty)
+        XCTAssertEqual(env.toast?.text, "Tệp xuất đã bị thay thế hoặc chỉnh sửa")
+
+        let link = tempDir.appendingPathComponent("linked.png")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: file)
+        var linkedRecord = editedRecord
+        linkedRecord.destinationDisplayPath = link.path
+        linkedRecord.sha256 = Hashing.sha256Hex(edited)
+        await vm.revealExport(record: linkedRecord)
+        XCTAssertTrue(received.isEmpty)
+        XCTAssertEqual(env.toast?.text, "Không còn tìm thấy tệp xuất tại vị trí đã lưu")
+
+        try env.sessions.insertExportRecord(editedRecord)
+        var inaccessible = editedRecord
+        inaccessible.id = "QA-inaccessible"
+        inaccessible.createdAtMs = 1000
+        inaccessible.destinationBookmarkID = "QA-missing-bookmark"
+        try env.sessions.insertExportRecord(inaccessible)
+        await vm.revealRecentExport(sessionID: sessionID)
+        XCTAssertTrue(received.isEmpty)
+        XCTAssertEqual(env.toast?.text, "Có bản xuất nhưng không thể truy cập tệp")
+    }
+
+    #if DEBUG
+    func testNewFinderRequestCancelsOlderReadAndReleasesItsBookmark() async throws {
+        let vm = LibraryViewModel(env: env)
+        let file = tempDir.appendingPathComponent("older.png")
+        let secondURL = tempDir.appendingPathComponent("newer.png")
+        let data = createDummyImageData()
+        try data.write(to: file)
+        try data.write(to: secondURL)
+        let bookmarkID = try env.saveDefaultExportFolder(tempDir)
+        let old = ExportRecordModel(sessionID: "QA-old", sessionRevisionNo: 1, format: .png,
+            filename: file.lastPathComponent, destinationDisplayPath: file.path, destinationBookmarkID: bookmarkID,
+            width: 200, height: 200, sha256: Hashing.sha256Hex(data), status: .success)
+        let new = ExportRecordModel(sessionID: "QA-new", sessionRevisionNo: 1, format: .png,
+            filename: secondURL.lastPathComponent, destinationDisplayPath: secondURL.path,
+            width: 200, height: 200, sha256: Hashing.sha256Hex(data), status: .success)
+        let reading = expectation(description: "First request has opened the file under its bookmark")
+        let releaseRead = DispatchSemaphore(value: 0)
+        vm.onFinderHashForTesting = { url in
+            guard url.lastPathComponent == "older.png" else { return }
+            reading.fulfill()
+            guard releaseRead.wait(timeout: .now() + 8) == .success else {
+                throw AppError.ioFailure("QA read did not resume")
+            }
+            try Task.checkCancellation()
+        }
+        var received: [URL] = []
+        env.shareService.revealInFinderHook = { received.append($0) }
+        let first = Task { await vm.revealExport(record: old) }
+        defer {
+            releaseRead.signal()
+            first.cancel()
+            env.shareService.revealInFinderHook = nil
+        }
+        await fulfillment(of: [reading], timeout: 5)
+        try env.trashRepo.deleteBookmark(id: bookmarkID)
+        XCTAssertNotNil(try env.trashRepo.bookmark(id: bookmarkID))
+
+        await vm.revealExport(record: new)
+        XCTAssertEqual(received.map(\.path), [secondURL.path])
+        env.showToast("QA newer result")
+        releaseRead.signal()
+        await first.value
+        XCTAssertEqual(received.map(\.path), [secondURL.path])
+        XCTAssertEqual(env.toast?.text, "QA newer result")
+        XCTAssertNil(try env.trashRepo.bookmark(id: bookmarkID))
+        print("QA-FINDER-CANCEL olderBookmarkReleased=true laterRequestOnly=true")
+    }
+    #endif
 
     // MARK: - T06: Bố cục Toolbar và Sắp xếp (LIB-02)
     func testT06_SortPickerAndToolbarLayout() async throws {

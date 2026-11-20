@@ -2,6 +2,7 @@ import XCTest
 import CoreGraphics
 import CoreImage
 import UniformTypeIdentifiers
+import Darwin
 @testable import OpenPhotobooth
 
 final class AcceptanceMatrixTests: XCTestCase {
@@ -156,9 +157,10 @@ final class AcceptanceMatrixTests: XCTestCase {
         do {
             _ = try await env.exportService.export(detail: detail, request: request)
             XCTFail("Export cannot report full success without its history")
-        } catch AppError.exportHistoryNotSaved(let url) {
-            XCTAssertEqual(url.lastPathComponent, "PartialExport.png")
-            XCTAssertNotNil(ImageNormalizer.uprightImage(url: url))
+        } catch AppError.exportHistoryNotSaved(let file) {
+            XCTAssertEqual(file.url.lastPathComponent, "PartialExport.png")
+            XCTAssertNotNil(ImageNormalizer.uprightImage(url: file.url))
+            XCTAssertEqual(file.sha256, Hashing.sha256Hex(fileURL: file.url))
         }
         XCTAssertTrue(try env.sessions.listExportRecords(sessionID: setup.session.id).isEmpty)
     }
@@ -186,6 +188,636 @@ final class AcceptanceMatrixTests: XCTestCase {
         let (record, url) = try await env.exportService.export(detail: legacy, request: request)
         XCTAssertEqual(record.status, .success)
         XCTAssertNotNil(ImageNormalizer.uprightImage(url: url))
+    }
+
+    @MainActor
+    func testExportOverwriteRejectsDirectoryAndLinksAndSuffixesOccupiedNames() async throws {
+        let setup = try await createCompleted4PhotoSession()
+        let detail = try XCTUnwrap(env.sessions.getDetail(sessionID: setup.session.id))
+        let folder = env.layout.exportsTempDir
+        let directory = folder.appendingPathComponent("directory.jpg")
+        let marker = directory.appendingPathComponent("keep.txt")
+        let sentinel = Data("keep".utf8)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        try sentinel.write(to: marker)
+        try FileManager.default.createSymbolicLink(atPath: folder.appendingPathComponent("link.jpg").path,
+                                                   withDestinationPath: marker.path)
+        try FileManager.default.createSymbolicLink(atPath: folder.appendingPathComponent("dangling.jpg").path,
+                                                   withDestinationPath: "missing")
+        for name in ["directory", "link", "dangling"] {
+            var request = ExportService.ExportRequest(sessionID: detail.session.id, format: .jpeg, quality: 90,
+                width: 400, height: 400, filenameBase: name, destinationFolder: folder, replaceExisting: true)
+            do {
+                _ = try await env.exportService.export(detail: detail, request: request)
+                XCTFail("Overwrite accepted occupied non-file: \(name)")
+            } catch AppError.exportFailed(let reason) { XCTAssertTrue(reason.contains("không phải tệp thường")) }
+            XCTAssertFalse(try env.sessions.listExportRecords(sessionID: detail.session.id).contains {
+                $0.status == .success && $0.filename == "\(name).jpg"
+            })
+            request.replaceExisting = false
+            let (record, url) = try await env.exportService.export(detail: detail, request: request)
+            XCTAssertEqual(url.lastPathComponent, "\(name) (1).jpg")
+            XCTAssertEqual(record.sha256, Hashing.sha256Hex(fileURL: url))
+        }
+        XCTAssertEqual(try Data(contentsOf: marker), sentinel)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: folder.appendingPathComponent("link.jpg").path), marker.path)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: folder.appendingPathComponent("dangling.jpg").path), "missing")
+        let invalid = ExportService.ExportRequest(sessionID: detail.session.id, format: .jpeg, quality: 90,
+            width: 400, height: 400, filenameBase: "truncated\0name", destinationFolder: folder, replaceExisting: true)
+        do {
+            _ = try await env.exportService.export(detail: detail, request: invalid)
+            XCTFail("An embedded NUL must not reach POSIX path handling")
+        } catch AppError.exportFailed(let reason) { XCTAssertTrue(reason.contains("không hợp lệ")) }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.appendingPathComponent("truncated").path))
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: folder.path).contains { $0.hasSuffix(".partial") })
+    }
+
+    #if DEBUG
+    @MainActor
+    func testExportRechecksIdentityAndRejectsLateConflictsWithoutRemovingTheirBytes() async throws {
+        let setup = try await createCompleted4PhotoSession()
+        let detail = try XCTUnwrap(env.sessions.getDetail(sessionID: setup.session.id))
+        let folder = env.layout.exportsTempDir
+        let original = Data("old bytes".utf8)
+        let concurrent = Data("concurrent bytes".utf8)
+        defer { env.exportService.onFileCommitForTesting = nil }
+        for name in ["other-inode", "late-directory", "late-link", "occupied", "metadata-error"] {
+            let url = folder.appendingPathComponent("\(name).png")
+            if name != "occupied" { try original.write(to: url) }
+            env.exportService.onFileCommitForTesting = { step, target in
+                if step == .beforeCoordination && name == "other-inode" {
+                    try concurrent.write(to: target, options: .atomic)
+                }
+                if step == .beforeMetadata && name == "metadata-error" {
+                    throw AppError.ioFailure("QA metadata failure")
+                }
+                if step == .beforeRename {
+                    switch name {
+                    case "late-directory", "late-link":
+                        try FileManager.default.moveItem(at: target, to: target.appendingPathExtension("old"))
+                        if name == "late-directory" {
+                            try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
+                            try concurrent.write(to: target.appendingPathComponent("keep.txt"))
+                        } else {
+                            try FileManager.default.createSymbolicLink(atPath: target.path, withDestinationPath: target.appendingPathExtension("old").path)
+                        }
+                    case "occupied": try concurrent.write(to: target)
+                    default: break
+                    }
+                }
+            }
+            let request = ExportService.ExportRequest(sessionID: detail.session.id, format: .png, quality: 90,
+                width: 400, height: 400, filenameBase: name, destinationFolder: folder, replaceExisting: true)
+            do {
+                _ = try await env.exportService.export(detail: detail, request: request)
+                XCTFail("Export should reject \(name)")
+            } catch AppError.exportFailed(let reason) where name != "occupied" {
+                XCTAssertTrue(reason.contains(name == "metadata-error" ? "QA metadata failure" : "Tệp đích đã thay đổi"), reason)
+            } catch AppError.exportFileExists where name == "occupied" {}
+            switch name {
+            case "late-directory": XCTAssertEqual(try Data(contentsOf: url.appendingPathComponent("keep.txt")), concurrent)
+            case "late-link":
+                XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: url.path), url.appendingPathExtension("old").path)
+                XCTAssertEqual(try Data(contentsOf: url.appendingPathExtension("old")), original)
+            case "metadata-error": XCTAssertEqual(try Data(contentsOf: url), original)
+            default: XCTAssertEqual(try Data(contentsOf: url), concurrent)
+            }
+        }
+        XCTAssertFalse(try env.sessions.listExportRecords(sessionID: detail.session.id).contains { $0.status == .success })
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: folder.path).contains { $0.hasSuffix(".partial") })
+    }
+
+    @MainActor
+    func testExportStopsBeforeRenameWhenSelectedFolderMoves() async throws {
+        let setup = try await createCompleted4PhotoSession()
+        let detail = try XCTUnwrap(env.sessions.getDetail(sessionID: setup.session.id))
+        let original = Data("QA original".utf8)
+        defer { env.exportService.onFileCommitForTesting = nil }
+        for overwrite in [false, true] {
+            let folder = env.layout.exportsTempDir.appendingPathComponent("selected-\(overwrite)")
+            let moved = env.layout.exportsTempDir.appendingPathComponent("moved-\(overwrite)")
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+            let name = "result.png"
+            if overwrite { try original.write(to: folder.appendingPathComponent(name)) }
+            env.exportService.onFileCommitForTesting = { step, _ in
+                guard step == .beforeRename else { return }
+                try FileManager.default.moveItem(at: folder, to: moved)
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+            }
+            let request = ExportService.ExportRequest(sessionID: detail.session.id, format: .png, quality: 95,
+                width: 400, height: 400, filenameBase: "result", destinationFolder: folder, replaceExisting: overwrite)
+            do {
+                _ = try await env.exportService.export(detail: detail, request: request)
+                XCTFail("A moved folder must stop the export, overwrite=\(overwrite)")
+            } catch AppError.exportFolderChanged {}
+            XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: folder.path).isEmpty)
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: moved.path), overwrite ? [name] : [])
+            if overwrite { XCTAssertEqual(try Data(contentsOf: moved.appendingPathComponent(name)), original) }
+            print("QA-EXPORT-FOLDER before-rename overwrite=\(overwrite) old-contents-preserved")
+        }
+        let records = try env.sessions.listExportRecords(sessionID: detail.session.id)
+        XCTAssertEqual(records.count, 2)
+        XCTAssertTrue(records.allSatisfy { $0.status == .failed && $0.destinationDisplayPath == nil })
+    }
+
+    @MainActor
+    func testExportKeepsWrittenImageButRejectsStaleAndLookalikePathsBeforeHistory() async throws {
+        let setup = try await createCompleted4PhotoSession()
+        let detail = try XCTUnwrap(env.sessions.getDetail(sessionID: setup.session.id))
+        let unrelated = createSampleImageData(color: CGColor(red: 0, green: 1, blue: 0, alpha: 1))
+        defer { env.exportService.onFileCommitForTesting = nil }
+        let cases: [(String, ExportService.FileCommitStep, Bool, Bool)] = [
+            ("after-rename-empty", .afterRename, true, false),
+            ("after-rename-lookalike", .afterRename, true, true),
+            ("before-history-empty", .beforeHistoryValidation, true, false),
+            ("before-history-lookalike", .beforeHistoryValidation, true, true),
+            ("before-history-same-folder", .beforeHistoryValidation, false, true)
+        ]
+        for (label, injectionPoint, moveFolder, addLookalike) in cases {
+            let folder = env.layout.exportsTempDir.appendingPathComponent(label)
+            let moved = folder.appendingPathExtension("moved")
+            let url = folder.appendingPathComponent("result.png")
+            let actual = moveFolder ? moved.appendingPathComponent("result.png") : folder.appendingPathComponent("relocated.png")
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+            env.exportService.onFileCommitForTesting = { step, _ in
+                guard step == injectionPoint else { return }
+                if moveFolder {
+                    try FileManager.default.moveItem(at: folder, to: moved)
+                    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+                } else {
+                    try FileManager.default.moveItem(at: url, to: actual)
+                }
+                if addLookalike { try unrelated.write(to: url) }
+            }
+            let request = ExportService.ExportRequest(sessionID: detail.session.id, format: .png, quality: 95,
+                width: 400, height: 400, filenameBase: "result", destinationFolder: folder)
+            do {
+                _ = try await env.exportService.export(detail: detail, request: request)
+                XCTFail("Success must not include an unverified URL: \(label)")
+            } catch AppError.exportLocationUnconfirmed {}
+            XCTAssertNotNil(ImageNormalizer.uprightImage(url: actual))
+            XCTAssertNotEqual(try Data(contentsOf: actual), unrelated)
+            if addLookalike { XCTAssertEqual(try Data(contentsOf: url), unrelated) }
+            else { XCTAssertFalse(FileManager.default.fileExists(atPath: url.path)) }
+            let actualFolder = actual.deletingLastPathComponent()
+            XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: actualFolder.path).contains { $0.hasSuffix(".partial") })
+            print("QA-EXPORT-FOLDER \(label) retained-output=true returned-success=false")
+        }
+        let records = try env.sessions.listExportRecords(sessionID: detail.session.id)
+        XCTAssertEqual(records.count, cases.count)
+        XCTAssertTrue(records.allSatisfy { $0.status == .failed && $0.destinationDisplayPath == nil })
+    }
+
+    @MainActor
+    func testAutoExportWarnsWhenWrittenFileCanNoLongerBeVerified() async throws {
+        let setup = try await createCompleted4PhotoSession()
+        try env.sessions.setStatus(sessionID: setup.session.id, status: .reviewable)
+        let folder = env.layout.exportsTempDir.appendingPathComponent("auto")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        let bookmark = try folder.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil)
+        env.settings.exportFolderBookmarkID = try env.trashRepo.saveBookmark(purpose: "exportFolder", blob: bookmark, displayPath: folder.path)
+        env.settings.autoExport = true
+        defer { env.exportService.onFileCommitForTesting = nil }
+        env.exportService.onFileCommitForTesting = { step, target in
+            guard step == .beforeHistoryValidation else { return }
+            let actual = target.deletingLastPathComponent().appendingPathComponent("retained.jpg")
+            try FileManager.default.moveItem(at: target, to: actual)
+        }
+        let completed = try await env.completeSession(sessionID: setup.session.id)
+        XCTAssertTrue(completed)
+        XCTAssertEqual(try env.sessions.getSession(id: setup.session.id)?.status, .completed)
+        XCTAssertEqual(env.toast?.kind, .warning)
+        XCTAssertEqual(env.toast?.text, AppError.exportLocationUnconfirmed.message)
+        XCTAssertNotNil(ImageNormalizer.uprightImage(url: folder.appendingPathComponent("retained.jpg")))
+        let records = try env.sessions.listExportRecords(sessionID: setup.session.id)
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(records.first?.status, .failed)
+        XCTAssertNil(records.first?.destinationDisplayPath)
+    }
+
+    @MainActor
+    func testManualExportWarnsAndDoesNotRevealUnverifiedOutput() async throws {
+        let setup = try await createCompleted4PhotoSession()
+        let review = ReviewViewModel(env: env)
+        await review.load(sessionID: setup.session.id)
+        let sheet = ExportViewModel(env: env)
+        let folder = env.layout.exportsTempDir
+        sheet.review = review
+        sheet.format = .png
+        sheet.width = 400
+        sheet.height = 400
+        sheet.filename = "manual"
+        sheet.selectFolder(folder)
+        sheet.updatePreview()
+        let clock = ContinuousClock()
+        let deadline = clock.now + .seconds(5)
+        while sheet.isPreviewLoading && clock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        guard sheet.canExportPreview else { return XCTFail("The fixture must have a ready preview") }
+
+        var finderURL: URL?
+        env.shareService.revealInFinderHook = { finderURL = $0 }
+        defer {
+            env.shareService.revealInFinderHook = nil
+            env.exportService.onFileCommitForTesting = nil
+        }
+        await sheet.runExport()
+        let validURL = try XCTUnwrap(sheet.lastResultURL)
+        await sheet.revealResult()?.value
+        XCTAssertEqual(finderURL, validURL)
+        let previous = try XCTUnwrap(env.sessions.listExportRecords(sessionID: setup.session.id).first)
+        XCTAssertEqual(previous.destinationDisplayPath, validURL.path)
+        XCTAssertEqual(previous.sha256, Hashing.sha256Hex(fileURL: validURL))
+        finderURL = nil
+
+        env.exportService.onFileCommitForTesting = { step, target in
+            guard step == .beforeHistoryValidation else { return }
+            try FileManager.default.moveItem(at: target, to: folder.appendingPathComponent("retained.png"))
+        }
+        await sheet.runExport()
+        XCTAssertEqual(sheet.errorMessage, AppError.exportLocationUnconfirmed.message)
+        XCTAssertNil(sheet.lastResultURL)
+        XCTAssertFalse(sheet.historySaveFailed)
+        XCTAssertNil(sheet.revealResult())
+        XCTAssertNil(finderURL)
+        XCTAssertNotNil(ImageNormalizer.uprightImage(url: folder.appendingPathComponent("retained.png")))
+        let records = try env.sessions.listExportRecords(sessionID: setup.session.id)
+        XCTAssertEqual(records.filter { $0.status == .success }.map(\.id), [previous.id])
+        XCTAssertNil(records.first { $0.status == .failed }?.destinationDisplayPath)
+    }
+
+    @MainActor
+    func testManualExportRejectsChangedFolderSelectedBeforeClick() async throws {
+        for fromDefault in [true, false] {
+            for overwrite in [false, true] {
+                let setup = try await createCompleted4PhotoSession()
+                let detail = try XCTUnwrap(env.sessions.getDetail(sessionID: setup.session.id))
+                let folder = env.layout.exportsTempDir.appendingPathComponent(UUID().uuidString, isDirectory: true)
+                let moved = folder.appendingPathExtension("moved")
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+                if fromDefault { _ = try env.saveDefaultExportFolder(folder) }
+                let sheet = await manualExportSheet(detail: detail, chosenFolder: fromDefault ? nil : folder)
+                let original = Data("original folder".utf8)
+                let other = Data("replacement folder".utf8)
+                let name = "selection.png"
+                if overwrite { try original.write(to: folder.appendingPathComponent(name)) }
+                try FileManager.default.moveItem(at: folder, to: moved)
+                try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+                if overwrite { try other.write(to: folder.appendingPathComponent(name)) }
+                sheet.replaceExisting = overwrite
+                await sheet.runExport()
+                XCTAssertEqual(sheet.errorMessage, AppError.exportFolderChanged.message)
+                XCTAssertNil(sheet.folderURL)
+                XCTAssertNil(sheet.lastResultURL)
+                XCTAssertTrue(try env.sessions.listExportRecords(sessionID: setup.session.id).isEmpty)
+                XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path), overwrite ? [name] : [])
+                XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: moved.path), overwrite ? [name] : [])
+                if overwrite {
+                    XCTAssertEqual(try Data(contentsOf: folder.appendingPathComponent(name)), other)
+                    XCTAssertEqual(try Data(contentsOf: moved.appendingPathComponent(name)), original)
+                }
+                XCTAssertEqual(sheet.filename, "selection")
+                XCTAssertEqual(sheet.width, 400)
+                XCTAssertEqual(sheet.height, 400)
+                XCTAssertEqual(sheet.quality, 86)
+                XCTAssertEqual(sheet.format, .png)
+                XCTAssertEqual(sheet.replaceExisting, overwrite)
+
+                sheet.selectFolder(moved)
+                await sheet.runExport()
+                let file = try XCTUnwrap(sheet.lastResultURL)
+                let record = try XCTUnwrap(env.sessions.listExportRecords(sessionID: setup.session.id).first)
+                XCTAssertEqual(file.path, moved.appendingPathComponent(name).path)
+                XCTAssertEqual(record.status, .success)
+                XCTAssertEqual(record.sessionRevisionNo, detail.session.revisionNo)
+                XCTAssertEqual(record.destinationDisplayPath, file.path)
+                XCTAssertEqual(record.destinationBookmarkID, env.settings.exportFolderBookmarkID)
+                XCTAssertNotNil(record.destinationBookmarkID)
+                XCTAssertEqual(record.sha256, Hashing.sha256Hex(fileURL: file))
+                print("QA-RESELECT default=\(fromDefault) overwrite=\(overwrite) rejectedReplacement=true verifiedRetry=true")
+            }
+        }
+    }
+
+    @MainActor
+    func testManualExportWithUnsavedBookmarkStillVerifiesSelectedFolder() async throws {
+        let setup = try await createCompleted4PhotoSession()
+        let detail = try XCTUnwrap(env.sessions.getDetail(sessionID: setup.session.id))
+        let folder = env.layout.exportsTempDir.appendingPathComponent("one-off", isDirectory: true)
+        let moved = folder.appendingPathExtension("moved")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        try env.db.run("""
+            CREATE TEMP TRIGGER reject_export_bookmark BEFORE INSERT ON app_bookmarks
+            BEGIN SELECT RAISE(ABORT, 'QA bookmark could not be saved'); END
+            """)
+        let sheet = await manualExportSheet(detail: detail, chosenFolder: folder)
+        XCTAssertEqual(sheet.errorMessage, "Không lưu được thư mục mặc định. Bạn vẫn có thể thử xuất lần này.")
+        XCTAssertEqual(sheet.folderURL, folder)
+        await sheet.runExport()
+        let file = try XCTUnwrap(sheet.lastResultURL)
+        let record = try XCTUnwrap(env.sessions.listExportRecords(sessionID: setup.session.id).first)
+        XCTAssertEqual(record.status, .success)
+        XCTAssertEqual(record.sessionID, setup.session.id)
+        XCTAssertEqual(record.sessionRevisionNo, detail.session.revisionNo)
+        XCTAssertNil(record.destinationBookmarkID)
+        XCTAssertEqual(record.destinationDisplayPath, file.path)
+        XCTAssertEqual(record.sha256, Hashing.sha256Hex(fileURL: file))
+        var revealed: URL?
+        env.shareService.revealInFinderHook = { revealed = $0 }
+        defer { env.shareService.revealInFinderHook = nil }
+        await sheet.revealResult()?.value
+        XCTAssertEqual(revealed, file)
+
+        try FileManager.default.moveItem(at: folder, to: moved)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        await sheet.runExport()
+        XCTAssertEqual(sheet.errorMessage, AppError.exportFolderChanged.message)
+        XCTAssertNil(sheet.lastResultURL)
+        XCTAssertNil(sheet.folderURL)
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: folder.path).isEmpty)
+        XCTAssertEqual(try env.sessions.listExportRecords(sessionID: setup.session.id), [record])
+        XCTAssertEqual(Hashing.sha256Hex(fileURL: moved.appendingPathComponent(file.lastPathComponent)), record.sha256)
+        print("QA-ONE-OFF bookmark=nil SHA=\(record.sha256 ?? "") changedFolderRejected=true")
+    }
+
+    @MainActor
+    func testManualFinderRejectsAnotherSessionsOverwriteAndInvalidPaths() async throws {
+        let first = try await createCompleted4PhotoSession()
+        let second = try await createCompleted4PhotoSession()
+        let firstDetail = try XCTUnwrap(env.sessions.getDetail(sessionID: first.session.id))
+        let secondDetail = try XCTUnwrap(env.sessions.getDetail(sessionID: second.session.id))
+        let folder = env.layout.exportsTempDir.appendingPathComponent("manual-finder", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        let sheet = await manualExportSheet(detail: firstDetail, chosenFolder: folder)
+        await sheet.runExport()
+        let url = try XCTUnwrap(sheet.lastResultURL)
+        let original = try XCTUnwrap(env.sessions.listExportRecords(sessionID: first.session.id).first)
+        var revealed: [URL] = []
+        env.shareService.revealInFinderHook = { revealed.append($0) }
+        defer { env.shareService.revealInFinderHook = nil }
+        await sheet.revealResult()?.value
+        XCTAssertEqual(revealed, [url])
+        XCTAssertNil(sheet.finderWarning)
+
+        let request = ExportService.ExportRequest(sessionID: second.session.id, format: .png, quality: 95,
+            width: 520, height: 400, filenameBase: sheet.filename, destinationFolder: folder, replaceExisting: true)
+        let (replacement, replacedURL) = try await env.exportService.export(detail: secondDetail, request: request)
+        XCTAssertEqual(replacedURL, url)
+        XCTAssertNotEqual(replacement.sha256, original.sha256)
+        XCTAssertEqual(replacement.sha256, Hashing.sha256Hex(fileURL: url))
+        await sheet.revealResult()?.value
+        XCTAssertEqual(revealed, [url])
+        XCTAssertEqual(sheet.finderWarning, "Tệp xuất đã bị thay thế hoặc chỉnh sửa")
+        print("QA-SHEET-FINDER firstSHA=\(original.sha256 ?? "") onDiskSHA=\(replacement.sha256 ?? "") blocked=true")
+
+        let movedFile = folder.appendingPathComponent("moved.png")
+        try FileManager.default.moveItem(at: url, to: movedFile)
+        await sheet.revealResult()?.value
+        XCTAssertEqual(sheet.finderWarning, "Không còn tìm thấy tệp xuất tại vị trí đã lưu")
+        try FileManager.default.createSymbolicLink(at: url, withDestinationURL: movedFile)
+        await sheet.revealResult()?.value
+        XCTAssertEqual(sheet.finderWarning, "Không còn tìm thấy tệp xuất tại vị trí đã lưu")
+
+        let movedFolder = folder.appendingPathExtension("moved")
+        try FileManager.default.moveItem(at: folder, to: movedFolder)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        await sheet.revealResult()?.value
+        XCTAssertEqual(sheet.finderWarning, "Không thể truy cập tệp xuất")
+        XCTAssertEqual(revealed, [url])
+        XCTAssertEqual(try env.sessions.listExportRecords(sessionID: first.session.id), [original])
+    }
+
+    @MainActor
+    func testManualFinderKeepsHistoryWarningAndVerifiesFileWithoutHistory() async throws {
+        let setup = try await createCompleted4PhotoSession()
+        let detail = try XCTUnwrap(env.sessions.getDetail(sessionID: setup.session.id))
+        let sheet = await manualExportSheet(detail: detail, chosenFolder: env.layout.exportsTempDir)
+        try env.db.run("""
+            CREATE TEMP TRIGGER fail_export_history BEFORE INSERT ON export_records
+            BEGIN SELECT RAISE(ABORT, 'QA history failure'); END
+            """)
+        await sheet.runExport()
+        let file = try XCTUnwrap(sheet.lastResultURL)
+        let warning = try XCTUnwrap(sheet.errorMessage)
+        XCTAssertTrue(warning.contains("chưa ghi được lịch sử xuất"))
+        XCTAssertTrue(sheet.historySaveFailed)
+        XCTAssertTrue(try env.sessions.listExportRecords(sessionID: setup.session.id).isEmpty)
+        var revealed: [URL] = []
+        env.shareService.revealInFinderHook = { revealed.append($0) }
+        defer { env.shareService.revealInFinderHook = nil }
+        await sheet.revealResult()?.value
+        XCTAssertEqual(revealed, [file])
+        XCTAssertNil(sheet.finderWarning)
+
+        try createSampleImageData(color: CGColor(red: 0, green: 1, blue: 0, alpha: 1)).write(to: file, options: .atomic)
+        await sheet.revealResult()?.value
+        XCTAssertEqual(revealed, [file])
+        XCTAssertEqual(sheet.finderWarning, "Tệp xuất đã bị thay thế hoặc chỉnh sửa")
+        XCTAssertTrue(sheet.historySaveFailed)
+        XCTAssertEqual(sheet.errorMessage, warning)
+        print("QA-SHEET-NO-HISTORY correctFileRevealed=true replacementBlocked=true bothWarningsPreserved=true")
+    }
+
+    @MainActor
+    func testManualFinderInvalidatesLateRequestsOnRepeatNewExportAndDismiss() async throws {
+        for action in ["repeat", "export", "dismiss"] {
+            let setup = try await createCompleted4PhotoSession()
+            let detail = try XCTUnwrap(env.sessions.getDetail(sessionID: setup.session.id))
+            let folder = env.layout.exportsTempDir.appendingPathComponent(action, isDirectory: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+            let sheet = await manualExportSheet(detail: detail, chosenFolder: folder)
+            try env.db.run("""
+                CREATE TEMP TRIGGER IF NOT EXISTS fail_export_history BEFORE INSERT ON export_records
+                BEGIN SELECT RAISE(ABORT, 'QA history failure'); END
+                """)
+            await sheet.runExport()
+            let firstFile = try XCTUnwrap(sheet.lastResultURL)
+            let firstBookmarkID = try XCTUnwrap(env.settings.exportFolderBookmarkID)
+            let reading = expectation(description: "\(action): old request opened the file")
+            let cancelled = expectation(description: "\(action): old request received cancellation")
+            let release = DispatchSemaphore(value: 0)
+            sheet.onFinderHashForTesting = { _ in
+                reading.fulfill()
+                guard release.wait(timeout: .now() + 10) == .success else {
+                    throw AppError.ioFailure("QA read did not resume")
+                }
+                if Task.isCancelled { cancelled.fulfill() }
+                throw AppError.externalFolderPermissionLost
+            }
+            var revealed: [URL] = []
+            env.shareService.revealInFinderHook = { revealed.append($0) }
+            let first = try XCTUnwrap(sheet.revealResult())
+            defer {
+                release.signal()
+                first.cancel()
+                env.shareService.revealInFinderHook = nil
+            }
+            await fulfillment(of: [reading], timeout: 5)
+            sheet.onFinderHashForTesting = nil
+            switch action {
+            case "repeat":
+                await sheet.revealResult()?.value
+                XCTAssertEqual(revealed, [firstFile])
+            case "export":
+                let newFolder = folder.appendingPathComponent("new", isDirectory: true)
+                try FileManager.default.createDirectory(at: newFolder, withIntermediateDirectories: false)
+                sheet.selectFolder(newFolder)
+                await sheet.runExport()
+                XCTAssertNotEqual(sheet.lastResultURL, firstFile)
+                XCTAssertNotNil(try env.trashRepo.bookmark(id: firstBookmarkID))
+                XCTAssertTrue(revealed.isEmpty)
+            default:
+                sheet.cancelResultReveal()
+                XCTAssertTrue(revealed.isEmpty)
+            }
+            release.signal()
+            await first.value
+            await fulfillment(of: [cancelled], timeout: 3)
+            XCTAssertEqual(revealed, action == "repeat" ? [firstFile] : [])
+            XCTAssertNil(sheet.finderWarning)
+            if action == "export" {
+                XCTAssertNil(try env.trashRepo.bookmark(id: firstBookmarkID))
+            }
+            print("QA-SHEET-CANCEL action=\(action) cancelled=true noLateWarning=true noLateReveal=true")
+        }
+    }
+
+    @MainActor
+    func testManualExportClearsFolderChangedDuringWriteAndKeepsDestinationOnFileConflict() async throws {
+        let setup = try await createCompleted4PhotoSession()
+        let detail = try XCTUnwrap(env.sessions.getDetail(sessionID: setup.session.id))
+        let original = Data("previous output".utf8)
+        let replacement = Data("concurrent output".utf8)
+        let cases: [(String, ExportService.FileCommitStep, Bool, Bool)] = [
+            ("coordination-missing", .beforeCoordination, true, true),
+            ("coordination", .insideCoordination, true, true),
+            ("rename-new", .beforeRename, false, true),
+            ("rename-overwrite", .beforeRename, true, true),
+            ("file-only", .insideCoordination, true, false)
+        ]
+        defer { env.exportService.onFileCommitForTesting = nil }
+        for (index, (name, stepToChange, overwrite, changeFolder)) in cases.enumerated() {
+            let folder = env.layout.exportsTempDir.appendingPathComponent(name, isDirectory: true)
+            let moved = folder.appendingPathExtension("moved")
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+            let file = folder.appendingPathComponent("selection.png")
+            if overwrite { try original.write(to: file) }
+            let sheet = await manualExportSheet(detail: detail, chosenFolder: folder)
+            sheet.replaceExisting = overwrite
+            env.exportService.onFileCommitForTesting = { step, target in
+                guard step == stepToChange else { return }
+                if changeFolder {
+                    try FileManager.default.moveItem(at: folder, to: moved)
+                    if stepToChange == .beforeCoordination { return }
+                    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+                }
+                try replacement.write(to: target, options: .atomic)
+            }
+            await sheet.runExport()
+            XCTAssertNil(sheet.lastResultURL)
+            XCTAssertEqual(sheet.folderURL, changeFolder ? nil : folder)
+            if changeFolder {
+                XCTAssertEqual(sheet.errorMessage, AppError.exportFolderChanged.message)
+                XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: moved.path), overwrite ? ["selection.png"] : [])
+                if overwrite { XCTAssertEqual(try Data(contentsOf: moved.appendingPathComponent("selection.png")), original) }
+            } else {
+                XCTAssertTrue(sheet.errorMessage?.contains("Tệp đích đã thay đổi") == true)
+            }
+            if stepToChange == .beforeCoordination {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path))
+            } else {
+                XCTAssertEqual(try Data(contentsOf: file), replacement)
+                XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path), ["selection.png"])
+            }
+            let existing = try env.sessions.listExportRecords(sessionID: setup.session.id)
+            XCTAssertEqual(existing.filter { $0.filename == "selection.png" && $0.status == .failed }.count,
+                           index + 1)
+            if changeFolder {
+                env.exportService.onFileCommitForTesting = nil
+                sheet.selectFolder(moved)
+                XCTAssertEqual(sheet.filename, "selection")
+                XCTAssertEqual(sheet.width, 400)
+                XCTAssertEqual(sheet.height, 400)
+                XCTAssertEqual(sheet.format, .png)
+                XCTAssertEqual(sheet.quality, 86)
+                XCTAssertEqual(sheet.replaceExisting, overwrite)
+                XCTAssertTrue(sheet.canExportPreview)
+                await sheet.runExport()
+                XCTAssertEqual(sheet.lastResultURL?.path, moved.appendingPathComponent("selection.png").path)
+                XCTAssertTrue(try env.sessions.listExportRecords(sessionID: setup.session.id).contains {
+                    $0.status == .success && $0.destinationDisplayPath == sheet.lastResultURL?.path
+                })
+            }
+            print("QA-LATE-DESTINATION case=\(name) folderCleared=\(changeFolder) replacementPreserved=true")
+        }
+    }
+
+    @MainActor
+    private func manualExportSheet(detail: SessionDetail, chosenFolder: URL?) async -> ExportViewModel {
+        let review = ReviewViewModel(env: env)
+        await review.load(sessionID: detail.session.id)
+        let sheet = ExportViewModel(env: env)
+        sheet.review = review
+        sheet.configure(detail: detail)
+        sheet.format = .png
+        sheet.width = 400
+        sheet.height = 400
+        sheet.quality = 86
+        sheet.filename = "selection"
+        if let chosenFolder { sheet.selectFolder(chosenFolder) }
+        sheet.updatePreview()
+        let deadline = ContinuousClock.now + .seconds(8)
+        while sheet.isPreviewLoading && ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(sheet.canExportPreview)
+        return sheet
+    }
+    #endif
+
+    @MainActor
+    func testExportOverwriteRetainsMetadataAndVerifiedNewImage() async throws {
+        let setup = try await createCompleted4PhotoSession()
+        let detail = try XCTUnwrap(env.sessions.getDetail(sessionID: setup.session.id))
+        let folder = env.layout.exportsTempDir
+        let url = folder.appendingPathComponent("metadata.png")
+        let old = Data("previous content".utf8)
+        try old.write(to: url)
+        let created = Date(timeIntervalSince1970: 1_600_000_000)
+        try FileManager.default.setAttributes([.creationDate: created, .posixPermissions: 0o640], ofItemAtPath: url.path)
+        let acl = try XCTUnwrap(acl_from_text("!#acl 1\ngroup:ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C:everyone:12:allow:read\n"))
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
+        XCTAssertEqual(acl_set_file(url.path, ACL_TYPE_EXTENDED, acl), 0)
+        let comment = try PropertyListSerialization.data(fromPropertyList: "QA comment", format: .binary, options: 0)
+        var finder = Data(repeating: 0, count: 32)
+        finder[9] = 0x06
+        let attributes = ["com.apple.metadata:kMDItemFinderComment": comment, "com.apple.FinderInfo": finder]
+        for (key, bytes) in attributes {
+            XCTAssertEqual(bytes.withUnsafeBytes { setxattr(url.path, key, $0.baseAddress, $0.count, 0, 0) }, 0)
+        }
+        let request = ExportService.ExportRequest(sessionID: detail.session.id, format: .png, quality: 90,
+            width: 400, height: 400, filenameBase: "metadata", destinationFolder: folder, replaceExisting: true)
+        let (record, saved) = try await env.exportService.export(detail: detail, request: request)
+        XCTAssertEqual(saved, url)
+        XCTAssertNotEqual(try Data(contentsOf: saved), old)
+        XCTAssertEqual(record.sha256, Hashing.sha256Hex(fileURL: saved))
+        XCTAssertNotNil(ImageNormalizer.uprightImage(url: saved))
+        let info = try FileManager.default.attributesOfItem(atPath: saved.path)
+        XCTAssertEqual(info[.creationDate] as? Date, created)
+        XCTAssertEqual((info[.posixPermissions] as? NSNumber)?.intValue, 0o640)
+        let copiedACL = try XCTUnwrap(acl_get_file(saved.path, ACL_TYPE_EXTENDED))
+        defer { acl_free(UnsafeMutableRawPointer(copiedACL)) }
+        let expectedACLText = try XCTUnwrap(acl_to_text(acl, nil))
+        let actualACLText = try XCTUnwrap(acl_to_text(copiedACL, nil))
+        defer { acl_free(expectedACLText); acl_free(actualACLText) }
+        XCTAssertEqual(String(cString: actualACLText), String(cString: expectedACLText))
+        for (key, bytes) in attributes {
+            var read = Data(count: bytes.count)
+            let length = read.withUnsafeMutableBytes { getxattr(saved.path, key, $0.baseAddress, $0.count, 0, 0) }
+            XCTAssertEqual(length, bytes.count)
+            XCTAssertEqual(read, bytes)
+        }
     }
 
     // MARK: - LIB-01: Xoá riêng ô 2, xoá ô 2 và 4 cùng lúc, giữ phiên

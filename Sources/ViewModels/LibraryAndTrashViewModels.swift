@@ -323,6 +323,12 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     public var fileMetadataProbe: ((URL) throws -> (isRegularFile: Bool, isDirectory: Bool))? = nil
+    #if DEBUG
+    var onFinderHashForTesting: (@Sendable (URL) throws -> Void)?
+    #endif
+
+    private var finderRequestID: UUID?
+    private var finderFileCheck: Task<ExportFileVerifier.Check, Error>?
 
     public enum FileResolutionErrorClassification {
         case missingOrInvalid
@@ -330,44 +336,23 @@ public final class LibraryViewModel: ObservableObject {
     }
 
     public static func classifyFileError(_ error: Error) -> FileResolutionErrorClassification {
-        let ns = error as NSError
-        var chain: [NSError] = []
-        var current: NSError? = ns
-        while let err = current {
-            chain.append(err)
-            current = err.userInfo[NSUnderlyingErrorKey] as? NSError
+        switch ExportFileVerifier.classifyFileError(error) {
+        case .missingOrInvalid: return .missingOrInvalid
+        case .inaccessible: return .inaccessible
         }
-
-        // Ưu tiên không thể truy cập khi có nguyên nhân quyền rõ ràng (§4.3)
-        for err in chain {
-            if err.domain == NSCocoaErrorDomain {
-                if err.code == NSFileReadNoPermissionError {
-                    return .inaccessible
-                }
-            } else if err.domain == NSPOSIXErrorDomain {
-                if err.code == Int(EACCES) || err.code == Int(EPERM) {
-                    return .inaccessible
-                }
-            }
-        }
-
-        // Tệp mất hoặc đường dẫn không còn hợp lệ
-        for err in chain {
-            if err.domain == NSCocoaErrorDomain {
-                if err.code == NSFileNoSuchFileError || err.code == NSFileReadNoSuchFileError {
-                    return .missingOrInvalid
-                }
-            } else if err.domain == NSPOSIXErrorDomain {
-                if err.code == Int(ENOENT) || err.code == Int(ENOTDIR) {
-                    return .missingOrInvalid
-                }
-            }
-        }
-
-        return .inaccessible
     }
 
-    public func revealRecentExport(sessionID: String) {
+    private func beginFinderRequest() -> UUID {
+        finderFileCheck?.cancel()
+        finderFileCheck = nil
+        let id = UUID()
+        finderRequestID = id
+        return id
+    }
+
+    public func revealRecentExport(sessionID: String) async {
+        guard !Task.isCancelled else { return }
+        let requestID = beginFinderRequest()
         let records: [ExportRecordModel]
         do {
             records = try env.sessions.listExportRecords(sessionID: sessionID)
@@ -376,10 +361,12 @@ public final class LibraryViewModel: ObservableObject {
             return
         }
 
-        revealAvailableExport(in: records)
+        await revealAvailableExport(in: records, requestID: requestID)
     }
 
-    private func revealAvailableExport(in records: [ExportRecordModel]) {
+    private func revealAvailableExport(in records: [ExportRecordModel], requestID: UUID) async {
+        defer { if finderRequestID == requestID { finderFileCheck = nil } }
+        guard finderRequestID == requestID, !Task.isCancelled else { return }
         let successRecords = records.filter { $0.status == .success }
         guard !successRecords.isEmpty else {
             env.showToast("Chưa có bản xuất thành công", kind: .info)
@@ -400,8 +387,10 @@ public final class LibraryViewModel: ObservableObject {
 
         var hasInaccessible = false
         var hasMissingOrInvalid = false
+        var hasModified = false
 
         for record in sorted {
+            guard finderRequestID == requestID, !Task.isCancelled else { return }
             guard let path = record.destinationDisplayPath,
                   !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   path.hasPrefix("/") else {
@@ -416,24 +405,45 @@ public final class LibraryViewModel: ObservableObject {
                 let accessing = folder?.startAccessingSecurityScopedResource() == true
                 defer { if accessing { folder?.stopAccessingSecurityScopedResource() } }
                 let fileURL = folder?.appendingPathComponent(storedURL.lastPathComponent) ?? storedURL
-                let meta: (isRegularFile: Bool, isDirectory: Bool)
                 if let probe = fileMetadataProbe {
-                    meta = try probe(fileURL)
-                } else {
-                    let vals = try fileURL.resourceValues(forKeys: [.isRegularFileKey, .isDirectoryKey])
-                    meta = (vals.isRegularFile == true, vals.isDirectory == true)
+                    let meta = try probe(fileURL)
+                    guard meta.isRegularFile, !meta.isDirectory else {
+                        hasMissingOrInvalid = true
+                        continue
+                    }
                 }
-
-                if meta.isRegularFile && !meta.isDirectory {
+                #if DEBUG
+                let beforeHash = onFinderHashForTesting
+                #else
+                let beforeHash: (@Sendable (URL) throws -> Void)? = nil
+                #endif
+                let check = Task.detached(priority: .userInitiated) {
+                    try ExportFileVerifier.check(fileURL, expectedHash: record.sha256, beforeHash: beforeHash)
+                }
+                finderFileCheck = check
+                let result = try await withTaskCancellationHandler {
+                    try await check.value
+                } onCancel: {
+                    check.cancel()
+                }
+                guard finderRequestID == requestID, !Task.isCancelled else { return }
+                switch result {
+                case .verified(let version):
+                    // The path may have changed while this request was resuming on the main actor.
+                    guard try ExportFileVerifier.matchesCurrentVersion(fileURL, version) else {
+                        hasModified = true
+                        continue
+                    }
                     env.shareService.revealInFinder(fileURL)
                     return
-                } else {
-                    hasMissingOrInvalid = true
-                    continue
+                case .missingOrInvalid: hasMissingOrInvalid = true
+                case .modified: hasModified = true
                 }
+            } catch is CancellationError {
+                return
             } catch {
-                let classification = (error as? AppError) == .externalFolderPermissionLost
-                    ? .inaccessible : Self.classifyFileError(error)
+                guard finderRequestID == requestID, !Task.isCancelled else { return }
+                let classification = Self.classifyFileError(error)
                 switch classification {
                 case .inaccessible:
                     hasInaccessible = true
@@ -444,8 +454,11 @@ public final class LibraryViewModel: ObservableObject {
             }
         }
 
+        guard finderRequestID == requestID, !Task.isCancelled else { return }
         if hasInaccessible {
             env.showToast("Có bản xuất nhưng không thể truy cập tệp", kind: .warning)
+        } else if hasModified {
+            env.showToast("Tệp xuất đã bị thay thế hoặc chỉnh sửa", kind: .warning)
         } else if hasMissingOrInvalid {
             env.showToast("Không còn tìm thấy tệp xuất tại vị trí đã lưu", kind: .warning)
         } else {
@@ -453,8 +466,10 @@ public final class LibraryViewModel: ObservableObject {
         }
     }
 
-    public func revealExport(record: ExportRecordModel) {
-        revealAvailableExport(in: [record])
+    public func revealExport(record: ExportRecordModel) async {
+        guard !Task.isCancelled else { return }
+        let requestID = beginFinderRequest()
+        await revealAvailableExport(in: [record], requestID: requestID)
     }
 
     public func exportRecords(sessionID: String) -> [ExportRecordModel] {

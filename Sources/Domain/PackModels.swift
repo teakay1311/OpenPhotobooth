@@ -70,7 +70,15 @@ public struct PackEntry: Identifiable, Equatable {
     public var thumbnailData: Data?
     public var assetCount: Int
     public var isDuplicate: Bool
-    public var existingFrameID: String?
+    public var existingFrameID: String? { replacementTarget?.id }
+    var replacementTarget: PackReplacementTarget?
+    var replacementUnavailableReason: String?
+}
+
+struct PackReplacementTarget: Equatable {
+    let id: String
+    let revisionID: String
+    let name: String
 }
 
 public enum PackDuplicatePolicy: String, CaseIterable {

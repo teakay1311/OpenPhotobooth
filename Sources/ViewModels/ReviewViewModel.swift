@@ -1272,6 +1272,10 @@ public final class ReviewViewModel: ObservableObject {
     // MARK: - Export / Share / Complete (§11)
 
     public func runExport(request: ExportService.ExportRequest) async -> Result<URL, AppError> {
+        await runExportFile(request: request).map(\.url)
+    }
+
+    func runExportFile(request: ExportService.ExportRequest) async -> Result<ExportedFile, AppError> {
         guard await flushPendingEdits() else {
             return .failure(.invalidState("Chưa thể lưu hoàn tất các chỉnh sửa"))
         }
@@ -1284,10 +1288,10 @@ public final class ReviewViewModel: ObservableObject {
             engine.endExport(success: exportSucceeded)
         }
         do {
-            let (record, url) = try await env.exportService.export(detail: detail, request: request)
+            let (record, file) = try await env.exportService.exportFile(detail: detail, request: request)
             exportSucceeded = true
             env.showToast("Đã xuất \(record.filename)")
-            return .success(url)
+            return .success(file)
         } catch let e as AppError {
             return .failure(e)
         } catch {

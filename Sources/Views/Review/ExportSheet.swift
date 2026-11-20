@@ -107,6 +107,9 @@ public struct ExportSheet: View {
             if let err = vm.errorMessage {
                 Text(err).foregroundStyle(.red).font(.caption)
             }
+            if let warning = vm.finderWarning {
+                Text(warning).foregroundStyle(.orange).font(.caption)
+            }
             if let url = vm.lastResultURL {
                 HStack {
                     Image(systemName: vm.historySaveFailed ? "exclamationmark.triangle.fill" : "checkmark.circle.fill")
@@ -143,6 +146,7 @@ public struct ExportSheet: View {
         .frame(width: 660, height: 530)
         .onChange(of: reviewVM.detail?.session.revisionNo) { vm.updatePreview() }
         .onChange(of: reviewVM.detail?.snapshot.id) { vm.updatePreview() }
+        .onDisappear { vm.cancelResultReveal() }
         .onAppear {
             vm.review = reviewVM
             if let detail = reviewVM.detail {

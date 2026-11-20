@@ -31,7 +31,9 @@ public enum AppError: Error, LocalizedError, Equatable {
     // Export
     case exportFailed(String)               // E-EXP-01
     case exportPreviewChanged
-    case exportHistoryNotSaved(URL)
+    case exportHistoryNotSaved(ExportedFile)
+    case exportLocationUnconfirmed
+    case exportFolderChanged
     case exportFileExists                   // E-EXP-02
     case notEnoughPhotos(missing: Int)      // thiếu ảnh khi đổi khung / xuất
     // Share
@@ -78,7 +80,9 @@ public enum AppError: Error, LocalizedError, Equatable {
         case .ioFailure(let d): return "Lỗi đọc/ghi tệp: \(d)"
         case .exportFailed(let d): return "Không thể xuất ảnh. Phiên chụp vẫn an toàn. (\(d))"
         case .exportPreviewChanged: return "Phiên đã thay đổi. Hãy kiểm tra xem trước mới và bấm Xuất lại."
-        case .exportHistoryNotSaved(let url): return "Đã lưu \(url.lastPathComponent), chưa ghi được lịch sử xuất."
+        case .exportHistoryNotSaved(let file): return "Đã lưu \(file.url.lastPathComponent), chưa ghi được lịch sử xuất."
+        case .exportLocationUnconfirmed: return "Ảnh đã được ghi nhưng không thể xác nhận vị trí. Hãy kiểm tra thư mục xuất trước khi thử lại."
+        case .exportFolderChanged: return "Thư mục xuất đã thay đổi. Hãy chọn lại thư mục."
         case .exportFileExists: return "Tên file đã tồn tại."
         case .notEnoughPhotos(let missing): return "Thiếu \(missing) ảnh — hãy chụp bổ sung."
         case .shareCancelled: return "Đã hủy chia sẻ."
@@ -123,6 +127,8 @@ public enum AppError: Error, LocalizedError, Equatable {
         case .exportFileExists: return "E-EXP-02"
         case .exportPreviewChanged: return "E-EXP-03"
         case .exportHistoryNotSaved: return "E-EXP-04"
+        case .exportLocationUnconfirmed: return "E-EXP-05"
+        case .exportFolderChanged: return "E-EXP-06"
         case .notEnoughPhotos: return "E-CAP-05"
         case .shareCancelled: return "E-SHR-01"
         case .restoreConflict: return "E-TRS-01"
