@@ -44,10 +44,7 @@ public struct MainWindow: View {
             }
         }
         .overlay(alignment: .bottom) {
-            if env.toast != nil {
-                ToastOverlay(env: env)
-                    .allowsHitTesting(false)
-            }
+            ToastOverlay(env: env)
         }
         .animation(.easeInOut(duration: 0.18), value: env.route)
         .frame(minWidth: 1024, minHeight: 680)

@@ -2,7 +2,6 @@ import Foundation
 import SwiftUI
 
 /// Toast không nghiêm trọng, tự ẩn (§2.1) — không thay trạng thái lưu thực tế.
-/// Hashable để dùng làm identity (.id) cho ToastOverlay — toast mới phải restart bộ đếm tự ẩn.
 public struct ToastMessage: Equatable, Hashable {
     public enum Kind: Equatable, Hashable { case success, info, warning }
     public var text: String

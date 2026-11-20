@@ -40,7 +40,16 @@ public final class AppEnvironment: ObservableObject {
     @Published public var bannerSessionID: String?
     @Published private(set) var lastCancelledCaptureID: String?
     @Published public var isProcessingBannerAction: Bool = false
-    @Published public var toast: ToastMessage?
+    struct ToastPresentation {
+        let id = UUID()
+        let message: ToastMessage
+    }
+    @Published private(set) var activeToast: ToastPresentation?
+    public var toast: ToastMessage? { activeToast?.message }
+    private(set) var toastDismissTask: Task<Void, Never>?
+    #if DEBUG
+    var toastWaitForTesting: (@MainActor () async throws -> Void)?
+    #endif
     @Published public var showFullscreen = false
     @Published var nativeFullscreenExitRequest = 0
     @Published public var frameEditorDraft: FrameEditorContext?
@@ -358,6 +367,10 @@ public final class AppEnvironment: ObservableObject {
         // applyAppearance được gọi từ onAppear của MainWindow.
     }
 
+    deinit {
+        toastDismissTask?.cancel()
+    }
+
     /// Khởi động theo §3.1: migration xong → seed → recovery → dọn rác (ưu tiên thấp) → banner.
     public func boot() async {
         guard launchError == nil else {
@@ -404,8 +417,8 @@ public final class AppEnvironment: ObservableObject {
         shareService.cleanupStaleShareCache()
         if report.hasProblems {
             let count = report.quarantinedFiles + report.orphanedFiles
-            toast = ToastMessage(text: "Khởi động an toàn: \(count) tệp nghi vấn, \(report.issues.count) vấn đề cần kiểm tra.",
-                                 kind: report.issues.isEmpty ? .info : .warning)
+            showToast("Khởi động an toàn: \(count) tệp nghi vấn, \(report.issues.count) vấn đề cần kiểm tra.",
+                      kind: report.issues.isEmpty ? .info : .warning)
         }
         EventBus.shared.post(.recoveryCompleted(issues: report.issues.count))
     }
@@ -429,7 +442,35 @@ public final class AppEnvironment: ObservableObject {
     }
 
     public func showToast(_ text: String, kind: ToastMessage.Kind = .success) {
-        toast = ToastMessage(text: text, kind: kind)
+        toastDismissTask?.cancel()
+        let presentation = ToastPresentation(message: ToastMessage(text: text, kind: kind))
+        let id = presentation.id
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .milliseconds(3500))
+        let defaultWait: @MainActor () async throws -> Void = { try await clock.sleep(until: deadline) }
+        #if DEBUG
+        let wait = toastWaitForTesting ?? defaultWait
+        #else
+        let wait = defaultWait
+        #endif
+
+        activeToast = presentation
+        toastDismissTask = Task { [weak self] in
+            do {
+                try await wait()
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, let self, self.activeToast?.id == id else { return }
+            self.toastDismissTask = nil
+            self.activeToast = nil
+        }
+    }
+
+    func dismissToast() {
+        toastDismissTask?.cancel()
+        toastDismissTask = nil
+        activeToast = nil
     }
 
     /// Đóng banner phiên chưa hoàn thành (§3.1.6 — dùng bởi SessionBanner).

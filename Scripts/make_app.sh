@@ -68,6 +68,27 @@ case "$architectures" in
 esac
 codesign --verify --deep --strict "$staged"
 
+for arch in arm64 x86_64; do
+  entitlements="$lock/entitlements-$arch.plist"
+  if ! codesign -d --arch "$arch" --entitlements :- "$staged" > "$entitlements" ||
+     ! plutil -lint "$entitlements" >/dev/null; then
+    echo "Error: Cannot read signed Release entitlements ($arch)." >&2
+    exit 1
+  fi
+  if plutil -extract 'com\.apple\.security\.get-task-allow' xml1 -o - "$entitlements" >/dev/null 2>&1; then
+    echo "Error: Release includes com.apple.security.get-task-allow ($arch)." >&2
+    exit 1
+  fi
+  for key in com.apple.security.app-sandbox com.apple.security.device.camera \
+             com.apple.security.files.bookmarks.app-scope com.apple.security.files.user-selected.read-write; do
+    if ! value="$(plutil -extract "${key//./\\.}" raw -expect bool "$entitlements" 2>/dev/null)" ||
+       [ "$value" != true ]; then
+      echo "Error: Release entitlement $key must be true ($arch)." >&2
+      exit 1
+    fi
+  done
+done
+
 if [ -e "$destination" ]; then
   mv "$destination" "$backup"
 fi

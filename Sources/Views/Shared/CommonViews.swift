@@ -80,7 +80,8 @@ public struct ToastOverlay: View {
     public var body: some View {
         VStack {
             Spacer()
-            if let toast = env.toast {
+            if let presentation = env.activeToast {
+                let toast = presentation.message
                 HStack(spacing: 8) {
                     Image(systemName: icon(toast.kind))
                     Text(toast.text).lineLimit(3)
@@ -90,19 +91,11 @@ public struct ToastOverlay: View {
                 .background(.regularMaterial, in: Capsule())
                 .overlay(Capsule().strokeBorder(borderColor(toast.kind), lineWidth: 1))
                 .transition(.move(edge: .bottom).combined(with: .opacity))
-                // .id(toast): toast MỚI đè toast cũ phải bắt đầu lại bộ đếm 3.5s
-                // (onAppear chỉ chạy lại khi identity đổi — nếu không toast mới không bao giờ tự ẩn)
-                .id(toast)
-                .onAppear {
-                    Task {
-                        try? await Task.sleep(nanoseconds: 3_500_000_000)
-                        withAnimation { if env.toast == toast { env.toast = nil } }
-                    }
-                }
+                .id(presentation.id)
                 .padding(.bottom, 20)
             }
         }
-        .animation(.easeInOut(duration: 0.2), value: env.toast)
+        .animation(.easeInOut(duration: 0.2), value: env.activeToast?.id)
         .allowsHitTesting(false)
     }
 

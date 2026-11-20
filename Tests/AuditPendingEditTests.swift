@@ -243,12 +243,12 @@ extension FiveFixesRegressionTests {
     XCTAssertTrue(env.toast?.text.contains("chia sẻ") == true)
     XCTAssertEqual(try env.sessions.getDetail(sessionID: id), before)
     try Data("corrupt QA image".utf8).write(to: source)
-    env.toast = nil
+    env.dismissToast()
     let corrupt = await library.prepareShareFile(for: card)
     XCTAssertNil(corrupt)
     XCTAssertEqual(env.toast?.kind, .warning)
     try original.write(to: source)
-    env.toast = nil
+    env.dismissToast()
     let shared = await library.prepareShareFile(for: card)
     let output = try XCTUnwrap(shared)
     XCTAssertNotNil(CGImage.createFrom(data: try Data(contentsOf: output)))
@@ -269,7 +269,7 @@ extension FiveFixesRegressionTests {
     XCTAssertNil(busy)
     XCTAssertEqual(env.toast?.kind, .warning)
     token.release()
-    env.toast = nil
+    env.dismissToast()
     let cancelled = Task { @MainActor in await library.prepareShareFile(for: card) }
     cancelled.cancel()
     let result = await cancelled.value
@@ -543,7 +543,7 @@ extension FiveFixesRegressionTests {
     env.requestStorageMeasurement(isPostClean: true)
     await fulfillment(of: [accepted], timeout: 5)
     let marker = ToastMessage(text: "New measurement accepted", kind: .info)
-    env.toast = marker
+    env.showToast(marker.text, kind: marker.kind)
     gate.signal()
     await old.value
     XCTAssertFalse(env.isCleaningCache)

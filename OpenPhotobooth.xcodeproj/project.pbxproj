@@ -83,6 +83,7 @@
 		C25463769EEA546D0F52AC72 /* Clock.swift in Sources */ = {isa = PBXBuildFile; fileRef = 87DAF0F4F3AA7EFE22088BC6 /* Clock.swift */; };
 		C4DDF8C8A4FE487002B5C4D5 /* AppIcon.icns in Resources */ = {isa = PBXBuildFile; fileRef = F90734EC128272C40121391B /* AppIcon.icns */; };
 		C5866B561687929925375E7F /* AuditDuplicateExportTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0B5476E72999AE3AE9BF3940 /* AuditDuplicateExportTests.swift */; };
+		C77592F94D1BF489E505D85F /* ToastLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D6C1D105B1288C33BDC8ED59 /* ToastLifecycleTests.swift */; };
 		CB7A5E31DCA28521D172DEA9 /* OperationCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = E9F58ED16062A671384ECA5F /* OperationCoordinator.swift */; };
 		CD6EE81B4E4EC4267A58A3EA /* AcceptanceMatrixTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C9F08F729835F257D4E4827 /* AcceptanceMatrixTests.swift */; };
 		CFCC0D4D6DF01D29EA8430AF /* ImageColorPipeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5556517432BC6FEBD22C921 /* ImageColorPipeline.swift */; };
@@ -205,6 +206,7 @@
 		D2D94C99483425F787E06373 /* LibraryAndTrashViewModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryAndTrashViewModels.swift; sourceTree = "<group>"; };
 		D5556517432BC6FEBD22C921 /* ImageColorPipeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImageColorPipeline.swift; sourceTree = "<group>"; };
 		D596FD5E39C8D4CAF75AB794 /* ExportService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExportService.swift; sourceTree = "<group>"; };
+		D6C1D105B1288C33BDC8ED59 /* ToastLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToastLifecycleTests.swift; sourceTree = "<group>"; };
 		DBEE40DF1662C54EB8456026 /* CompositeRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompositeRenderer.swift; sourceTree = "<group>"; };
 		DCB3CDE484A5BEA9BEA28BAA /* AuditDataLinkTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuditDataLinkTests.swift; sourceTree = "<group>"; };
 		DCBC3CEEA348D21C5B0B6D78 /* FramesViewModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FramesViewModels.swift; sourceTree = "<group>"; };
@@ -432,6 +434,7 @@
 				B967A8CEA8EAF414DB8438D6 /* LibraryTabFixTests.swift */,
 				23BFEB4BEBE4BE7C702F88B7 /* OpenPhotoboothTests.swift */,
 				AB17EC134E53B036A2874B01 /* SessionCancellationTests.swift */,
+				D6C1D105B1288C33BDC8ED59 /* ToastLifecycleTests.swift */,
 				7FB783A0F972CE036B1A331F /* TrashAndSettingsFixTests.swift */,
 			);
 			path = Tests;
@@ -617,6 +620,7 @@
 				9960FDB2626F9D2F3C6EE5F2 /* LibraryTabFixTests.swift in Sources */,
 				FFB73FB6468B0F622582D92B /* OpenPhotoboothTests.swift in Sources */,
 				4986C8C9B5E076C7FFC32B6F /* SessionCancellationTests.swift in Sources */,
+				C77592F94D1BF489E505D85F /* ToastLifecycleTests.swift in Sources */,
 				ADA67D31375D962619BD0D74 /* TrashAndSettingsFixTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -777,8 +781,9 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Resources/OpenPhotobooth.entitlements;
+				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 3;
 				DEAD_CODE_STRIPPING = YES;
 				ENABLE_TESTABILITY = YES;
 				INFOPLIST_FILE = Resources/Info.plist;
@@ -786,7 +791,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.2.1;
+				MARKETING_VERSION = 1.2.2;
 				PRODUCT_BUNDLE_IDENTIFIER = vn.openphotobooth.app;
 				PRODUCT_MODULE_NAME = OpenPhotobooth;
 				PRODUCT_NAME = "Open Photobooth";
@@ -888,7 +893,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Resources/OpenPhotobooth.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 2;
+				CURRENT_PROJECT_VERSION = 3;
 				DEAD_CODE_STRIPPING = YES;
 				ENABLE_TESTABILITY = YES;
 				INFOPLIST_FILE = Resources/Info.plist;
@@ -896,7 +901,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.2.1;
+				MARKETING_VERSION = 1.2.2;
 				PRODUCT_BUNDLE_IDENTIFIER = vn.openphotobooth.app;
 				PRODUCT_MODULE_NAME = OpenPhotobooth;
 				PRODUCT_NAME = "Open Photobooth";
