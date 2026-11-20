@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import CoreGraphics
+import UniformTypeIdentifiers
 
 /// ReviewView (§2.8, §9.3): Xem và chỉnh ảnh sau khi chụp.
 /// Layout: photo strip (trên) | preview (giữa) | inspector phải (tab Màu/Làm mịn/Crop).
@@ -26,6 +27,13 @@ public struct ReviewView: View {
         VStack(spacing: 0) {
             header
             Divider()
+            if vm.missingFrameResources {
+                Label("Thiếu hoặc lỗi tài nguyên khung", systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.orange).padding(8)
+            } else if vm.missingPhotos > 0 {
+                Label("Thiếu ảnh trong khung · \(vm.missingPhotos) ảnh", systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.orange).padding(8)
+            }
             if let detail = vm.detail, let count = detail.session.pendingSelectionCount {
                 selectionPanel(detail: detail, captureCount: count)
             } else {
@@ -88,8 +96,18 @@ public struct ReviewView: View {
             ExportSheet(env: env, reviewVM: vm)
         }
         .sheet(isPresented: $showFramePicker) {
-            FrameSwitchSheet(env: env, currentFrameID: vm.detail?.snapshot.sourceFrameID) { newFrameID in
-                Task { await vm.changeFrame(to: newFrameID) }
+            if vm.detail?.session.defaults.plannedCaptureCount != nil {
+                CaptureFrameChooser(env: env, sessionID: sessionID,
+                                    onClose: { showFramePicker = false },
+                                    onApplied: {
+                    showFramePicker = false
+                    Task { await vm.load(sessionID: sessionID) }
+                })
+                .frame(minWidth: 780, minHeight: 560)
+            } else {
+                FrameSwitchSheet(env: env, currentFrameID: vm.detail?.snapshot.sourceFrameID) { newFrameID in
+                    Task { await vm.changeFrame(to: newFrameID) }
+                }
             }
         }
     }
@@ -187,7 +205,7 @@ public struct ReviewView: View {
             }
             Spacer()
             if vm.isSaving {
-                ProgressView().scaleEffect(0.7)
+                ProgressView().controlSize(.small).frame(width: 16, height: 16)
                 Text("Đang lưu…").font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -347,6 +365,7 @@ public struct ReviewView: View {
                     HStack(spacing: 6) {
                         Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
                         Text(saveErr).font(.caption).foregroundStyle(.secondary)
+                            .lineLimit(1).help(saveErr)
                         Button("Thử lưu lại") {
                             Task { await vm.retrySave() }
                         }
@@ -608,6 +627,7 @@ public struct ReviewView: View {
             }
         }
         .padding(12)
+        .disabled(!vm.canEditPlacement)
     }
 
     // MARK: Footer (§3.3 retake, §3.4 change frame, §11 export/share/complete)
@@ -623,11 +643,11 @@ public struct ReviewView: View {
             }
             .disabled(vm.selectedPhotoIndex == nil)
             Button {
-                showFramePicker = true
+                Task { if await vm.flushPendingEdits() { showFramePicker = true } }
             } label: {
                 Label("Đổi khung", systemImage: "rectangle.3.offgrid")
             }
-            if !vm.canExport {
+            if vm.missingPhotos > 0 {
                 Button {
                     Task { await vm.continueCapture() }
                 } label: {
@@ -664,7 +684,7 @@ public struct ReviewView: View {
             }
             .disabled(!vm.canExport)
             PrimaryButton(title: "Hoàn thành", systemImage: "checkmark.circle.fill",
-                          disabledReason: vm.canExport ? nil : "Chưa đủ ảnh") {
+                          disabledReason: vm.canExport ? nil : (vm.missingFrameResources ? "Thiếu tài nguyên khung" : "Chưa đủ ảnh")) {
                 Task {
                     guard await vm.complete() else { return }
                     let dest = env.reviewContext?.sourceRoute ?? .library
@@ -761,6 +781,428 @@ public struct FrameSwitchSheet: View {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Bộ chọn dùng chung cho phiên chụp trước, đổi khung và Kiosk.
+struct CaptureFrameChooser: View {
+    @ObservedObject var env: AppEnvironment
+    let sessionID: String
+    var kiosk = false
+    var onMissingPhotos: ((SessionDetail) -> Void)? = nil
+    let onClose: () -> Void
+    let onApplied: () -> Void
+
+    @State private var detail: SessionDetail?
+    @State private var frames: [FrameCardModel] = []
+    @State private var frame: FrameCardModel?
+    @State private var selection: [Int] = []
+    @Environment(\.displayScale) private var displayScale
+    @State private var viewport = CGSize.zero
+    @State private var framePreview: FramePreview?
+    @State private var selectionPreview: (request: PreviewSelection, image: CGImage)?
+    @State private var importDetail: SessionDetail?
+    @State private var importURL: URL?
+    @State private var error: String?
+    @State private var previewError: String?
+    @State private var applying = false
+    @State private var loading = true
+
+    private var photos: [Int: PhotoRevision] {
+        detail?.currentRevisions(includeUnassigned: true).filter { $0.value.state == .available } ?? [:]
+    }
+
+    private var required: Int { frame?.slotCount ?? 0 }
+    private var canConfirm: Bool {
+        required > 0 && selection.count == required && Set(selection).isSubset(of: Set(photos.keys))
+    }
+
+    private struct PreviewFrame: Equatable {
+        let id: String
+        let revision: String
+        let width: Int
+        let height: Int
+    }
+
+    @State private var previewRetry = 0
+
+    private struct PreviewSelection: Equatable {
+        let retry: Int
+        let sessionID: String
+        let sessionRevision: Int
+        let frame: PreviewFrame
+        let order: [Int]
+        let photoIDs: [String]
+    }
+
+    private struct FramePreview {
+        let request: PreviewFrame
+        let snapshot: FrameSnapshot
+        let image: CGImage
+    }
+
+    private var previewRequest: PreviewSelection? {
+        guard let detail, let frame, let revision = frame.frame.currentRevisionID,
+              viewport.width >= 1, viewport.height >= 1 else { return nil }
+        let pixelScale = min(displayScale, 1600 / max(viewport.width, viewport.height))
+        let width = max(1, Int((viewport.width * pixelScale).rounded()))
+        let height = max(1, Int((viewport.height * pixelScale).rounded()))
+        return PreviewSelection(retry: previewRetry, sessionID: detail.session.id, sessionRevision: detail.session.revisionNo,
+                                frame: PreviewFrame(id: frame.id, revision: revision, width: width, height: height),
+                                order: selection, photoIDs: selection.compactMap { photos[$0]?.id })
+    }
+
+    private var previewVerified: Bool {
+        guard let request = previewRequest else { return false }
+        return selectionPreview?.request == request
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Button("Quay lại", action: onClose)
+                    .disabled(applying)
+                Text("Chọn khung").font(.title2.bold())
+                Spacer()
+                Button("Nhập khung PNG", systemImage: "square.and.arrow.down", action: pickPNG)
+                    .disabled(loading || applying || detail == nil)
+            }
+            if let error {
+                Text(error).foregroundStyle(.red).accessibilityLabel(error)
+            }
+            if loading {
+                ProgressView("Đang kiểm tra ảnh…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if detail != nil {
+                HSplitView {
+                    frameList
+                        .frame(minWidth: 220, idealWidth: 300)
+                    VStack(alignment: .leading, spacing: 10) {
+                        photoStrip
+                        previewPane
+                    }
+                    .padding(.leading, 12)
+                    .frame(minWidth: 390, maxWidth: .infinity)
+                }
+                HStack {
+                    Text(status).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Dùng khung này") { Task { await apply() } }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!canConfirm || !previewVerified || applying)
+                }
+            } else {
+                Spacer()
+            }
+        }
+        .padding(24)
+        .background(.background)
+        .task { await reload() }
+        .task(id: previewRequest) { await updatePreview() }
+        .sheet(isPresented: Binding(get: { importURL != nil }, set: { if !$0 { importURL = nil } })) {
+            if let importURL {
+                FrameImportSheet(env: env, urls: [importURL], sessionPhotoCount: photos.count,
+                                 sessionDetail: importDetail, onSessionFrameSaved: { imported, canApply in
+                    let shown = importDetail
+                    Task {
+                        if canApply, let shown, let revision = imported.currentRevisionID {
+                            let ids = shown.currentRevisions(includeUnassigned: true)
+                                .filter { $0.value.state == .available }
+                                .sorted { $0.key < $1.key }.map { $0.value.id }
+                            await commit(frameID: imported.id, frameRevision: revision, detail: shown,
+                                         photoIDs: ids, imported: true)
+                        } else {
+                            await reload(preferredFrameID: imported.id)
+                        }
+                    }
+                }, onFinished: {})
+            }
+        }
+    }
+
+    private var frameList: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 8) {
+                if frames.isEmpty { Text("Chưa có khung sẵn sàng").foregroundStyle(.secondary) }
+                ForEach(frames) { card in
+                    Button {
+                        select(card)
+                    } label: {
+                        HStack {
+                            ChooserFrameThumbnail(env: env, frame: card.frame)
+                                .frame(width: 52, height: 50)
+                            VStack(alignment: .leading) {
+                                Text(card.frame.name).lineLimit(2)
+                                Text("\(card.slotCount) ảnh").font(.caption).foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if frame?.id == card.id { Image(systemName: "checkmark.circle.fill") }
+                        }
+                        .padding(6)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(frame?.id == card.id ? .isSelected : [])
+                }
+            }
+            .padding(4)
+        }
+        .disabled(applying)
+    }
+
+    private var photoStrip: some View {
+        ScrollView(.horizontal) {
+            HStack(spacing: 8) {
+                ForEach(photos.keys.sorted(), id: \.self) { index in
+                    if let photo = photos[index] {
+                        Button {
+                            selectionPreview = nil
+                            if let old = selection.firstIndex(of: index) { selection.remove(at: old) }
+                            else if selection.count < required { selection.append(index) }
+                        } label: {
+                            VStack {
+                                ChooserPhotoThumbnail(env: env, revision: photo)
+                                    .frame(width: 66, height: 52)
+                                if let selected = selection.firstIndex(of: index) {
+                                    Text("Ảnh \(index) · Ô \(selected + 1)").font(.caption)
+                                } else {
+                                    Text("Ảnh \(index)").font(.caption)
+                                }
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(selection.contains(index) ? .accentColor : nil)
+                        .disabled(applying || required == 0 ||
+                                  (selection.count == required && !selection.contains(index)))
+                        .accessibilityAddTraits(selection.contains(index) ? .isSelected : [])
+                    }
+                }
+            }
+        }
+    }
+
+    private var previewPane: some View {
+        GeometryReader { geometry in
+            Group {
+                if let request = previewRequest, let base = framePreview,
+                   base.request.id == request.frame.id, base.request.revision == request.frame.revision {
+                    let rendered = selectionPreview?.request == request ? selectionPreview?.image : nil
+                    let image = rendered ?? base.image
+                    let scale = min(geometry.size.width / Double(image.width),
+                                    geometry.size.height / Double(image.height))
+                    let width = Double(image.width) * scale
+                    let height = Double(image.height) * scale
+                    let ranks = Dictionary(uniqueKeysWithValues: base.snapshot.requiredIndices.sorted()
+                        .enumerated().map { ($0.element, $0.offset + 1) })
+                    ZStack(alignment: .topLeading) {
+                        Image(image, scale: 1, label: Text("Bản xem trước ảnh ghép"))
+                            .resizable()
+                            .accessibilityValue("\(rendered == nil ? 0 : selection.count)/\(required) ô đã điền")
+                        ForEach(base.snapshot.slots) { slot in
+                            if let rank = ranks[slot.captureIndex] {
+                                let filled = rendered != nil && rank <= selection.count
+                                Text("\(rank)")
+                                    .font(.caption.bold())
+                                    .foregroundStyle(.white)
+                                    .frame(width: 18, height: 18)
+                                    .background(.black.opacity(filled ? 0.7 : 0.45), in: Circle())
+                                    .position(x: (slot.x + slot.width / 2) * width,
+                                              y: (slot.y + slot.height / 2) * height)
+                                    .accessibilityHidden(true)
+                            }
+                        }
+                    }
+                    .frame(width: width, height: height)
+                } else if frame == nil {
+                    Text("Chọn một khung để xem trước").foregroundStyle(.secondary)
+                } else if previewError == nil {
+                    ProgressView("Đang dựng khung…")
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .onChange(of: geometry.size, initial: true) { _, size in viewport = size }
+        }
+    }
+
+    private var status: String {
+        if applying { return "Đang áp dụng khung…" }
+        if let previewError { return previewError }
+        guard required > 0 else { return "\(photos.count) ảnh khả dụng" }
+        if photos.count < required {
+            return "Đã chọn \(selection.count)/\(required) · Cần thêm \(required - photos.count) ảnh"
+        }
+        if selection.count < required { return "Chọn ảnh theo thứ tự · \(selection.count)/\(required)" }
+        return "\(required) ảnh dùng trong khung · \(photos.count) ảnh trong phiên"
+    }
+
+    private func select(_ card: FrameCardModel) {
+        if frame?.id == card.id, frame?.frame.currentRevisionID == card.frame.currentRevisionID {
+            if previewError != nil { previewRetry += 1 }
+            return
+        }
+        frame = card
+        if card.id == detail?.snapshot.sourceFrameID,
+           card.frame.currentRevisionID == detail?.snapshot.sourceFrameRevisionID,
+           let saved = detail?.session.defaults.selectedCaptureOrder,
+           saved.count == required, Set(saved).isSubset(of: Set(photos.keys)) {
+            selection = saved
+        } else {
+            selection = photos.count == required ? photos.keys.sorted() : []
+        }
+        selectionPreview = nil
+        previewError = nil
+    }
+
+    private func reload(preferredFrameID: String? = nil, retainError: Bool = false) async {
+        loading = true
+        defer { loading = false }
+        let repository = env.sessions
+        let frameRepository = env.frames
+        let filter = kiosk ? env.settings.fullscreenFrameFilter : "all"
+        let id = sessionID
+        let result = try? await Task.detached {
+            let current = try repository.verifiedCaptureDetail(sessionID: id)
+            let cards = try frameRepository.listReadyFrames()
+                .filter { filter == "all" || $0.categoryID == filter || $0.id == preferredFrameID }
+                .map { frame in
+                    let slots = try frame.currentRevisionID.map { try frameRepository.getSlots(revisionID: $0) } ?? []
+                    return FrameCardModel(frame: frame, thumbnail: nil,
+                                          slotCount: Set(slots.map(\.captureIndex)).count)
+                }
+            return (current, cards)
+        }.value
+        guard !Task.isCancelled else { return }
+        guard let result, let current = result.0 else {
+            detail = nil
+            error = "Không tìm thấy phiên chụp"
+            return
+        }
+        if current.session.awaitsFrame && !current.missingIndices.isEmpty {
+            if let onMissingPhotos { onMissingPhotos(current) }
+            else { env.openReview(sessionID: sessionID, source: .library) }
+            error = "Phiên còn thiếu ảnh"
+            return
+        }
+        let previousFrame = frame
+        let previousSelection = selection
+        detail = current
+        frames = result.1
+        frame = nil
+        selection = []
+        framePreview = nil
+        selectionPreview = nil
+        if !retainError { error = nil }
+        let wanted = preferredFrameID ?? previousFrame?.id ?? current.snapshot.sourceFrameID ??
+            (kiosk ? env.settings.fullscreenDefaultFrame : nil)
+        if let card = frames.first(where: { $0.id == wanted }) ?? frames.first {
+            select(card)
+            if retainError, card.id == previousFrame?.id,
+               card.frame.currentRevisionID == previousFrame?.frame.currentRevisionID {
+                let available = photos
+                selection = previousSelection.filter { available[$0] != nil }
+            }
+        }
+    }
+
+    private func updatePreview() async {
+        previewError = nil
+        guard let request = previewRequest, let detail,
+              request.photoIDs.count == request.order.count else { return }
+        do {
+            let result = try await env.chooserPreviews.render(detail: detail, frameID: request.frame.id,
+                revision: request.frame.revision, order: request.order,
+                width: request.frame.width, height: request.frame.height)
+            guard !Task.isCancelled, previewRequest == request else { return }
+            framePreview = FramePreview(request: request.frame, snapshot: result.snapshot, image: result.frame)
+            selectionPreview = result.selection.map { (request, $0) }
+        } catch {
+            guard !Task.isCancelled, previewRequest == request else { return }
+            selectionPreview = nil
+            previewError = (error as? AppError)?.message ?? "Không thể xem trước. Kiểm tra ảnh hoặc tài nguyên khung."
+        }
+    }
+
+    private func pickPNG() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.png]
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK {
+            importDetail = detail
+            importURL = panel.url
+        }
+    }
+
+    private func apply() async {
+        guard let detail, let frame, let revisionID = frame.frame.currentRevisionID,
+              canConfirm, previewVerified else { return }
+        await commit(frameID: frame.id, frameRevision: revisionID, detail: detail,
+                     photoIDs: selection.compactMap { photos[$0]?.id }, imported: false)
+    }
+
+    private func commit(frameID: String, frameRevision: String, detail: SessionDetail,
+                        photoIDs: [String], imported: Bool) async {
+        guard !applying else { return }
+        applying = true
+        defer { applying = false }
+        let sessions = env.sessions
+        let frames = env.frames
+        let assets = env.assets
+        let id = sessionID
+        do {
+            try await Task.detached {
+                try sessions.applyCaptureFrame(sessionID: id, expectedRevision: detail.session.revisionNo,
+                                               frameID: frameID, frameRevisionID: frameRevision,
+                                               orderedPhotoIDs: photoIDs, frames: frames, assets: assets)
+            }.value
+            if env.engine.session?.id == id, let updated = try? sessions.getDetail(sessionID: id) {
+                _ = env.engine.adoptSession(record: updated.session, snapshot: updated.snapshot,
+                                            committed: updated.currentRevisions(), forReview: true)
+            }
+            onApplied()
+        } catch {
+            let message = (error as? AppError)?.message ?? error.localizedDescription
+            self.error = imported ? "Đã lưu khung, chưa áp dụng. \(message)" : message
+            await reload(preferredFrameID: frameID, retainError: true)
+        }
+    }
+}
+
+private struct ChooserFrameThumbnail: View {
+    let env: AppEnvironment
+    let frame: Frame
+    @State private var thumbnail: Data?
+
+    var body: some View {
+        ImageDataView(data: thumbnail)
+            .task(id: frame.currentRevisionID) {
+                if let revision = frame.currentRevisionID {
+                    thumbnail = await env.frameThumbnails.requestThumbnail(frameID: frame.id, revisionID: revision)
+                }
+            }
+    }
+}
+
+private struct ChooserPhotoThumbnail: View {
+    let env: AppEnvironment
+    let revision: PhotoRevision
+    @State private var image: CGImage?
+
+    var body: some View {
+        Group {
+            if let image { Image(decorative: image, scale: 1).resizable().scaledToFill() }
+            else { Image(systemName: "photo").foregroundStyle(.secondary) }
+        }
+        .clipped()
+        .task(id: revision.id) {
+            let repository = env.sessions
+            let photo = revision
+            image = await Task.detached {
+                guard let url = try? repository.fileURL(for: photo) else { return nil }
+                return LibraryViewModel.downscaleThumbnail(url: url, maxDimension: 145)
+                    .flatMap { CGImage.createFrom(data: $0) }
+            }.value
         }
     }
 }

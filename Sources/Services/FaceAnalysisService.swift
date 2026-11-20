@@ -24,7 +24,10 @@ public final class FaceAnalysisService: @unchecked Sendable {
     private let cacheLock = NSLock()
     private var cache: [String: [FaceBox]] = [:]  // key: photoRevisionID|assetHash
 
-    public init() {}
+    private let detector: (@Sendable (CGImage) -> [FaceBox])?
+
+    public init() { detector = nil }
+    init(detector: @escaping @Sendable (CGImage) -> [FaceBox]) { self.detector = detector }
 
     public func clearCache() {
         cacheLock.lock(); cache.removeAll(); cacheLock.unlock()
@@ -38,7 +41,9 @@ public final class FaceAnalysisService: @unchecked Sendable {
     /// Phát hiện mặt trên ảnh tĩnh (đã chuẩn hóa orientation). Kết quả cache theo key.
     public func detectFaces(cgImage: CGImage, cacheKey: String? = nil) async -> [FaceBox] {
         if let key = cacheKey, let hit = cachedFaces(key: key) { return hit }
-        let boxes = await withCheckedContinuation { (cont: CheckedContinuation<[FaceBox], Never>) in
+        let boxes: [FaceBox]
+        if let detector { boxes = detector(cgImage) }
+        else { boxes = await withCheckedContinuation { (cont: CheckedContinuation<[FaceBox], Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 let request = VNDetectFaceRectanglesRequest()
                 request.revision = VNDetectFaceRectanglesRequestRevision3
@@ -59,6 +64,7 @@ public final class FaceAnalysisService: @unchecked Sendable {
                     cont.resume(returning: [])
                 }
             }
+        }
         }
         if let key = cacheKey {
             cacheLock.lock()

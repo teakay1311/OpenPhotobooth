@@ -123,6 +123,130 @@ public struct ToastOverlay: View {
     }
 }
 
+// MARK: - Hủy phiên chụp
+
+struct CaptureCancellationButton: View {
+    @ObservedObject var env: AppEnvironment
+    @State private var showsSheet = false
+
+    var body: some View {
+        Group {
+            if env.engine.canCancelSession || showsSheet {
+                Button("Hủy phiên chụp…") {
+                    do {
+                        try env.engine.requestSessionCancellation()
+                        showsSheet = true
+                    } catch {
+                        env.showToast((error as? AppError)?.message ?? error.localizedDescription, kind: .warning)
+                    }
+                }
+                .disabled(env.engine.isCancellingSession || env.showLeaveCaptureConfirmation)
+            }
+        }
+        .sheet(isPresented: $showsSheet) {
+            CaptureCancellationSheet(engine: env.engine)
+                .interactiveDismissDisabled()
+        }
+        .onChange(of: env.engine.cancellationPhase) { _, phase in
+            if phase == nil { showsSheet = false }
+        }
+    }
+}
+
+private struct CaptureCancellationSheet: View {
+    @ObservedObject var engine: CaptureEngine
+
+    private var title: String {
+        if engine.session?.awaitsFrame == true { return "Hủy phiên chụp?" }
+        let name = engine.session?.defaults.appliedFrameName ?? engine.session?.frameNameAtCapture ?? "khung hiện tại"
+        return "Hủy phiên \(name)?"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(title)
+                .font(.headline)
+                .accessibilityAddTraits(.isHeader)
+            switch engine.cancellationPhase {
+            case .confirming:
+                Text("Phiên cùng \(engine.committedShots.count) ảnh đã lưu sẽ được chuyển vào Thùng rác.")
+                HStack {
+                    backButton
+                    Spacer()
+                    Button("Hủy phiên", role: .destructive) { engine.confirmSessionCancellation() }
+                }
+            case .waitingForShot:
+                ProgressView("Đang hoàn tất lượt hiện tại…")
+            case .saveFailed(let message, let index):
+                Text("Chưa lưu được ảnh lượt \(index). \(message)")
+                HStack {
+                    backButton
+                    Spacer()
+                    Button("Thử lưu lại") { Task { await engine.retrySaveForSessionCancellation() } }
+                    Button("Bỏ ảnh chưa lưu và hủy phiên", role: .destructive) {
+                        engine.requestDiscardForSessionCancellation()
+                    }
+                }
+            case .confirmingDiscard(_, let index):
+                Text("Ảnh lượt \(index) sẽ bị bỏ nếu chưa lưu được. Phiên và các ảnh đã lưu sẽ được chuyển vào Thùng rác.")
+                HStack {
+                    backButton
+                    Spacer()
+                    Button("Bỏ ảnh chưa lưu và hủy phiên", role: .destructive) {
+                        engine.discardForSessionCancellation()
+                    }
+                }
+            case nil:
+                EmptyView()
+            }
+        }
+        .padding(24)
+        .frame(width: 510)
+        .background(CaptureCancellationEscape { engine.returnFromSessionCancellation() })
+    }
+
+    private var backButton: some View {
+        Button("Quay lại") { engine.returnFromSessionCancellation() }
+            .keyboardShortcut(.defaultAction)
+    }
+}
+
+private struct CaptureCancellationEscape: NSViewRepresentable {
+    let action: () -> Void
+
+    func makeNSView(context: Context) -> EscapeHandler { EscapeHandler() }
+
+    func updateNSView(_ view: EscapeHandler, context: Context) {
+        view.action = action
+    }
+
+    // The parent capture view also handles Escape. Limit this override to the sheet's window.
+    final class EscapeHandler: NSView {
+        var action: (() -> Void)?
+        private var monitor: Any?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let monitor {
+                NSEvent.removeMonitor(monitor)
+                self.monitor = nil
+            }
+            guard window != nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                guard let self, let window, event.window === window, event.charactersIgnoringModifiers == "\u{1b}" else {
+                    return event
+                }
+                action?()
+                return nil
+            }
+        }
+
+        deinit {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+        }
+    }
+}
+
 // MARK: - Banner phiên chưa hoàn thành (§3.1.6)
 
 public struct SessionBanner: View {

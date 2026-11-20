@@ -24,7 +24,7 @@ public final class FrameThumbnailService: @unchecked Sendable {
 
     /// Trả về cached thumbnail nếu có sẵn, hoặc nil nếu chưa dựng.
     public func cachedThumbnail(frameID: String, revisionID: String) -> Data? {
-        thumbnails.cachedData(key: "frame-v2-\(revisionID)", validForGeneration: thumbnails.generation)
+        thumbnails.cachedData(key: "frame-v2-r\(CompositeRenderer.renderCacheVersion)-\(revisionID)", validForGeneration: thumbnails.generation)
     }
 
     private func getInFlight(key: String) -> Task<Data?, Never>? {
@@ -48,7 +48,7 @@ public final class FrameThumbnailService: @unchecked Sendable {
     /// Yêu cầu thumbnail bất đồng bộ (coalesce theo key + generation, A3 đúng tỷ lệ).
     public func requestThumbnail(frameID: String, revisionID: String) async -> Data? {
         let gen = thumbnails.generation
-        let key = "frame-v2-\(revisionID)"
+        let key = "frame-v2-r\(CompositeRenderer.renderCacheVersion)-\(revisionID)"
         if let cached = thumbnails.cachedData(key: key, validForGeneration: gen) {
             return cached
         }
@@ -78,8 +78,8 @@ public final class FrameThumbnailService: @unchecked Sendable {
             let snapSlots = slots.map { SnapshotSlot(from: $0) }
             let snap = FrameSnapshot(sourceFrameID: frameID, sourceFrameRevisionID: revisionID,
                                      canvasWidth: rev.canvasWidth, canvasHeight: rev.canvasHeight,
-                                     background: rev.backgroundAssetID.map { SnapshotLayer(assetID: $0, placement: rev.backgroundPlacement) },
-                                     foreground: rev.foregroundAssetID.map { SnapshotLayer(assetID: $0, placement: rev.foregroundPlacement) },
+                                     background: rev.backgroundAssetID.map { SnapshotLayer(assetID: $0, placement: rev.backgroundPlacement, imageOrientation: rev.backgroundImageOrientation) },
+                                     foreground: rev.foregroundAssetID.map { SnapshotLayer(assetID: $0, placement: rev.foregroundPlacement, imageOrientation: rev.foregroundImageOrientation) },
                                      backgroundColorHex: rev.backgroundColorHex,
                                      slots: snapSlots, snapshotHash: "thumb-\(revisionID)")
 

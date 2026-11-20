@@ -59,23 +59,16 @@ public final class SessionRenderBuilder: @unchecked Sendable {
             sources[index] = RenderSource(image: image)
             // Vision trên ảnh đã normalize (§8.4) — cacheKey gắn rotation để không dùng
             // kết quả của ảnh xoay cho ảnh chưa xoay (và ngược lại)
-            if detail.session.defaults.smartFace ?? true {
+            if Self.requiresAutoFace(detail, index: index) {
                 let detected = await faceAnalysis.detectFaces(cgImage: image,
-                                                               cacheKey: "\(revision.id)|rot\(Int(resolved.photoRotation))")
+                                                               cacheKey: "\(revision.id)|m\(detail.session.defaults.outputMirror)|rot\(resolved.photoRotation)")
                 faces[index] = detected
             } else {
                 faces[index] = []
             }
         }
 
-        var placements: [String: PhotoPlacement] = [:]
-        var cropModes: [String: CropMode] = [:]
-        for slot in detail.snapshot.slots {
-            if let p = detail.placements[slot.id] {
-                placements[slot.id] = p.placement
-                cropModes[slot.id] = p.cropMode
-            }
-        }
+        let (placements, cropModes) = Self.resolvePlacements(detail: detail, sources: sources, faces: faces)
 
         return CompositionModel(snapshot: detail.snapshot,
                                 sources: sources,
@@ -90,48 +83,127 @@ public final class SessionRenderBuilder: @unchecked Sendable {
                                                        matteColor: matteColor))
     }
 
+    static func requiresAutoFace(_ detail: SessionDetail, index: Int) -> Bool {
+        detail.session.defaults.autoFacePlacementVersion == 1 && detail.session.defaults.smartFace != false &&
+            detail.snapshot.slots.contains { slot in
+                slot.captureIndex == index && detail.placements[slot.id]?.manualOverride != true &&
+                    (detail.placements[slot.id]?.cropMode ?? slot.defaultCropMode) == .autoFace
+            }
+    }
+
+    static func resolvePlacements(detail: SessionDetail, sources: [Int: RenderSource], faces: [Int: [FaceBox]])
+        -> (placements: [String: PhotoPlacement], cropModes: [String: CropMode]) {
+        var placements: [String: PhotoPlacement] = [:]
+        var modes: [String: CropMode] = [:]
+        for slot in detail.snapshot.slots {
+            let stored = detail.placements[slot.id]
+            placements[slot.id] = stored?.placement ?? PhotoPlacement()
+            modes[slot.id] = stored?.cropMode ?? slot.defaultCropMode
+            guard requiresAutoFace(detail, index: slot.captureIndex), stored?.manualOverride != true,
+                  modes[slot.id] == .autoFace, let source = sources[slot.captureIndex] else { continue }
+            let result = SmartFraming.propose(sourceWidth: Double(source.width), sourceHeight: Double(source.height),
+                slotWidth: slot.width * Double(detail.snapshot.canvasWidth),
+                slotHeight: slot.height * Double(detail.snapshot.canvasHeight), faces: faces[slot.captureIndex] ?? [],
+                userManualOverride: false, defaultMode: .autoFace)
+            placements[slot.id] = PhotoPlacement(scale: result.scale, offsetX: result.offsetX, offsetY: result.offsetY)
+            modes[slot.id] = result.fitMode
+        }
+        return (placements, modes)
+    }
+
     /// A1: Nhánh nghiêm ngặt dùng chung cho Xuất tay, Auto Export và Tạo tệp Chia sẻ.
     /// Xác nhận từng ảnh hiện hành bắt buộc và mỗi lớp nền/lớp phủ được khai báo đều đọc và giải mã được từ đĩa thật.
-    public func buildModelStrict(detail: SessionDetail, targetWidth: Int, targetHeight: Int,
-                                 transparentBackground: Bool = false,
-                                 matteColor: CGColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)) async throws -> CompositionModel {
+    func verifiedFrameLayers(_ detail: SessionDetail) throws -> [String: CGImage] {
+        if detail.session.awaitsFrame { throw AppError.invalidState("Chọn khung ảnh trước") }
         if detail.needsPhotoSelection { throw AppError.invalidState("Chọn ảnh vào khung trước") }
         guard detail.hasEnoughPhotos else {
             throw AppError.notEnoughPhotos(missing: detail.missingCount)
         }
-        var assetImages: [String: CGImage] = [:]
-        if let bg = detail.snapshot.background {
-            guard let img = try? assets.loadVerifiedImage(assetID: bg.assetID) else {
-                throw AppError.missingFrameAssets
-            }
-            assetImages[bg.assetID] = img
-        }
-        if let fg = detail.snapshot.foreground {
-            guard let img = try? assets.loadVerifiedImage(assetID: fg.assetID) else {
-                throw AppError.missingFrameAssets
-            }
-            assetImages[fg.assetID] = img
-        }
+        return try verifiedFrameLayers(detail.snapshot)
+    }
 
+    private func verifiedFrameLayers(_ snapshot: FrameSnapshot) throws -> [String: CGImage] {
+        var images: [String: CGImage] = [:]
+        for layer in [snapshot.background, snapshot.foreground].compactMap({ $0 }) {
+            guard let image = try? assets.loadVerifiedImage(assetID: layer.assetID) else {
+                throw AppError.missingFrameAssets
+            }
+            images[layer.assetID] = image
+        }
+        return images
+    }
+
+    func verifiedSource(_ detail: SessionDetail, index: Int) throws -> CGImage {
+        try verifiedSource(detail.currentRevisions()[index], index: index)
+    }
+
+    private func verifiedSource(_ revision: PhotoRevision?, index: Int) throws -> CGImage {
+        guard let revision, revision.state == .available else {
+            throw AppError.notEnoughPhotos(missing: 1)
+        }
+        do {
+            return try sessions.verifiedPhotoImage(revision)
+        } catch {
+            throw AppError.ioFailure("Tệp ảnh lượt \(index) bị thiếu, hỏng hoặc không khớp checksum")
+        }
+    }
+
+    func verifyCompletion(_ detail: SessionDetail) throws {
+        _ = try verifiedFrameLayers(detail)
+        for index in detail.snapshot.requiredIndices.sorted() {
+            _ = try verifiedSource(detail, index: index)
+        }
+    }
+
+    public func buildModelStrict(detail: SessionDetail, targetWidth: Int, targetHeight: Int,
+                                 transparentBackground: Bool = false,
+                                 matteColor: CGColor = CGColor(red: 1, green: 1, blue: 1, alpha: 1)) async throws -> CompositionModel {
+        let assetImages = try verifiedFrameLayers(detail)
+        return try await buildVerifiedModel(detail: detail, revisions: detail.currentRevisions(),
+                                            assetImages: assetImages,
+                                            options: RenderOptions(targetWidth: targetWidth,
+                                                                   targetHeight: targetHeight,
+                                                                   transparentBackground: transparentBackground,
+                                                                   matteColor: matteColor))
+    }
+
+    func renderChooserPreview(detail: SessionDetail, snapshot: FrameSnapshot, order: [Int],
+                              width: Int, height: Int) async throws -> CGImage {
+        guard order.count <= snapshot.requiredCaptureCount, Set(order).count == order.count,
+              snapshot.canvasWidth > 0, snapshot.canvasHeight > 0, width > 0, height > 0 else {
+            throw AppError.invalidState("Không thể dựng bản xem trước")
+        }
+        let scale = min(Double(width) / Double(snapshot.canvasWidth),
+                        Double(height) / Double(snapshot.canvasHeight))
+        var draft = detail
+        draft.snapshot = snapshot.previewAssigningPhotos(in: order)
+        if detail.snapshot.sourceFrameID != snapshot.sourceFrameID ||
+            detail.snapshot.sourceFrameRevisionID != snapshot.sourceFrameRevisionID {
+            draft.session.defaults.autoFacePlacementVersion = 1
+        }
+        if detail.snapshot.sourceFrameRevisionID != snapshot.sourceFrameRevisionID ||
+            detail.session.defaults.selectedCaptureOrder != order {
+            draft.placements = [:]
+        }
+        let options = RenderOptions(targetWidth: max(1, Int((Double(snapshot.canvasWidth) * scale).rounded())),
+                                    targetHeight: max(1, Int((Double(snapshot.canvasHeight) * scale).rounded())),
+                                    transparentBackground: true)
+        let model = try await buildVerifiedModel(detail: draft,
+                                                 revisions: detail.currentRevisions(includeUnassigned: true),
+                                                 assetImages: verifiedFrameLayers(snapshot), options: options)
+        try Task.checkCancellation()
+        return try CompositeRenderer.render(model: model)
+    }
+
+    private func buildVerifiedModel(detail: SessionDetail, revisions: [Int: PhotoRevision],
+                                    assetImages: [String: CGImage],
+                                    options: RenderOptions) async throws -> CompositionModel {
         var sources: [Int: RenderSource] = [:]
         var faces: [Int: [FaceBox]] = [:]
-        let current = detail.currentRevisions()
-        for index in detail.snapshot.requiredIndices {
-            guard let revision = current[index], revision.state == .available else {
-                throw AppError.notEnoughPhotos(missing: 1)
-            }
-            guard let url = try? sessions.fileURL(for: revision),
-                  let bytes = try? Data(contentsOf: url) else {
-                throw AppError.ioFailure("Không đọc được tệp ảnh lượt \(index)")
-            }
-            if revision.sha256.isEmpty {
-                Log.export.warning("Ảnh cũ lượt \(index) chưa có checksum để đối chiếu")
-            } else if Hashing.sha256Hex(bytes) != revision.sha256 {
-                throw AppError.ioFailure("Tệp ảnh lượt \(index) không khớp checksum của phiên")
-            }
-            guard let raw = ImageNormalizer.uprightImage(data: bytes) else {
-                throw AppError.ioFailure("Tệp ảnh lượt \(index) bị hỏng trên ổ đĩa")
-            }
+        for index in detail.snapshot.requiredIndices.sorted() {
+            try Task.checkCancellation()
+            let raw = try verifiedSource(revisions[index], index: index)
+            guard let revision = revisions[index] else { throw AppError.notEnoughPhotos(missing: 1) }
             let resolved = ResolvedPhotoParams.resolve(defaults: detail.session.defaults,
                                                        override: detail.overrides[index])
             var decoded = ImageNormalizer.applyOutputMirror(raw, mirrored: detail.session.defaults.outputMirror)
@@ -141,23 +213,16 @@ public final class SessionRenderBuilder: @unchecked Sendable {
             let cacheKey = "\(revision.id)|m\(detail.session.defaults.outputMirror ? 1 : 0)|r\(Int(resolved.photoRotation))"
             sourceImageCache.setObject(decoded, forKey: cacheKey as NSString)
             sources[index] = RenderSource(image: decoded)
-            if detail.session.defaults.smartFace ?? true {
+            if Self.requiresAutoFace(detail, index: index) {
                 let detected = await faceAnalysis.detectFaces(cgImage: decoded,
-                                                              cacheKey: "\(revision.id)|rot\(Int(resolved.photoRotation))")
+                                                              cacheKey: "\(revision.id)|m\(detail.session.defaults.outputMirror)|rot\(resolved.photoRotation)")
                 faces[index] = detected
             } else {
                 faces[index] = []
             }
         }
 
-        var placements: [String: PhotoPlacement] = [:]
-        var cropModes: [String: CropMode] = [:]
-        for slot in detail.snapshot.slots {
-            if let p = detail.placements[slot.id] {
-                placements[slot.id] = p.placement
-                cropModes[slot.id] = p.cropMode
-            }
-        }
+        let (placements, cropModes) = Self.resolvePlacements(detail: detail, sources: sources, faces: faces)
 
         return CompositionModel(snapshot: detail.snapshot,
                                 sources: sources,
@@ -167,9 +232,7 @@ public final class SessionRenderBuilder: @unchecked Sendable {
                                 placements: placements,
                                 cropModes: cropModes,
                                 assetImages: assetImages,
-                                options: RenderOptions(targetWidth: targetWidth, targetHeight: targetHeight,
-                                                       transparentBackground: transparentBackground,
-                                                       matteColor: matteColor))
+                                options: options)
     }
 
     /// Render cache preview (Thư viện / Review / Sheet xuất) — key theo §11.1, D2-A09.

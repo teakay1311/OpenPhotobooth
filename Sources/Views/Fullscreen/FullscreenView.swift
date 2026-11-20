@@ -22,7 +22,8 @@ public struct FullscreenView: View {
             Group {
                 switch vm.step {
                 case .welcome: welcomeStep
-                case .selectFrame: selectFrameStep
+                case .captureSetup: captureSetupStep
+                case .chooseFrame: chooseFrameStep
                 case .live: liveStep
                 case .review: reviewStep
                 case .finish: finishStep
@@ -41,7 +42,7 @@ public struct FullscreenView: View {
                             .foregroundStyle(.white.opacity(0.7))
                     }
                     .buttonStyle(.plain)
-                    .disabled(vm.exitRequested)
+                    .disabled(vm.exitRequested || env.engine.isCancellingSession)
                     .help("Đóng chế độ toàn màn hình (Esc)")
                     .accessibilityLabel("Đóng chế độ toàn màn hình")
                     .padding(14)
@@ -52,6 +53,7 @@ public struct FullscreenView: View {
         .onExitCommand { requestExit() }
         .onChange(of: env.nativeFullscreenExitRequest) { requestExit() }
         .onChange(of: env.engine.state) { vm.finishExitIfReady() }
+        .onChange(of: env.lastCancelledCaptureID) { vm.returnToCaptureSetupAfterCancellation() }
         .overlay(alignment: .bottom) {
             ToastOverlay(env: env).allowsHitTesting(false)
         }
@@ -63,7 +65,7 @@ public struct FullscreenView: View {
             Task { await captureVM.refreshCameraState() }
         }
         .task { await captureVM.observeCameraEvents() }
-        .onChange(of: env.engine.isCaptureBusy) { _, busy in
+        .onChange(of: env.engine.isCaptureBusy || env.engine.isCancellingSession) { _, busy in
             if !busy { Task { await captureVM.resumeDeferredCameraRefresh() } }
         }
         .onDisappear {
@@ -72,6 +74,7 @@ public struct FullscreenView: View {
     }
 
     private func requestExit() {
+        guard !env.engine.isCancellingSession else { return }
         shootingTask?.cancel()
         vm.exitFullscreenRequested()
     }
@@ -83,46 +86,19 @@ public struct FullscreenView: View {
             Text("Photobooth").font(.system(size: 56, weight: .bold)).foregroundStyle(.white)
             Text("Chạm để bắt đầu").font(.title2).foregroundStyle(.white.opacity(0.7))
             PrimaryButton(title: "Bắt đầu", systemImage: "play.fill") {
-                vm.step = .selectFrame
+                vm.step = .captureSetup
             }
             .controlSize(.large)
         }
     }
 
-    // MARK: Select frame
+    // MARK: Thiết lập chụp
 
-    private var selectFrameStep: some View {
-        VStack(spacing: 0) {
-            Text("Chọn khung").font(.title).foregroundStyle(.white).padding(.top, 20)
-            if vm.readyFrames.isEmpty {
-                Spacer()
-                Text("Chưa có khung hợp lệ. Mở màn Khung ảnh để thêm.").foregroundStyle(.white.opacity(0.6))
-                Spacer()
-            } else {
-                ScrollView {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 200), spacing: 12)], spacing: 12) {
-                        ForEach(vm.readyFrames) { card in
-                            Button {
-                                vm.selectedFrameID = card.id
-                            } label: {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    ImageDataView(data: card.thumbnail)
-                                        .frame(height: 160)
-                                        .clipShape(RoundedRectangle(cornerRadius: 10))
-                                    Text(card.frame.name).foregroundStyle(.white).font(.headline)
-                                    Text("\(card.slotCount) ảnh").foregroundStyle(.white.opacity(0.6)).font(.caption)
-                                }
-                                .padding(8)
-                                .background(RoundedRectangle(cornerRadius: 12)
-                                    .strokeBorder(vm.selectedFrameID == card.id ? Color.accentColor : Color.white.opacity(0.2),
-                                                  lineWidth: vm.selectedFrameID == card.id ? 3 : 1))
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(20)
-                }
-            }
+    private var captureSetupStep: some View {
+        VStack(spacing: 20) {
+            Text("Thiết lập chụp").font(.title).foregroundStyle(.white)
+            CaptureCountPicker(count: $captureVM.plannedCaptureCount)
+                .foregroundStyle(.white)
             HStack(spacing: 12) {
                 Button("Quay lại") { vm.step = .welcome }
                     .buttonStyle(.borderedProminent)
@@ -155,9 +131,21 @@ public struct FullscreenView: View {
         }
     }
 
+    @ViewBuilder private var chooseFrameStep: some View {
+        if let id = env.engine.session?.id {
+            CaptureFrameChooser(env: env, sessionID: id, kiosk: true, onMissingPhotos: { detail in
+                if env.engine.adoptSession(record: detail.session, snapshot: detail.snapshot,
+                                           committed: detail.currentRevisions()) {
+                    vm.step = .live
+                }
+            }, onClose: { requestExit() },
+                                onApplied: { Task { await vm.openReview() } })
+                .padding(.top, 38)
+        }
+    }
+
     private var shootDisabledReason: String? {
         if vm.isStarting { return "Đang chuẩn bị phiên chụp" }
-        if vm.selectedFrameID == nil { return "Chọn khung" }
         if captureVM.permissionState != .authorized { return "Cần bật camera trước" }
         if !captureVM.isCameraReady { return "Chờ camera sẵn sàng" }
         return nil
@@ -189,6 +177,11 @@ public struct FullscreenView: View {
                 Text("Camera không khả dụng").foregroundStyle(.white)
             }
             // Overlay countdown
+            if let session = env.engine.session {
+                Text("Đã lưu \(env.engine.committedShots.count)/\(session.captureCount) ảnh")
+                    .foregroundStyle(.white)
+                    .monospacedDigit()
+            }
             if case .countdown(let remaining, let index, _) = env.engine.state {
                 VStack(spacing: 6) {
                     Text("\(remaining)").font(.system(size: 96, weight: .bold, design: .rounded))
@@ -197,17 +190,20 @@ public struct FullscreenView: View {
                         .font(.title3).foregroundStyle(.white)
                 }
             }
+            CaptureCancellationButton(env: env)
             switch env.engine.state {
-            case .ready where env.engine.session?.captureMode == .manual:
+            case .ready where !env.engine.isCancellingSession:
                 PrimaryButton(title: "Chụp tiếp", systemImage: "camera",
                               disabledReason: captureVM.isCameraReady ? nil : "Chờ camera sẵn sàng") {
                     Task {
                         guard await env.capturePreview.confirmVideoFallback(), env.showFullscreen, !vm.exitRequested else { return }
-                        do { try env.engine.captureNextManual() }
-                        catch { env.showToast(error.localizedDescription, kind: .warning) }
+                        do {
+                            if env.engine.session?.captureMode == .manual { try env.engine.captureNextManual() }
+                            else { try env.engine.startOrContinue() }
+                        } catch { env.showToast(error.localizedDescription, kind: .warning) }
                     }
                 }
-            case .paused:
+            case .paused where !env.engine.isCancellingSession:
                 PrimaryButton(title: "Tiếp tục", systemImage: "play.fill",
                               disabledReason: captureVM.isCameraReady ? nil : "Chờ camera sẵn sàng") {
                     Task {
@@ -216,7 +212,7 @@ public struct FullscreenView: View {
                         catch { env.showToast(error.localizedDescription, kind: .warning) }
                     }
                 }
-            case .recoverableError(let message, _):
+            case .recoverableError(let message, _) where !env.engine.isCancellingSession:
                 Text(message).foregroundStyle(.white)
                 PrimaryButton(title: captureVM.startButtonTitle, systemImage: "arrow.clockwise",
                               disabledReason: env.engine.hasPhotoToSave || captureVM.isCameraReady ? nil : "Chờ camera sẵn sàng") {

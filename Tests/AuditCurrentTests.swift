@@ -152,6 +152,9 @@ final class AuditCurrentTests: XCTestCase {
         print("AUDIT-SLOTS count=\(vm.slots.count) indices=\(vm.slots.map(\.captureIndex).sorted())")
         XCTAssertEqual(vm.slots.count, 12)
         XCTAssertEqual(Set(vm.slots.map(\.captureIndex)), Set(1...12))
+        let deadline = ContinuousClock.now + .seconds(5)
+        while vm.isValidating, ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(vm.isValidating)
         XCTAssertTrue(vm.canSave)
     }
 

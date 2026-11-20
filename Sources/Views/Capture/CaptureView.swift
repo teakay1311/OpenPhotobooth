@@ -42,7 +42,7 @@ public struct CaptureView: View {
             Task { await vm.refreshCameraState() }
         }
         .task { await vm.observeCameraEvents() }
-        .onChange(of: env.engine.isCaptureBusy) { _, busy in
+        .onChange(of: env.engine.isCaptureBusy || env.engine.isCancellingSession) { _, busy in
             if !busy { Task { await vm.resumeDeferredCameraRefresh() } }
         }
         .onChange(of: env.route) { route in
@@ -56,7 +56,7 @@ public struct CaptureView: View {
                 env.retakeSessionID = nil
                 env.openReview(sessionID: retakeID, source: env.reviewContext?.sourceRoute ?? .capture)
             } else if case .reviewing = newState, let session = env.engine.session,
-                      session.pendingSelectionCount != nil, !env.showLeaveCaptureConfirmation {
+                      (session.awaitsFrame || session.pendingSelectionCount != nil), !env.showLeaveCaptureConfirmation {
                 env.openReview(sessionID: session.id, source: .capture)
             }
         }
@@ -73,7 +73,7 @@ public struct CaptureView: View {
         GeometryReader { geo in
             let compact = geo.size.width < 1080
             HStack(spacing: 0) {
-                if !compact {
+                if !compact, showsLegacyFrame {
                     FramePickerColumn(vm: vm, env: env, isSearchFocused: $isSearchFocused)
                         .frame(width: 240)
                     Divider()
@@ -102,25 +102,35 @@ public struct CaptureView: View {
         }
     }
 
+    private var showsLegacyFrame: Bool {
+        guard let session = env.engine.session else { return false }
+        return session.defaults.plannedCaptureCount == nil
+    }
+
     private var header: some View {
         HStack(spacing: 12) {
             Text("Chụp ảnh").font(.title3.weight(.semibold))
             statusBadge
             Spacer()
+            if env.engine.session == nil {
+                CaptureCountPicker(count: $vm.plannedCaptureCount)
+            }
             if isCompact {
-                Button {
-                    activePopover = activePopover == .framePicker ? nil : .framePicker
-                } label: {
-                    Label("Khung ảnh", systemImage: "rectangle.3.offgrid")
+                if showsLegacyFrame {
+                    Button {
+                        activePopover = activePopover == .framePicker ? nil : .framePicker
+                    } label: {
+                        Label("Khung ảnh", systemImage: "rectangle.3.offgrid")
+                    }
+                    .popover(isPresented: Binding(
+                        get: { activePopover == .framePicker },
+                        set: { if !$0 && activePopover == .framePicker { activePopover = nil; isSearchFocused = false } }
+                    )) {
+                        FramePickerColumn(vm: vm, env: env, isSearchFocused: $isSearchFocused)
+                            .frame(width: 300, height: 450)
+                    }
+                    .help("Chọn khung ảnh")
                 }
-                .popover(isPresented: Binding(
-                    get: { activePopover == .framePicker },
-                    set: { if !$0 && activePopover == .framePicker { activePopover = nil; isSearchFocused = false } }
-                )) {
-                    FramePickerColumn(vm: vm, env: env, isSearchFocused: $isSearchFocused)
-                        .frame(width: 300, height: 450)
-                }
-                .help("Chọn khung ảnh")
 
                 Button {
                     activePopover = activePopover == .quickControls ? nil : .quickControls
@@ -158,7 +168,7 @@ public struct CaptureView: View {
                 Label("Toàn màn hình", systemImage: "arrow.up.left.and.arrow.down.right")
             }
             .help("Mở Fullscreen Photobooth")
-            .disabled(env.engine.isCaptureBusy || env.engine.hasPhotoToSave)
+            .disabled(env.engine.isCancellingSession || env.engine.isCaptureBusy || env.engine.hasPhotoToSave)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -210,7 +220,8 @@ public struct CaptureView: View {
         HStack(spacing: 16) {
             progressText
             Spacer()
-            secondaryButtons
+            CaptureCancellationButton(env: env)
+            secondaryButtons.disabled(env.engine.isCancellingSession)
             primaryActionButton
         }
         .padding(.horizontal, 16)
@@ -234,20 +245,32 @@ public struct CaptureView: View {
 
     private var progressText: some View {
         Group {
-            switch env.engine.state {
-            case .countdown(_, let index, _), .capturing(let index, _), .persisting(let index, _):
-                Text("Ảnh \(index)/\(max(env.engine.requiredIndices.count, 1))").font(.headline)
-            case .intermission:
-                Text("Nghỉ \(env.engine.intervalSeconds)s…").foregroundStyle(.secondary)
-            case .paused:
-                Text("Đã tạm dừng — ảnh đã chụp vẫn được giữ").foregroundStyle(.orange)
-            case .recoverableError(let message, _):
-                Text(message).foregroundStyle(.red)
-            default:
-                Text(env.engine.committedShots.isEmpty
-                     ? "Chưa chụp ảnh nào"
-                     : "Đã chụp \(env.engine.committedShots.count)/\(env.engine.requiredIndices.count)")
-                    .foregroundStyle(.secondary)
+            if let session = env.engine.session, session.awaitsFrame {
+                HStack(spacing: 8) {
+                    Text("Đã lưu \(env.engine.committedShots.count)/\(session.captureCount) ảnh")
+                        .monospacedDigit()
+                    if case .recoverableError(let message, _) = env.engine.state {
+                        Text(message).foregroundStyle(.red)
+                    } else if case .paused = env.engine.state {
+                        Text("Đã tạm dừng").foregroundStyle(.orange)
+                    }
+                }
+            } else {
+                switch env.engine.state {
+                case .countdown(_, let index, _), .capturing(let index, _), .persisting(let index, _):
+                    Text("Ảnh \(index)/\(max(env.engine.requiredIndices.count, 1))").font(.headline)
+                case .intermission:
+                    Text("Nghỉ \(env.engine.intervalSeconds)s…").foregroundStyle(.secondary)
+                case .paused:
+                    Text("Đã tạm dừng — ảnh đã chụp vẫn được giữ").foregroundStyle(.orange)
+                case .recoverableError(let message, _):
+                    Text(message).foregroundStyle(.red)
+                default:
+                    Text(env.engine.committedShots.isEmpty
+                         ? "Chưa chụp ảnh nào"
+                         : "Đã chụp \(env.engine.committedShots.count)/\(env.engine.requiredIndices.count)")
+                        .foregroundStyle(.secondary)
+                }
             }
         }
     }
@@ -276,6 +299,7 @@ public struct CaptureView: View {
     }
 
     private var disabledReason: String? {
+        if env.engine.isCancellingSession { return "Đang xử lý yêu cầu hủy phiên" }
         switch env.engine.state {
         case .reviewing, .completed, .countdown, .intermission: return nil
         case .capturing, .persisting: return "Chờ hoàn tất lượt chụp"
@@ -288,10 +312,6 @@ public struct CaptureView: View {
         default: break
         }
         guard vm.isCameraReady else { return "Chờ camera sẵn sàng" }
-        if env.engine.state == .idle {
-            if vm.selectedFrame == nil { return "Chọn/thiết lập khung trước" }
-            if vm.selectedFrame?.validationStatus != .ready { return "Khung chưa thiết lập (E-FRM-02)" }
-        }
         return nil
     }
 }
@@ -440,19 +460,21 @@ struct CameraStageColumn: View {
 
     var body: some View {
         VStack(spacing: 10) {
-            Picker("", selection: Binding(
-                get: { vm.previewMode },
-                set: { vm.setPreviewMode($0) }
-            )) {
-                ForEach(CaptureViewModel.PreviewMode.allCases) { mode in
-                    Text(mode.label).tag(mode)
+            if env.engine.snapshot?.sourceFrameID != nil {
+                Picker("", selection: Binding(
+                    get: { vm.previewMode },
+                    set: { vm.setPreviewMode($0) }
+                )) {
+                    ForEach(CaptureViewModel.PreviewMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
                 }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .accessibilityLabel("Chế độ xem trước camera")
+                .frame(width: 220)
+                .padding(.top, 12)
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .accessibilityLabel("Chế độ xem trước camera")
-            .frame(width: 220)
-            .padding(.top, 12)
 
             ZStack {
                 RoundedRectangle(cornerRadius: 12)
@@ -497,7 +519,7 @@ struct CameraStageColumn: View {
                 } else if let service = env.camera as? CameraService {
                     CIPreviewView(cameraService: service,
                                   mirror: env.settings.previewMirror,
-                                  inFrame: vm.previewMode == .inFrame ? inFrameSpec : nil,
+                                  inFrame: env.engine.snapshot?.sourceFrameID != nil && vm.previewMode == .inFrame ? inFrameSpec : nil,
                                   photoParameters: vm.livePhotoParameters, faceAnalysis: env.faceAnalysis)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
                     countdownOverlay
@@ -616,7 +638,7 @@ struct CameraStageColumn: View {
                     Text("Đang nghỉ").padding(6).background(.black.opacity(0.6), in: Capsule()).foregroundStyle(.white)
                 }
                 Spacer()
-                Text(vm.previewMode == .camera ? "Xem trước camera" : "Xem trước trong khung")
+                Text((env.engine.snapshot?.sourceFrameID == nil || vm.previewMode == .camera) ? "Xem trước camera" : "Xem trước trong khung")
                     .padding(6).background(.black.opacity(0.6), in: Capsule()).foregroundStyle(.white)
             }
             .padding(10)
@@ -627,7 +649,7 @@ struct CameraStageColumn: View {
     private var currentScrollTargetKey: String {
         let sid = env.engine.session?.id ?? "none"
         let required = env.engine.session != nil ? env.engine.requiredIndices.sorted()
-            : vm.selectionCount.map { Array(1...$0) } ?? vm.selectedFrameIndices
+            : Array(1...vm.plannedCaptureCount)
         let activeIndex: Int
         switch env.engine.state {
         case .countdown(_, let idx, _), .capturing(let idx, _), .persisting(let idx, _):
@@ -642,7 +664,7 @@ struct CameraStageColumn: View {
 
     private var currentActiveIndex: Int {
         let required = env.engine.session != nil ? env.engine.requiredIndices.sorted()
-            : vm.selectionCount.map { Array(1...$0) } ?? vm.selectedFrameIndices
+            : Array(1...vm.plannedCaptureCount)
         switch env.engine.state {
         case .countdown(_, let idx, _), .capturing(let idx, _), .persisting(let idx, _):
             return idx
@@ -655,7 +677,7 @@ struct CameraStageColumn: View {
 
     var thumbnailStrip: some View {
         let required = env.engine.session != nil ? env.engine.requiredIndices.sorted()
-            : vm.selectionCount.map { Array(1...$0) } ?? vm.selectedFrameIndices
+            : Array(1...vm.plannedCaptureCount)
         let count = required.count
         let totalContentWidth = CGFloat(count * 64 + max(count - 1, 0) * 8 + 32)
 
@@ -843,23 +865,11 @@ struct QuickControlsColumn: View {
                         .help(sessionStarted ? "Áp dụng từ phiên tiếp theo" : "0–15 giây")
                 }
                 Divider()
-                Toggle("Chụp thêm để chọn ảnh", isOn: Binding(
-                    get: { sessionStarted ? env.engine.session?.defaults.selectionCaptureCount != nil : vm.requestedSelectionCount != nil },
-                    set: { vm.requestedSelectionCount = $0
-                        ? min(vm.selectedFrameIndices.count + 2, ResourceLimits.maxCaptureIndices) : nil }))
-                    .disabled(sessionStarted || vm.selectedFrameIndices.isEmpty)
                 if let session = env.engine.session, let count = session.defaults.selectionCaptureCount {
                     Text("Chụp \(count) ảnh · chọn \(session.requiredCaptureCount)")
                         .foregroundStyle(.secondary)
-                } else if !sessionStarted, let count = vm.selectionCount {
-                    let minimum = vm.selectedFrameIndices.count
-                    Stepper("Chụp \(count) ảnh · chọn \(minimum)", value: Binding(
-                        get: { vm.selectionCount ?? count },
-                        set: { vm.requestedSelectionCount = $0 }),
-                        in: minimum...ResourceLimits.maxCaptureIndices)
-                        .disabled(sessionStarted)
+                    Divider()
                 }
-                Divider()
                 // Preset
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Preset màu").font(.subheadline.weight(.medium))
@@ -890,7 +900,7 @@ struct QuickControlsColumn: View {
                                                  set: { env.settings.soundEnabled = $0 }))
                     .help("Tiếng tick đếm ngược, shutter, hoàn thành")
                 Divider()
-                Button("Cài đặt camera…") { env.requestNavigation(to: .settings) }
+                Button("Cài đặt camera…") { env.openSettings(section: .camera) }
                     .help("Mở Cài đặt → Camera")
                 Spacer()
             }
@@ -942,5 +952,18 @@ struct PresetChip: View {
         .buttonStyle(.plain)
         .accessibilityLabel("Preset màu \(preset.nameVN)")
         .help("Preset \(preset.nameVN)")
+    }
+}
+
+struct CaptureCountPicker: View {
+    @Binding var count: Int
+
+    var body: some View {
+        Picker("Số ảnh của phiên", selection: $count) {
+            ForEach(1...ResourceLimits.maxCaptureIndices, id: \.self) { count in
+                Text("\(count)").tag(count)
+            }
+        }
+        .fixedSize()
     }
 }

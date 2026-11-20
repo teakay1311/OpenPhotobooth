@@ -228,7 +228,7 @@ public final class SettingsStore: ObservableObject {
         let presetID = defaultPreset
         let preset = BuiltinPreset.byID(presetID)
         let params = preset?.parameters ?? .natural
-        return SessionDefaultsSnapshot(
+        var snapshot = SessionDefaultsSnapshot(
             parameterVersion: ColorMappingVersion.current,
             presetID: presetID,
             presetName: preset?.nameVN ?? "Tự nhiên",
@@ -239,6 +239,8 @@ public final class SettingsStore: ObservableObject {
             outputMirror: outputMirror,
             rotation: rotation,
             smartFace: smartFace)
+        snapshot.autoFacePlacementVersion = 1
+        return snapshot
     }
 
     /// Đặt lại toàn bộ cài đặt (không xóa dữ liệu §15.2 Dữ liệu).

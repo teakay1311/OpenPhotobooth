@@ -19,8 +19,10 @@ public final class AppEnvironment: ObservableObject {
     public let settings: SettingsStore
     public let audio: AudioService
     public let faceAnalysis: FaceAnalysisService
+    lazy var chooserPreviews = ChooserPreviewService(frames: frames, builder: renderBuilder)
     public let renderBuilder: SessionRenderBuilder
     public let safetySave: SafetySaveService
+    lazy var trashPreviews = TrashPreviewLoader(service: trashService)
     public let trashService: TrashService
     public let trashScheduler: TrashCleanupScheduler
     public let exportService: ExportService
@@ -36,6 +38,7 @@ public final class AppEnvironment: ObservableObject {
     @Published public var route: ScreenRoute = .capture
     @Published public var recoveryReport: RecoveryService.Report?
     @Published public var bannerSessionID: String?
+    @Published private(set) var lastCancelledCaptureID: String?
     @Published public var isProcessingBannerAction: Bool = false
     @Published public var toast: ToastMessage?
     @Published public var showFullscreen = false
@@ -48,7 +51,8 @@ public final class AppEnvironment: ObservableObject {
     @Published public var showLeaveCaptureConfirmation = false
     @Published public var showFrameEditorLeaveConfirmation = false
     public var frameEditorHasChanges = false
-    public var frameEditorSaveHandler: (() -> Bool)?
+    public var frameEditorSaveHandler: (() async -> Bool)?
+    @Published var frameEditorIsSaving = false
     @Published public var pendingNavigationRoute: ScreenRoute? = nil
     @Published public var copiedColorAdjustments: CopiedColorAdjustments? = nil
     private let effectiveRoot: URL?
@@ -131,6 +135,59 @@ public final class AppEnvironment: ObservableObject {
     private var currentStorageMeasurementID: Int = 0
     public var onStorageMeasurementFinished: ((Int, StorageMeasurementStatus) -> Void)?
 
+    private var lastSuccessfulStorageMeasurement: (bytes: Int64, formatted: String)?
+    private(set) var storageMeasurementTask: Task<Void, Never>?
+    // Internal worker seam lets tests order completions without timing-dependent sleeps.
+    var storageSizeReader: @Sendable (URL) throws -> Int64 = { try AppEnvironment.measureStorageBytes(at: $0) }
+
+    nonisolated static func measureStorageBytes(at root: URL) throws -> Int64 {
+        func requireDirectory() throws {
+            guard try root.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else {
+                throw AppError.ioFailure("Thư mục dữ liệu không khả dụng")
+            }
+        }
+        try requireDirectory()
+        var enumerationError: Error?
+        guard let enumerator = FileManager.default.enumerator(
+            at: root, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey], options: [],
+            errorHandler: { _, error in enumerationError = error; return false }
+        ) else { throw AppError.ioFailure("Không thể duyệt thư mục dữ liệu") }
+        var totalBytes: Int64 = 0
+        for case let fileURL as URL in enumerator {
+            let values = try fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+            guard let regular = values.isRegularFile else {
+                throw AppError.ioFailure("Không đọc được thông tin tệp dữ liệu")
+            }
+            if regular {
+                guard let size = values.fileSize, size >= 0 else {
+                    throw AppError.ioFailure("Không đọc được dung lượng tệp dữ liệu")
+                }
+                totalBytes += Int64(size)
+            }
+        }
+        if let enumerationError { throw enumerationError }
+        try requireDirectory()
+        return totalBytes
+    }
+
+    @discardableResult
+    private func acceptStorageMeasurement(_ result: Result<Int64, Error>, afterCleaning: Bool) -> Bool {
+        switch result {
+        case .success(let bytes):
+            let formatted = FileLayout.formattedBytes(bytes)
+            lastSuccessfulStorageMeasurement = (bytes, formatted)
+            storageMeasurement = .current(bytes: bytes, formatted: formatted)
+            return true
+        case .failure:
+            if afterCleaning, let previous = lastSuccessfulStorageMeasurement {
+                storageMeasurement = .stale(bytes: previous.bytes, formatted: previous.formatted)
+            } else {
+                storageMeasurement = .failed(previous: lastSuccessfulStorageMeasurement)
+            }
+            return false
+        }
+    }
+
     public func requestStorageMeasurement(isPostClean: Bool = false) {
         if !isPostClean {
             if case .measuring = storageMeasurement { return }
@@ -139,45 +196,14 @@ public final class AppEnvironment: ObservableObject {
         currentStorageMeasurementID += 1
         let measureID = currentStorageMeasurementID
         storageMeasurement = .measuring
-        let layout = self.layout
-
-        Task.detached(priority: .utility) { [weak self] in
-            let fm = FileManager.default
-            var totalBytes: Int64 = 0
-            var measureFailed = false
-            if let enumerator = fm.enumerator(at: layout.rootURL, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey], options: []) {
-                for case let fileURL as URL in enumerator {
-                    do {
-                        let values = try fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
-                        if values.isRegularFile == true {
-                            totalBytes += Int64(values.fileSize ?? 0)
-                        }
-                    } catch {
-                        measureFailed = true
-                        break
-                    }
-                }
-            } else {
-                measureFailed = true
-            }
-
+        let root = layout.rootURL
+        let readSize = storageSizeReader
+        storageMeasurementTask = Task.detached(priority: .utility) { [weak self] in
+            let result = Result { try readSize(root) }
             await MainActor.run {
                 guard let self, self.currentStorageMeasurementID == measureID else { return }
-                let formatted = FileLayout.formattedBytes(totalBytes)
-                let status: StorageMeasurementStatus
-                if measureFailed {
-                    let prev: (bytes: Int64, formatted: String)? = {
-                        switch self.storageMeasurement {
-                        case .current(let b, let f), .stale(let b, let f): return (b, f)
-                        default: return nil
-                        }
-                    }()
-                    status = .failed(previous: prev)
-                } else {
-                    status = .current(bytes: totalBytes, formatted: formatted)
-                }
-                self.storageMeasurement = status
-                self.onStorageMeasurementFinished?(measureID, status)
+                self.acceptStorageMeasurement(result, afterCleaning: isPostClean)
+                self.onStorageMeasurementFinished?(measureID, self.storageMeasurement)
             }
         }
     }
@@ -190,52 +216,17 @@ public final class AppEnvironment: ObservableObject {
         let postCleanMeasureID = currentStorageMeasurementID
 
         let thumbs = self.thumbnails
-        let layout = self.layout
-        Task.detached(priority: .utility) { [weak self] in
+        let root = layout.rootURL
+        let readSize = storageSizeReader
+        storageMeasurementTask = Task.detached(priority: .utility) { [weak self] in
             let clearResult = thumbs.clearAllWithResult()
-
-            // Đo dung lượng nghiêm ngặt sau khi dọn (§5.3)
-            let fm = FileManager.default
-            var totalBytes: Int64 = 0
-            var measureFailed = false
-            if let enumerator = fm.enumerator(at: layout.rootURL, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey], options: []) {
-                for case let fileURL as URL in enumerator {
-                    do {
-                        let values = try fileURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
-                        if values.isRegularFile == true {
-                            totalBytes += Int64(values.fileSize ?? 0)
-                        }
-                    } catch {
-                        measureFailed = true
-                        break
-                    }
-                }
-            } else {
-                measureFailed = true
-            }
+            let measurement = Result { try readSize(root) }
 
             await MainActor.run {
                 guard let self, self.cacheCleanTaskID == taskID else { return }
                 self.cacheCleanTaskID = nil
-
-                let formatted = FileLayout.formattedBytes(totalBytes)
-                var measurementSucceeded = false
-                if !measureFailed && self.currentStorageMeasurementID == postCleanMeasureID {
-                    self.storageMeasurement = .current(bytes: totalBytes, formatted: formatted)
-                    measurementSucceeded = true
-                } else {
-                    let prev: (bytes: Int64, formatted: String)? = {
-                        switch self.storageMeasurement {
-                        case .current(let b, let f), .stale(let b, let f): return (b, f)
-                        default: return nil
-                        }
-                    }()
-                    if let prev {
-                        self.storageMeasurement = .stale(bytes: prev.bytes, formatted: prev.formatted)
-                    } else {
-                        self.storageMeasurement = .failed(previous: nil)
-                    }
-                }
+                guard self.currentStorageMeasurementID == postCleanMeasureID else { return }
+                let measurementSucceeded = self.acceptStorageMeasurement(measurement, afterCleaning: true)
 
                 switch clearResult {
                 case .success:
@@ -268,7 +259,7 @@ public final class AppEnvironment: ObservableObject {
     }
 
     public init(inMemory: Bool = false, customRoot: URL? = nil, customDefaults: UserDefaults? = nil,
-                camera: CameraServing = CameraService()) {
+                camera: CameraServing = CameraService(), faceAnalysis: FaceAnalysisService = FaceAnalysisService()) {
         if let customRoot {
             self.effectiveRoot = customRoot
         } else if inMemory {
@@ -323,7 +314,7 @@ public final class AppEnvironment: ObservableObject {
         settings = SettingsStore(defaults: defs)
         frameThumbnails = FrameThumbnailService(frames: frames, assets: assets, thumbnails: thumbnails, settings: settings)
         audio = AudioService(settings: settings, playback: inMemory ? { _, _ in } : nil)
-        faceAnalysis = FaceAnalysisService()
+        self.faceAnalysis = faceAnalysis
         renderBuilder = SessionRenderBuilder(sessions: sessions, assets: assets, layout: layout, faceAnalysis: faceAnalysis)
         coordinator = OperationCoordinator.shared
         safetySave = SafetySaveService(db: db, layout: layout, sessions: sessions, trashRepo: trashRepo, coordinator: coordinator)
@@ -335,7 +326,19 @@ public final class AppEnvironment: ObservableObject {
         packService = FramePackService(frames: frames, assets: assets, layout: layout, db: db)
 
         self.camera = camera
-        engine = CaptureEngine(camera: camera, safetySave: safetySave, sessions: sessions, audio: audio)
+        engine = CaptureEngine(camera: camera, safetySave: safetySave, sessions: sessions,
+                               trashService: trashService, audio: audio)
+        engine.onSessionCancelled = { [weak self] id in
+            guard let self else { return }
+            if bannerSessionID == id {
+                bannerSessionID = (try? sessions.latestRecoverableSession())?.id
+            }
+            lastCancelledCaptureID = id
+            showToast("Đã chuyển phiên vào Thùng rác")
+        }
+        engine.onCancellationError = { [weak self] error in
+            self?.showToast(error.message, kind: .warning)
+        }
         engine.onSessionStatusChanged = { [weak self] _ in
             self?.objectWillChange.send()
         }
@@ -467,6 +470,7 @@ public final class AppEnvironment: ObservableObject {
     @Published public var showReviewLeaveConfirmation = false
 
     var canSelectFrameForCapture: Bool {
+        guard !engine.isCancellingSession else { return false }
         guard engine.session != nil else { return true }
         guard !engine.hasPhotoToSave, engine.committedShots.isEmpty else { return false }
         switch engine.state {
@@ -501,7 +505,8 @@ public final class AppEnvironment: ObservableObject {
 
     /// Điểm yêu cầu điều hướng thống nhất có bảo vệ an toàn chụp ảnh và Frame Editor (D2-A10, NAV-01, NAV-02, H-B4)
     public func requestNavigation(to targetRoute: ScreenRoute) {
-        guard targetRoute != route else { return }
+        guard !frameEditorIsSaving else { return }
+        guard !engine.isCancellingSession, targetRoute != route else { return }
         if targetRoute != .settings {
             pendingSettingsSection = nil
         }
@@ -606,6 +611,7 @@ public final class AppEnvironment: ObservableObject {
 
     /// Người dùng chọn "Lưu" hoặc "Bỏ thay đổi" khi rời Frame Editor (H-B4)
     public func confirmLeaveFrameEditor() {
+        guard !frameEditorIsSaving else { return }
         showFrameEditorLeaveConfirmation = false
         frameEditorHasChanges = false
         frameEditorSaveHandler = nil
@@ -687,17 +693,50 @@ public final class AppEnvironment: ObservableObject {
     @Published public var reviewContext: ReviewContext?
 
     public func openReview(sessionID: String, source: ScreenRoute = .library, openFramePicker: Bool = false, openExport: Bool = false) {
+        guard !engine.isCancellingSession else { return }
+        if let session = try? sessions.getSession(id: sessionID), session.awaitsFrame {
+            let startingRoute = route
+            Task {
+                let repository = sessions
+                guard let detail = try? await Task.detached(operation: {
+                    try repository.verifiedCaptureDetail(sessionID: sessionID)
+                }).value else {
+                    showToast("Phiên chụp không còn khả dụng", kind: .warning)
+                    return
+                }
+                guard route == startingRoute, engine.canAdoptSession else { return }
+                if !detail.session.awaitsFrame {
+                    openReview(sessionID: sessionID, source: source, openFramePicker: openFramePicker,
+                               openExport: openExport)
+                } else if detail.missingIndices.isEmpty {
+                    route = .chooseFrame(sessionID: sessionID, source: source == .capture ? .capture : .library)
+                } else if engine.adoptSession(record: detail.session, snapshot: detail.snapshot,
+                                              committed: detail.currentRevisions()) {
+                    route = .capture
+                } else {
+                    showToast("Không thể tiếp tục phiên lúc này", kind: .warning)
+                }
+            }
+            return
+        }
         let intentID = openExport ? IDFactory.new() : nil
         reviewContext = ReviewContext(sessionID: sessionID, sourceRoute: source, openFramePicker: openFramePicker, exportIntentID: intentID)
         route = .review(sessionID: sessionID)
     }
 
+    func finishFrameChoice(sessionID: String, source: ScreenRoute.FrameChooserSource) {
+        guard route == .chooseFrame(sessionID: sessionID, source: source) else { return }
+        openReview(sessionID: sessionID, source: source.reviewRoute)
+    }
+
     public func openFrameEditor(frameID: String?) {
+        guard !engine.isCancellingSession else { return }
         frameEditorDraft = FrameEditorContext(frameID: frameID)
         route = .frameEditor(frameID: frameID)
     }
 
     public func closeFrameEditor() {
+        guard !frameEditorIsSaving else { return }
         frameEditorDraft = nil
         route = .frames
     }
@@ -717,9 +756,20 @@ public final class AppEnvironment: ObservableObject {
             throw AppError.notEnoughPhotos(missing: detail.missingCount)
         }
 
+        let builder = renderBuilder
+        try await Task.detached { try builder.verifyCompletion(detail) }.value
+
         let didTransition = try db.withTransaction { tx -> Bool in
-            let rows = try tx.query("SELECT status, completed_at_ms FROM sessions WHERE id=?", [.text(sessionID)])
-            guard let row = rows.first else { throw AppError.notFound("session \(sessionID)") }
+            let rows = try tx.query("""
+                SELECT status, revision_no, active_frame_snapshot_id FROM sessions
+                WHERE id=? AND status NOT IN ('trashed','purging')
+                  AND NOT EXISTS (SELECT 1 FROM trash_items WHERE root_type='session' AND root_id=sessions.id)
+                """, [.text(sessionID)])
+            guard let row = rows.first else { throw AppError.notFound("Phiên chụp không còn hoạt động") }
+            guard row["revision_no"].intValue == detail.session.revisionNo,
+                  row["active_frame_snapshot_id"].stringValue == detail.snapshot.id else {
+                throw AppError.invalidState("Phiên đã thay đổi. Hãy tải lại trước khi hoàn thành.")
+            }
             if row["status"]?.stringValue == "completed" {
                 return false
             }

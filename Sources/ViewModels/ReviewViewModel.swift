@@ -22,6 +22,7 @@ public final class ReviewViewModel: ObservableObject {
     @Published public private(set) var isExporting = false
     @Published public var showBeforeAfter = false
     @Published public private(set) var canExport = false
+    @Published public private(set) var missingFrameResources = false
     @Published public private(set) var missingPhotos: Int = 0
     @Published public var previewMode: PreviewDisplayMode = .inFrame
     @Published public private(set) var previewError: String? = nil
@@ -46,6 +47,13 @@ public final class ReviewViewModel: ObservableObject {
 
     public let env: AppEnvironment
     public var engine: CaptureEngine { env.engine }
+    private var effectivePlacements: [String: PhotoPlacement] = [:]
+    private var effectiveCropModes: [String: CropMode] = [:]
+    private var effectivePlacementContext: String?
+    var canEditPlacement: Bool {
+        guard let detail, let index = selectedPhotoIndex else { return false }
+        return !SessionRenderBuilder.requiresAutoFace(detail, index: index) || effectivePlacementContext == previewContext
+    }
     private let persistDebouncer = Debouncer(delay: .milliseconds(400))
     private var inFlightPreviewTask: Task<Void, Never>?
     private var pendingPreviewRequest: PreviewRenderRequest?
@@ -97,19 +105,21 @@ public final class ReviewViewModel: ObservableObject {
 
     public func setPreviewMode(_ mode: PreviewDisplayMode) {
         guard previewMode != mode else { return }
+        let retainPlacement = effectivePlacementContext == previewContext
         previewMode = mode
         cancelPreviewPipeline()
+        if retainPlacement { effectivePlacementContext = previewContext }
         Task { await regeneratePreview() }
     }
 
     public func updateUndoRedoState() {
         canUndo = !undoStack.isEmpty
-        canRedo = !redoStack.isEmpty
+        canRedo = !redoStack.isEmpty && !hasPendingEdits
     }
 
     public enum UndoAction {
         case photoOverride(captureIndex: Int, photoRevisionID: String, old: PhotoOverride?, new: PhotoOverride)
-        case applyAll(before: [Int: PhotoOverride], after: [Int: PhotoOverride])
+        case applyAll(sessionID: String, before: [String: PhotoOverride?], after: [String: PhotoOverride])
         case presetSession(sessionID: String, before: [String: PhotoOverride?], after: [String: PhotoOverride])
         case retake(shotID: String, from: String, to: String)
         case placement(snapshotSlotID: String, old: SlotPlacement, new: SlotPlacement)
@@ -138,7 +148,14 @@ public final class ReviewViewModel: ObservableObject {
                 previewMode = .inFrame
             }
         }
-        guard let d = try? env.sessions.getDetail(sessionID: sessionID) else {
+        let repository = env.sessions
+        let builder = env.renderBuilder
+        let (loaded, invalidFrame) = await Task.detached {
+            let detail = try? repository.verifiedCaptureDetail(sessionID: sessionID)
+            guard let detail, detail.hasEnoughPhotos else { return (detail, false) }
+            return (detail, (try? builder.verifiedFrameLayers(detail)) == nil)
+        }.value
+        guard let d = loaded else {
             env.showToast("Không đọc được phiên", kind: .warning)
             return false
         }
@@ -147,7 +164,8 @@ public final class ReviewViewModel: ObservableObject {
         }
         detail = d
         missingPhotos = d.missingCount
-        canExport = d.hasEnoughPhotos
+        missingFrameResources = invalidFrame
+        canExport = d.hasEnoughPhotos && !invalidFrame
 
         if isSameSession && previousSnapshotID == d.snapshot.id {
             // Cùng phiên & cùng snapshot (D2-A03): giữ nguyên lựa chọn hợp lệ
@@ -175,6 +193,13 @@ public final class ReviewViewModel: ObservableObject {
             previewImage = nil
         } else {
             await regeneratePreview()
+            if let index = selectedPhotoIndex, SessionRenderBuilder.requiresAutoFace(d, index: index) {
+                let context = previewContext
+                while !Task.isCancelled, previewContext == context, effectivePlacementContext != context,
+                      inFlightPreviewTask != nil {
+                    await Task.yield()
+                }
+            }
         }
         return true
     }
@@ -204,6 +229,7 @@ public final class ReviewViewModel: ObservableObject {
         inFlightPreviewTask?.cancel()
         pendingPreviewRequest = nil
         previewEpoch += 1
+        effectivePlacementContext = nil
         previewImage = nil
         previewError = nil
     }
@@ -269,6 +295,16 @@ public final class ReviewViewModel: ObservableObject {
             guard let self else { return }
             let image: CGImage?
             var renderError: String? = nil
+            var model: CompositionModel?
+            if req.mode != .singlePhoto || req.detail.snapshot.requiredIndices.contains(where: {
+                SessionRenderBuilder.requiresAutoFace(req.detail, index: $0)
+            }) {
+                let builder = self.env.renderBuilder
+                model = await Task.detached(priority: .userInitiated) {
+                    await builder.buildModel(detail: req.detail,
+                        targetWidth: req.detail.snapshot.canvasWidth, targetHeight: req.detail.snapshot.canvasHeight)
+                }.value
+            }
 
             if req.mode == .singlePhoto, let idx = req.selectedIndex {
                 do {
@@ -282,10 +318,13 @@ public final class ReviewViewModel: ObservableObject {
                     renderError = (error as? AppError)?.message ?? "Lỗi đọc tệp ảnh"
                 }
             } else {
-                image = await self.env.renderBuilder.renderPreview(
-                    detail: req.detail,
-                    maxDimension: 1100
-                )
+                if var rendering = model {
+                    let scale = 1100.0 / Double(max(req.detail.snapshot.canvasWidth, req.detail.snapshot.canvasHeight))
+                    rendering.options.targetWidth = max(1, Int((Double(req.detail.snapshot.canvasWidth) * scale).rounded()))
+                    rendering.options.targetHeight = max(1, Int((Double(req.detail.snapshot.canvasHeight) * scale).rounded()))
+                    let output = rendering
+                    image = await Task.detached(priority: .userInitiated) { try? CompositeRenderer.render(model: output) }.value
+                } else { image = nil }
             }
 
             await MainActor.run {
@@ -294,6 +333,12 @@ public final class ReviewViewModel: ObservableObject {
                     self.previewImage = image
                     self.previewError = renderError
                     self.lastDisplayedPreviewSequence = req.sequence
+                    if let model {
+                        self.effectivePlacements = model.placements
+                        self.effectiveCropModes = model.cropModes
+                        self.effectivePlacementContext = req.contextKey
+                        self.syncDraftsFromState()
+                    }
                 }
                 self.inFlightPreviewTask = nil
 
@@ -365,6 +410,9 @@ public final class ReviewViewModel: ObservableObject {
             if let pending = pendingPlacements[slotID] {
                 draftPlacement = pending.placement
                 draftCropMode = pending.cropMode
+            } else if effectivePlacementContext == previewContext, let p = effectivePlacements[slotID] {
+                draftPlacement = p
+                draftCropMode = detail.placements[slotID]?.cropMode ?? detail.snapshot.slots.first { $0.id == slotID }?.defaultCropMode
             } else if let p = detail.placements[slotID] {
                 draftPlacement = p.placement
                 draftCropMode = p.cropMode
@@ -380,8 +428,8 @@ public final class ReviewViewModel: ObservableObject {
 
     // MARK: - Color edits (§8.3 precedence)
 
-    private func recordDraftColor() {
-        guard let idx = selectedPhotoIndex, let detail, let rev = detail.currentRevisions()[idx] else { return }
+    private func recordDraftColor() -> Bool {
+        guard let idx = selectedPhotoIndex, let detail, let rev = detail.currentRevisions()[idx] else { return false }
         var o = detail.overrides[idx] ?? PhotoOverride()
         let old = pendingOverrides[rev.id]?.old ?? o
         o.color = draftColor
@@ -396,12 +444,17 @@ public final class ReviewViewModel: ObservableObject {
             }
             o.presetParameters = params
         }
+        guard o != (pendingOverrides[rev.id]?.new ?? detail.overrides[idx] ?? PhotoOverride()) else { return false }
         pendingOverrides[rev.id] = (index: idx, old: old, new: o)
+        redoStack.removeAll()
+        updateUndoRedoState()
+        return true
     }
 
     public func setColorValue(_ key: String, _ uiValue: Double) {
         // UI -100..100 → nội bộ -1..1 (sharpness 0..1)
         let v = key == "sharpness" ? (uiValue + 100) / 200 : uiValue / 100
+        let previous = draftColor
         switch key {
         case "exposure": draftColor.exposure = v
         case "contrast": draftColor.contrast = v
@@ -412,9 +465,9 @@ public final class ReviewViewModel: ObservableObject {
         case "tint": draftColor.tint = v
         case "vibrance": draftColor.vibrance = v
         case "sharpness": draftColor.sharpness = v
-        default: break
+        default: return
         }
-        recordDraftColor()
+        guard draftColor != previous, recordDraftColor() else { return }
         scheduleColorPersist()
         schedulePreviewRefresh()
     }
@@ -459,8 +512,9 @@ public final class ReviewViewModel: ObservableObject {
     }
 
     public func setPresetIntensity(_ value: Double) {
+        guard draftPresetIntensity != value else { return }
         draftPresetIntensity = value
-        recordDraftColor()
+        guard recordDraftColor() else { return }
         scheduleColorPersist()
         schedulePreviewRefresh()
     }
@@ -660,9 +714,8 @@ public final class ReviewViewModel: ObservableObject {
 
     /// Áp dụng màu cho tất cả (§8.3 — không đổi crop; một undo action).
     public func applyColorToAll() {
-        guard let detail else { return }
+        guard flushPendingEditsNow(), let detail else { return }
         let sessionID = detail.session.id
-        let before = detail.overrides
         var resolvedParams: ColorParameterSet? = nil
         let isExplicitNone = (draftPresetID == nil && detail.session.defaults.presetID != nil && draftPresetIntensity == 0)
         if let pid = draftPresetID {
@@ -673,17 +726,16 @@ public final class ReviewViewModel: ObservableObject {
             }
         }
         do {
-            try env.sessions.applyColorToAll(sessionID: sessionID,
+            let change = try env.sessions.applyColorToAll(sessionID: sessionID,
                                              color: draftColor,
                                              presetID: draftPresetID,
                                              presetParameters: resolvedParams,
                                              presetIntensity: draftPresetIntensity,
                                              explicitNoPreset: isExplicitNone ? true : nil)
-            let afterDetail = try? env.sessions.getDetail(sessionID: sessionID)
-            let after = afterDetail?.overrides ?? [:]
+            guard !change.after.isEmpty else { return }
             pendingOverrides.removeAll()
             Task { await reload(); await regeneratePreview() }
-            undoStack.append(.applyAll(before: before, after: after))
+            undoStack.append(.applyAll(sessionID: sessionID, before: change.before, after: change.after))
             redoStack.removeAll()
             updateUndoRedoState()
             env.showToast("Đã áp dụng màu cho tất cả ảnh (không đổi crop)")
@@ -711,13 +763,23 @@ public final class ReviewViewModel: ObservableObject {
 
     // MARK: - Crop / placement (§9.1, §9.2)
 
-    private func recordDraftPlacement() {
-        guard let slotID = selectedSlotID, let p = draftPlacement, let mode = draftCropMode, let detail else { return }
+    private func recordDraftPlacement() -> Bool {
+        guard let slotID = selectedSlotID, let p = draftPlacement, let mode = draftCropMode, let detail else { return false }
         let old = pendingPlacements[slotID]?.old ?? detail.placements[slotID]
         let index = detail.snapshot.slots.first { $0.id == slotID }?.captureIndex
         let photoRevisionID = index.flatMap { detail.currentRevisions()[$0]?.id }
+        if let pending = pendingPlacements[slotID] {
+            guard pending.placement != p || pending.cropMode != mode ||
+                  pending.snapshotID != detail.snapshot.id || pending.photoRevisionID != photoRevisionID else { return false }
+        } else if let stored = detail.placements[slotID], stored.manualOverride,
+                  stored.placement == p, stored.cropMode == mode {
+            return false
+        }
         pendingPlacements[slotID] = PendingPlacement(placement: p, cropMode: mode, old: old,
                                                      snapshotID: detail.snapshot.id, photoRevisionID: photoRevisionID)
+        redoStack.removeAll()
+        updateUndoRedoState()
+        return true
     }
 
     public func setCropMode(_ mode: CropMode) {
@@ -733,7 +795,7 @@ public final class ReviewViewModel: ObservableObject {
             }
         }
         draftCropMode = mode
-        recordDraftPlacement()
+        guard recordDraftPlacement() else { return }
         persistPlacement()
     }
 
@@ -741,8 +803,15 @@ public final class ReviewViewModel: ObservableObject {
     private var dragStartPlacement: SlotPlacement?
 
     public func updatePlacement(scale: Double? = nil, offsetX: Double? = nil, offsetY: Double? = nil, isFinal: Bool = false) {
+        guard canEditPlacement else { return }
+        if let slotID = selectedSlotID, effectivePlacementContext == previewContext,
+           detail?.placements[slotID]?.manualOverride != true, pendingPlacements[slotID] == nil {
+            draftPlacement = effectivePlacements[slotID] ?? draftPlacement
+            draftCropMode = effectiveCropModes[slotID] ?? draftCropMode
+        }
         autoFaceRequest += 1
-        if previewMode != .inFrame {
+        let previewModeChanged = previewMode != .inFrame
+        if previewModeChanged {
             previewMode = .inFrame
         }
         guard let slotID = selectedSlotID, let detail else { return }
@@ -754,13 +823,17 @@ public final class ReviewViewModel: ObservableObject {
         if let offsetX { p.offsetX = offsetX }
         if let offsetY { p.offsetY = offsetY }
         draftPlacement = p
-        recordDraftPlacement()
-        schedulePreviewRefresh()
+        let changed = recordDraftPlacement()
+        if changed || previewModeChanged { schedulePreviewRefresh() }
+        if !changed && pendingPlacements[slotID] == nil {
+            dragStartPlacement = nil
+            return
+        }
 
         if isFinal {
             placementDebouncer.cancel()
             persistPlacement()
-        } else if !placementGestureActive {
+        } else if changed && !placementGestureActive {
             placementDebouncer.callAsync { [weak self] in
                 await self?.persistPlacement()
             }
@@ -774,8 +847,12 @@ public final class ReviewViewModel: ObservableObject {
     public func resetPlacement() {
         guard let slotID = selectedSlotID, let detail,
               let slot = detail.snapshot.slots.first(where: { $0.id == slotID }) else { return }
+        guard canEditPlacement else { return }
         draftCropMode = slot.defaultCropMode
-        updatePlacement(scale: 1.0, offsetX: 0.0, offsetY: 0.0, isFinal: true)
+        draftPlacement = PhotoPlacement()
+        guard recordDraftPlacement() else { return }
+        placementDebouncer.cancel()
+        persistPlacement()
     }
 
     @discardableResult
@@ -845,7 +922,7 @@ public final class ReviewViewModel: ObservableObject {
             placementDebouncer.cancel()
             draftCropMode = proposal.fitMode
             draftPlacement = PhotoPlacement(scale: proposal.scale, offsetX: proposal.offsetX, offsetY: proposal.offsetY)
-            recordDraftPlacement()
+            guard recordDraftPlacement() else { return }
             if persistPlacement() { env.showToast(proposal.reason, kind: .info) }
         }
     }
@@ -926,6 +1003,7 @@ public final class ReviewViewModel: ObservableObject {
         pendingOverrides.removeAll()
         dragStartPlacement = nil
         isSaving = false
+        updateUndoRedoState()
         if let id = detail?.session.id, let fresh = try? env.sessions.getDetail(sessionID: id) {
             detail = fresh
         }
@@ -1035,6 +1113,7 @@ public final class ReviewViewModel: ObservableObject {
         guard let d = detail else { return }
         let adopted = engine.adoptSession(record: d.session, snapshot: d.snapshot, committed: d.currentRevisions(), forReview: false)
         if adopted {
+            if d.session.defaults.plannedCaptureCount != nil { env.retakeSessionID = d.session.id }
             env.requestNavigation(to: .capture)
         } else {
             env.showToast("Không thể nhận phiên chụp", kind: .warning)
@@ -1050,15 +1129,25 @@ public final class ReviewViewModel: ObservableObject {
         guard await flushPendingEdits(), await prepareCameraForRetake(), !engine.isCaptureBusy else { return }
         guard let detail else { return }
         engine.keepSessionAndExit()
-        guard let frameID = detail.snapshot.sourceFrameID else { return }
         do {
-            let snapshot = try env.frames.createSnapshot(frameID: frameID)
+            let snapshot: FrameSnapshot
             var defaults = detail.session.defaults
             defaults.selectedCaptureOrder = nil
-            if let count = defaults.selectionCaptureCount {
-                defaults.selectionCaptureCount = max(count, snapshot.requiredCaptureCount)
+            defaults.appliedFrameName = nil
+            let frameName: String?
+            if defaults.plannedCaptureCount != nil {
+                snapshot = .awaitingFrame()
+                frameName = nil
+            } else {
+                guard let frameID = detail.snapshot.sourceFrameID else { return }
+                let repository = env.frames
+                snapshot = try await Task.detached { try repository.validatedSnapshotForUse(frameID: frameID, persist: true) }.value
+                if let count = defaults.selectionCaptureCount {
+                    defaults.selectionCaptureCount = max(count, snapshot.requiredCaptureCount)
+                }
+                frameName = detail.session.frameNameAtCapture ?? (try? env.frames.getFrame(id: frameID)?.name)
             }
-            let frameName = detail.session.frameNameAtCapture ?? (try? env.frames.getFrame(id: frameID)?.name)
+            defaults.autoFacePlacementVersion = 1
             _ = try engine.beginSession(snapshot: snapshot, mode: detail.session.captureMode,
                                         cameraID: detail.session.cameraID,
                                         defaults: defaults,
@@ -1076,15 +1165,23 @@ public final class ReviewViewModel: ObservableObject {
 
     public func changeFrame(to frameID: String) async {
         guard let detail else { return }
+        let detailID = detail.session.id
         // H-A7: Chọn lại đúng khung hiện tại là no-op, không đổi snapshot hay reset crop
-        if detail.snapshot.sourceFrameID == frameID {
+        if detail.snapshot.sourceFrameID == frameID,
+           (try? env.frames.getFrame(id: frameID))?.currentRevisionID == detail.snapshot.sourceFrameRevisionID {
             return
         }
-        guard await flushPendingEdits() else { return }
+        guard await flushPendingEdits(), let detail = self.detail, detail.session.id == detailID else { return }
         do {
-            let newSnapshot = try env.frames.createSnapshot(frameID: frameID, persist: false)
+            let repository = env.frames
+            let newSnapshot = try await Task.detached { try repository.validatedSnapshotForUse(frameID: frameID) }.value
             // §3.4.3: N_new > hiện có → hiện thiếu ảnh, không cho xuất đến khi đủ
-            try env.sessions.changeFrame(sessionID: detail.session.id, newSnapshot: newSnapshot)
+            guard self.detail?.session.id == detail.session.id,
+                  self.detail?.session.revisionNo == detail.session.revisionNo else {
+                throw AppError.invalidState("Phiên đã thay đổi. Hãy chọn lại khung.")
+            }
+            let sessions = env.sessions
+            try await Task.detached { try sessions.changeFrame(sessionID: detail.session.id, newSnapshot: newSnapshot, frames: repository, expectedSessionRevision: detail.session.revisionNo) }.value
             _ = try? env.assets.collectGarbage()
             undoStack.removeAll()
             redoStack.removeAll()
@@ -1116,7 +1213,7 @@ public final class ReviewViewModel: ObservableObject {
     }
 
     public func redo() {
-        guard let action = redoStack.last else { return }
+        guard !hasPendingEdits, let action = redoStack.last else { return }
         do {
             try applyUndo(action, inverted: true)
             _ = redoStack.popLast()
@@ -1144,25 +1241,12 @@ public final class ReviewViewModel: ObservableObject {
             } else {
                 try env.sessions.clearOverride(sessionID: detail.session.id, photoRevisionID: rev.id)
             }
-        case .applyAll(let before, let after):
-            guard let detail else { throw AppError.notFound("Không có phiên") }
-            let snapshot = inverted ? after : before
-            let current = detail.currentRevisions()
-            if !inverted {
-                // Undo: các ảnh vốn KHÔNG có override trước đó phải được clear về mặc định,
-                // nếu không chúng giữ mãi giá trị vừa "áp dụng cho tất cả".
-                for idx in Set(after.keys).subtracting(before.keys) {
-                    if let rev = current[idx] {
-                        try? env.sessions.clearOverride(sessionID: detail.session.id,
-                                                        photoRevisionID: rev.id)
-                    }
-                }
+        case .applyAll(let sessionID, let before, let after):
+            guard detail?.session.id == sessionID else {
+                throw AppError.invalidState("Phiên chụp không khớp")
             }
-            for (idx, o) in snapshot {
-                if let rev = current[idx] {
-                    try env.sessions.setOverride(sessionID: detail.session.id, photoRevisionID: rev.id, override: o)
-                }
-            }
+            let target = inverted ? after.mapValues { Optional($0) } : before
+            try env.sessions.restorePresetOverrides(sessionID: sessionID, overrides: target)
         case .presetSession(let sessionID, let before, let after):
             guard let detail else { throw AppError.notFound("Không có phiên") }
             guard detail.session.id == sessionID else {
@@ -1231,6 +1315,7 @@ public final class ReviewViewModel: ObservableObject {
             try await env.completeSession(sessionID: detail.session.id)
             return true
         } catch {
+            await reload()
             env.showToast((error as? AppError)?.message ?? "Không thể hoàn thành phiên", kind: .warning)
             return false
         }

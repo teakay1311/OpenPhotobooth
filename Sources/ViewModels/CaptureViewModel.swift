@@ -51,6 +51,7 @@ public final class CaptureViewModel: ObservableObject {
     @Published public var countdown: Int = 3
     @Published public var interval: Int = 2
     @Published public var selectedPresetID: String = "natural"
+    @Published public var plannedCaptureCount = 4
     @Published public var requestedSelectionCount: Int?
     @Published public var liveFramePreview: Bool = false
 
@@ -266,9 +267,8 @@ public final class CaptureViewModel: ObservableObject {
     // MARK: - Session lifecycle (§3.2)
 
     public var canStartSession: Bool {
-        isCameraReady &&
-        selectedFrame != nil &&
-        selectedFrame?.validationStatus == .ready
+        !engine.isCancellingSession && isCameraReady &&
+        (1...ResourceLimits.maxCaptureIndices).contains(plannedCaptureCount)
     }
 
     public var startButtonTitle: String {
@@ -280,12 +280,15 @@ public final class CaptureViewModel: ObservableObject {
         case .intermission: return "Tạm dừng"
         case .paused: return "Tiếp tục"
         case .recoverableError: return engine.hasPhotoToSave ? "Thử lưu lại" : "Thử chụp lại lượt"
-        case .reviewing, .completed: return engine.session?.pendingSelectionCount == nil ? "Xem và chỉnh ảnh" : "Chọn ảnh vào khung"
+        case .reviewing, .completed:
+            if engine.session?.awaitsFrame == true { return "Chọn khung" }
+            return engine.session?.pendingSelectionCount == nil ? "Xem và chỉnh ảnh" : "Chọn ảnh vào khung"
         default: return "Bắt đầu chụp"
         }
     }
 
     public func primaryAction() async {
+        guard !engine.isCancellingSession else { return }
         switch engine.state {
         case .idle:
             await startNewSession()
@@ -348,6 +351,7 @@ public final class CaptureViewModel: ObservableObject {
 
     /// Xử lý phím Esc hủy đếm ngược hoặc thoát an toàn (AG-2).
     public func handleExitCommand() {
+        guard !engine.isCancellingSession else { return }
         if case .countdown = engine.state {
             let isRetake = (env.retakeSessionID != nil) || (engine.lastShotContext?.kind == .retake)
             let retakeID = env.retakeSessionID ?? engine.session?.id
@@ -363,7 +367,7 @@ public final class CaptureViewModel: ObservableObject {
     /// Kiểm tra tiền điều kiện §17.3 CreateSession: frame ready + camera usable + storage writable.
     public func startNewSession() async {
         guard canStartSession, await env.capturePreview.confirmVideoFallback(),
-              canStartSession, let frame = selectedFrame, !Task.isCancelled else { return }
+              canStartSession, !Task.isCancelled else { return }
         // Nếu có phiên paused khác → lựa chọn (§10.3)
         if engine.session != nil, engine.state != .idle {
             env.showToast("Đang có phiên hoạt động", kind: .warning)
@@ -376,14 +380,14 @@ public final class CaptureViewModel: ObservableObject {
             }
             let cameraID = selectedDeviceID == "auto" ? await env.camera.currentDevice?.uniqueID : selectedDeviceID
             try Task.checkCancellation()
-            let snapshot = try env.frames.createSnapshot(frameID: frame.id)
+            guard !engine.isCancellingSession else { return }
+            let snapshot = FrameSnapshot.awaitingFrame()
             var defaults = quickDefaults()
-            defaults.selectionCaptureCount = selectionCount
+            defaults.plannedCaptureCount = plannedCaptureCount
             _ = try engine.beginSession(snapshot: snapshot, mode: mode,
                                         cameraID: cameraID,
                                         defaults: defaults,
-                                        countdown: countdown, interval: interval,
-                                        frameName: frame.name)
+                                        countdown: countdown, interval: interval)
             try engine.startOrContinue()
         } catch is CancellationError {
             return
@@ -523,7 +527,7 @@ final class CapturePreviewCoordinator: ObservableObject {
     func refresh(requestAccess: Bool = false, forRetake: Bool = false) async {
         let retakeRoute = forRetake ? env.route : nil
         guard needsPreview || retakeRoute != nil else { return }
-        if env.engine.isCaptureBusy {
+        if env.engine.isCaptureBusy || env.engine.isCancellingSession {
             deferredRefresh = needsPreview
             return
         }

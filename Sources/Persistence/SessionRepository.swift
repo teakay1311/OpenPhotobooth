@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 /// SessionRepository: session/photo revision/snapshot/adjustment DB (§17.1).
@@ -21,7 +22,16 @@ public final class SessionRepository: @unchecked Sendable {
                               frameNameAtCapture: String? = nil,
                               countdownSeconds: Int = 3,
                               intermissionSeconds: Int = 2) throws -> CaptureSessionRecord {
-        guard snapshot.requiredCaptureCount > 0 else { throw AppError.frameUnconfigured }
+        let planned = defaults.plannedCaptureCount
+        if let planned {
+            guard (1...ResourceLimits.maxCaptureIndices).contains(planned),
+                  defaults.selectedCaptureOrder == nil, snapshot.slots.isEmpty,
+                  snapshot.sourceFrameID == nil, snapshot.background == nil, snapshot.foreground == nil else {
+                throw AppError.invalidState("Cấu hình phiên chụp chưa hợp lệ")
+            }
+        } else if snapshot.requiredCaptureCount == 0 {
+            throw AppError.frameUnconfigured
+        }
         if let count = defaults.selectionCaptureCount,
            count < snapshot.requiredCaptureCount || count > ResourceLimits.maxCaptureIndices {
             throw AppError.invalidState("Số lượt chụp phải đủ để điền khung ảnh")
@@ -29,13 +39,14 @@ public final class SessionRepository: @unchecked Sendable {
         let session = CaptureSessionRecord(
             status: .inProgress,
             activeFrameSnapshotID: snapshot.id,
-            requiredCaptureCount: snapshot.requiredCaptureCount,
+            requiredCaptureCount: planned ?? snapshot.requiredCaptureCount,
             captureMode: mode, cameraID: cameraID, defaults: defaults,
             frameNameAtCapture: frameNameAtCapture,
             countdownSeconds: countdownSeconds,
             intermissionSeconds: intermissionSeconds)
         let defaultsJSON = String(data: try Self.jsonEncoder.encode(defaults), encoding: .utf8) ?? "{}"
         try db.withTransaction { tx in
+            if planned != nil { try Self.storeSnapshot(snapshot, tx: tx) }
             try tx.run("""
                 INSERT INTO sessions(id, status, active_frame_snapshot_id, required_capture_count,
                     current_capture_index, capture_mode, camera_id, session_defaults_json, revision_no,
@@ -106,23 +117,28 @@ public final class SessionRepository: @unchecked Sendable {
             intermissionSeconds: intermissionSeconds)
     }
 
-    public struct SessionCard: Identifiable, Equatable {
+    public struct SessionCard: Identifiable, Equatable, Sendable {
         public var id: String { session.id }
         public var session: CaptureSessionRecord
         public var committedCount: Int
+        public var totalCapturedCount: Int = 0
         public var hasRenderCache: Bool
+        var sourceFrameName: String? = nil
     }
 
     public func listSessions(statuses: [SessionStatus]? = nil, searchText: String = "") throws -> [SessionCard] {
         let defaultsJSON = "(CASE WHEN json_valid(s.session_defaults_json) THEN s.session_defaults_json ELSE '{}' END)"
         let selectionCount = "json_extract(\(defaultsJSON), '$.selectionCaptureCount')"
+        let planned = "json_extract(\(defaultsJSON), '$.plannedCaptureCount')"
+        let awaitsFrame = "\(planned) IS NOT NULL AND json_extract(\(defaultsJSON), '$.selectedCaptureOrder') IS NULL"
         let pendingSelection = "\(selectionCount) BETWEEN 1 AND \(ResourceLimits.maxCaptureIndices) AND json_extract(\(defaultsJSON), '$.selectedCaptureOrder') IS NULL"
         let committedExpr = """
             (SELECT COUNT(DISTINCT sh.capture_index) FROM session_shots sh
              JOIN photo_revisions pr ON pr.id = sh.current_photo_revision_id
              JOIN frame_snapshots fs ON fs.id = s.active_frame_snapshot_id
              WHERE sh.session_id = s.id AND pr.state = 'available'
-               AND CASE WHEN \(pendingSelection) THEN sh.capture_index BETWEEN 1 AND \(selectionCount)
+               AND CASE WHEN \(awaitsFrame) THEN sh.capture_index BETWEEN 1 AND \(planned)
+                        WHEN \(pendingSelection) THEN sh.capture_index BETWEEN 1 AND \(selectionCount)
                         ELSE sh.capture_index IN (
                             SELECT json_extract(value, '$.captureIndex')
                             FROM json_each(
@@ -135,8 +151,12 @@ public final class SessionRepository: @unchecked Sendable {
         let effectiveStatusExpr = "CASE WHEN s.status = 'completed' AND \(committedExpr) < s.required_capture_count THEN 'paused' ELSE s.status END"
 
         var sql = """
-            SELECT s.*, \(committedExpr) AS committed
+            SELECT s.*, f.name AS source_frame_name, \(committedExpr) AS committed,
+              (SELECT COUNT(*) FROM session_shots sh JOIN photo_revisions pr ON pr.id=sh.current_photo_revision_id
+               WHERE sh.session_id=s.id AND pr.state='available') AS total_captured
             FROM sessions s
+            LEFT JOIN frame_snapshots sf ON sf.id = s.active_frame_snapshot_id
+            LEFT JOIN frames f ON f.id = sf.source_frame_id
             """
         var conditions: [String] = []
         var bind: [SQLiteValue] = []
@@ -151,12 +171,12 @@ public final class SessionRepository: @unchecked Sendable {
         let trimmedSearch = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedSearch.isEmpty {
             let pattern = "%\(trimmedSearch)%"
-            conditions.append("(s.frame_name_at_capture LIKE ? OR s.id LIKE ? OR datetime(s.created_at_ms / 1000, 'unixepoch', 'localtime') LIKE ?)")
+            conditions.append("(COALESCE(json_extract(\(defaultsJSON), '$.appliedFrameName'), s.frame_name_at_capture) LIKE ? OR s.id LIKE ? OR datetime(s.created_at_ms / 1000, 'unixepoch', 'localtime') LIKE ?)")
             bind += [.text(pattern), .text(pattern), .text(pattern)]
         }
 
         sql += " WHERE " + conditions.joined(separator: " AND ")
-        sql += " ORDER BY s.updated_at_ms DESC LIMIT 500"
+        sql += " ORDER BY s.updated_at_ms DESC, s.id ASC"
         let rows = try db.query(sql, bind)
         return rows.compactMap { row -> SessionCard? in
             guard var s = Self.session(from: row) else { return nil }
@@ -168,7 +188,8 @@ public final class SessionRepository: @unchecked Sendable {
                 s.completedAtMs = nil
             }
             return SessionCard(session: s, committedCount: committed,
-                               hasRenderCache: false)
+                               totalCapturedCount: row["total_captured"]?.intValue ?? committed,
+                               hasRenderCache: false, sourceFrameName: row["source_frame_name"] == .null ? nil : row["source_frame_name"].stringValue)
         }
     }
 
@@ -176,6 +197,7 @@ public final class SessionRepository: @unchecked Sendable {
         let rows = try db.query("""
             SELECT * FROM sessions
             WHERE status IN ('draft','in_progress','paused','reviewable') AND NOT \(Self.hasRootTrashItem)
+              AND NOT \(Self.hasUnresolvedCaptureCancellation)
             ORDER BY updated_at_ms DESC LIMIT 1
             """)
         return rows.first.flatMap(Self.session(from:))
@@ -418,12 +440,25 @@ public final class SessionRepository: @unchecked Sendable {
         EXISTS (SELECT 1 FROM trash_items WHERE root_type='session' AND root_id=sessions.id)
         """
 
+    private static let hasUnresolvedCaptureCancellation = """
+        EXISTS (
+            SELECT 1 FROM operation_intents WHERE root_id=sessions.id AND op_type='trash'
+              AND status IN ('prepared','files_staged','files_promoted','rollback_required')
+              AND json_extract(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END,
+                               '$.captureCancellation')=1
+        )
+        """
+
     func activeSession(id: String) throws -> CaptureSessionRecord? {
-        let row = try db.query("""
-            SELECT * FROM sessions WHERE id=? AND status NOT IN ('trashed','purging')
+        guard let row = try db.query("""
+            SELECT *, \(Self.hasUnresolvedCaptureCancellation) AS cancellation_needs_recovery
+            FROM sessions WHERE id=? AND status NOT IN ('trashed','purging')
               AND NOT \(Self.hasRootTrashItem)
-            """, [.text(id)]).first
-        return row.flatMap(Self.session(from:))
+            """, [.text(id)]).first else { return nil }
+        guard row["cancellation_needs_recovery"]?.intValue != 1 else {
+            throw AppError.invalidState("Cần mở lại ứng dụng để phục hồi vị trí tệp của phiên chụp")
+        }
+        return Self.session(from: row)
     }
 
     func activeCaptureDetail(sessionID: String) throws -> SessionDetail? {
@@ -508,12 +543,13 @@ public final class SessionRepository: @unchecked Sendable {
     }
 
     /// Áp dụng màu cho tất cả: override snapshot cho mọi ảnh current (§8.3, một transaction).
+    @discardableResult
     public func applyColorToAll(sessionID: String, color: ColorOverrides?,
                                 presetID: String?, presetParameters: ColorParameterSet?, presetIntensity: Double?,
-                                explicitNoPreset: Bool? = nil) throws {
+                                explicitNoPreset: Bool? = nil) throws -> (before: [String: PhotoOverride?], after: [String: PhotoOverride]) {
         let token = try OperationCoordinator.shared.acquire(key: "session:\(sessionID)", reason: "Chỉnh ảnh")
         defer { token.release() }
-        try db.withTransaction { tx in
+        let result = try db.withTransaction { tx -> (before: [String: PhotoOverride?], after: [String: PhotoOverride]) in
             let rows = try tx.query("""
                 SELECT pr.id, sh.capture_index FROM photo_revisions pr
                 JOIN session_shots sh ON sh.id = pr.shot_id
@@ -529,14 +565,19 @@ public final class SessionRepository: @unchecked Sendable {
                            )
                            ELSE 1 END
                 """, [.text(sessionID)])
+            var before: [String: PhotoOverride?] = [:]
+            var after: [String: PhotoOverride] = [:]
             for row in rows {
                 let revID = row["id"].stringValue
                 let existing = try tx.query("SELECT overrides_json FROM photo_adjustments WHERE photo_revision_id=?", [.text(revID)])
+                var old: PhotoOverride?
                 var o = PhotoOverride()
                 if let data = existing.first?["overrides_json"].stringValue.data(using: .utf8),
                    let decoded = try? Self.jsonDecoder.decode(PhotoOverride.self, from: data) {
+                    old = decoded
                     o = decoded
                 }
+                before.updateValue(old, forKey: revID)
                 o.color = color ?? o.color
                 if explicitNoPreset == true {
                     o.explicitNoPreset = true
@@ -549,6 +590,7 @@ public final class SessionRepository: @unchecked Sendable {
                     o.presetParameters = presetParameters
                     o.presetIntensity = presetIntensity
                 }
+                after[revID] = o
                 let json = String(data: try Self.jsonEncoder.encode(o), encoding: .utf8) ?? "{}"
                 let up = try tx.query("SELECT COUNT(*) c FROM photo_adjustments WHERE photo_revision_id=?", [.text(revID)])
                 if (up.first?["c"]?.intValue ?? 0) > 0 {
@@ -557,8 +599,13 @@ public final class SessionRepository: @unchecked Sendable {
                     try tx.run("INSERT INTO photo_adjustments(photo_revision_id, overrides_json, parameter_version, updated_at_ms) VALUES(?,?,1,?)", [.text(revID), .text(json), .int(Time.nowMs())])
                 }
             }
-            try tx.run("UPDATE sessions SET revision_no=revision_no+1, updated_at_ms=? WHERE id=?", [.int(Time.nowMs()), .text(sessionID)])
+            if !after.isEmpty {
+                try tx.run("UPDATE sessions SET revision_no=revision_no+1, updated_at_ms=? WHERE id=?", [.int(Time.nowMs()), .text(sessionID)])
+            }
+            return (before, after)
         }
+        if !result.after.isEmpty { EventBus.shared.post(.sessionChanged(sessionID: sessionID, revision: 0)) }
+        return result
     }
 
     /// Áp dụng preset cho cả phiên (§3.2): cập nhật tất cả ảnh hiện hành còn khả dụng (kể cả ảnh dự phòng) trong 1 giao dịch.
@@ -851,16 +898,87 @@ public final class SessionRepository: @unchecked Sendable {
     }
 
     /// Đổi khung ở Review (§3.6): snapshot mới + mapping + reset placements theo snapshot mới (transaction, D2-A08, DATA-01, DATA-02).
-    public func changeFrame(sessionID: String, newSnapshot: FrameSnapshot) throws {
-        try replaceFrame(sessionID: sessionID, proposedSnapshot: newSnapshot, selection: nil)
+    public func changeFrame(sessionID: String, newSnapshot: FrameSnapshot,
+                            frames: FrameRepository? = nil, expectedSessionRevision: Int? = nil) throws {
+        guard let frameID = newSnapshot.sourceFrameID, let revision = newSnapshot.sourceFrameRevisionID else {
+            try replaceFrame(sessionID: sessionID, proposedSnapshot: newSnapshot, selection: nil, expectedRevision: expectedSessionRevision)
+            return
+        }
+        let repository = frames ?? FrameRepository(db: db, assets: AssetStore(db: db, layout: layout), layout: layout)
+        let token = try OperationCoordinator.shared.acquireFrameAndSession(frameID: frameID, sessionID: sessionID, reason: "Đổi khung")
+        defer { token.release() }
+        _ = try repository.validatedSnapshotForUse(frameID: frameID, expectedRevisionID: revision, parentToken: token)
+        try replaceFrame(sessionID: sessionID, proposedSnapshot: newSnapshot, selection: nil, expectedRevision: expectedSessionRevision, parentToken: token)
     }
 
     public func confirmPhotoSelection(sessionID: String, order: [Int]) throws {
         try replaceFrame(sessionID: sessionID, proposedSnapshot: nil, selection: order)
     }
 
-    private func replaceFrame(sessionID: String, proposedSnapshot: FrameSnapshot?, selection: [Int]?) throws {
-        let lockToken = try OperationCoordinator.shared.acquire(key: "session:\(sessionID)", reason: "changeFrame")
+    func verifiedPhotoImage(_ revision: PhotoRevision) throws -> CGImage {
+        let data = try Data(contentsOf: fileURL(for: revision))
+        guard revision.sha256.isEmpty || Hashing.sha256Hex(data) == revision.sha256,
+              let image = ImageNormalizer.uprightImage(data: data) else {
+            throw AppError.ioFailure("Tệp ảnh không đọc được hoặc không khớp checksum")
+        }
+        return image
+    }
+
+    func verifiedCaptureDetail(sessionID: String) throws -> SessionDetail? {
+        guard var detail = try activeCaptureDetail(sessionID: sessionID) else { return nil }
+        for shot in detail.shots {
+            guard let current = shot.currentPhotoRevisionID,
+                  let index = detail.photoRevisions[shot.id]?.firstIndex(where: { $0.id == current }),
+                  let revision = detail.photoRevisions[shot.id]?[index],
+                  revision.state == .available,
+                  (try? verifiedPhotoImage(revision)) == nil else { continue }
+            detail.photoRevisions[shot.id]?[index].state = .corrupt
+        }
+        return detail
+    }
+
+    func applyCaptureFrame(sessionID: String, expectedRevision: Int, frameID: String,
+                           frameRevisionID: String, orderedPhotoIDs: [String],
+                           frames: FrameRepository, assets: AssetStore) throws {
+        let token = try OperationCoordinator.shared.acquireFrameAndSession(
+            frameID: frameID, sessionID: sessionID, reason: "Áp dụng khung")
+        defer { token.release() }
+        guard let detail = try verifiedCaptureDetail(sessionID: sessionID),
+              detail.session.defaults.plannedCaptureCount != nil,
+              let frame = try frames.getFrame(id: frameID),
+              frame.lifecycle == .active, frame.validationStatus == .ready,
+              frame.currentRevisionID == frameRevisionID else {
+            throw AppError.invalidState("Phiên hoặc khung đã thay đổi")
+        }
+        let current = detail.currentRevisions(includeUnassigned: true).filter { $0.value.state == .available }
+        let byID = Dictionary(uniqueKeysWithValues: current.map { ($0.value.id, $0.key) })
+        let order = orderedPhotoIDs.compactMap { byID[$0] }
+        guard order.count == orderedPhotoIDs.count, Set(order).count == order.count else {
+            throw AppError.invalidState("Ảnh đã chọn không còn khả dụng")
+        }
+        if detail.snapshot.sourceFrameID == frameID,
+           detail.snapshot.sourceFrameRevisionID == frameRevisionID,
+           detail.session.defaults.selectedCaptureOrder == order { return }
+        guard detail.session.revisionNo == expectedRevision,
+              !detail.session.awaitsFrame || detail.missingIndices.isEmpty else {
+            throw AppError.invalidState("Phiên đã thay đổi. Hãy kiểm tra lại ảnh trước khi xác nhận.")
+        }
+        let snapshot = try frames.validatedSnapshotForUse(frameID: frameID, expectedRevisionID: frameRevisionID, parentToken: token)
+        guard snapshot.sourceFrameRevisionID == frameRevisionID else {
+            throw AppError.invalidState("Khung ảnh đã thay đổi")
+        }
+        for layer in [snapshot.background, snapshot.foreground].compactMap({ $0 }) {
+            _ = try assets.loadVerifiedImage(assetID: layer.assetID)
+        }
+        try replaceFrame(sessionID: sessionID, proposedSnapshot: snapshot, selection: order,
+                         captureFirst: (expectedRevision, frame.name), parentToken: token)
+    }
+
+    private func replaceFrame(sessionID: String, proposedSnapshot: FrameSnapshot?, selection: [Int]?,
+                              captureFirst: (revision: Int, frameName: String)? = nil, expectedRevision: Int? = nil,
+                              parentToken: OperationCoordinator.OperationToken? = nil) throws {
+        let lockToken = try OperationCoordinator.shared.acquire(key: "session:\(sessionID)", reason: "changeFrame",
+                                                                parentToken: parentToken)
         defer { lockToken.release() }
 
         try db.withTransaction { tx in
@@ -868,14 +986,28 @@ public final class SessionRepository: @unchecked Sendable {
             guard let row = rows.first, var session = Self.session(from: row) else {
                 throw AppError.notFound("session \(sessionID)")
             }
+            guard expectedRevision == nil || expectedRevision == session.revisionNo else {
+                throw AppError.invalidState("Phiên đã thay đổi. Hãy mở lại bộ chọn khung.")
+            }
             let committedRows = try tx.query("""
                 SELECT sh.capture_index FROM session_shots sh
                 JOIN photo_revisions pr ON pr.id = sh.current_photo_revision_id
                 WHERE sh.session_id=? AND pr.state='available'
                 """, [.text(sessionID)])
             let committedIndices = Set(committedRows.compactMap { $0["capture_index"]?.intValue })
+            let previousSnapshot = try Self.loadSnapshot(session.activeFrameSnapshotID, tx: tx)
             let newSnapshot: FrameSnapshot
-            if let selection {
+            if let captureFirst {
+                guard session.defaults.plannedCaptureCount != nil,
+                      session.revisionNo == captureFirst.revision,
+                      let proposedSnapshot, proposedSnapshot.requiredCaptureCount > 0,
+                      let selection, Set(selection).isSubset(of: committedIndices) else {
+                    throw AppError.invalidState("Phiên hoặc ảnh đã thay đổi")
+                }
+                newSnapshot = try proposedSnapshot.assigningPhotos(in: selection)
+                session.defaults.selectedCaptureOrder = selection
+                session.defaults.appliedFrameName = captureFirst.frameName
+            } else if let selection {
                 guard let count = session.pendingSelectionCount,
                       session.status == .reviewable || session.status == .paused,
                       Set(1...count).isSubset(of: committedIndices),
@@ -888,7 +1020,8 @@ public final class SessionRepository: @unchecked Sendable {
                 newSnapshot = try snapshot.assigningPhotos(in: selection)
                 session.defaults.selectedCaptureOrder = selection
             } else {
-                guard let proposedSnapshot, proposedSnapshot.requiredCaptureCount > 0 else {
+                guard session.defaults.plannedCaptureCount == nil,
+                      let proposedSnapshot, proposedSnapshot.requiredCaptureCount > 0 else {
                     throw AppError.frameUnconfigured
                 }
                 if let count = session.defaults.selectionCaptureCount {
@@ -938,6 +1071,10 @@ public final class SessionRepository: @unchecked Sendable {
                 nextIndex = requiredIndices.max() ?? 1
             }
 
+            if let proposedSnapshot, proposedSnapshot.sourceFrameID != previousSnapshot.sourceFrameID ||
+                proposedSnapshot.sourceFrameRevisionID != previousSnapshot.sourceFrameRevisionID {
+                session.defaults.autoFacePlacementVersion = 1
+            }
             let defaultsJSON = String(decoding: try Self.jsonEncoder.encode(session.defaults), as: UTF8.self)
             try tx.run("""
                 UPDATE sessions
@@ -1005,6 +1142,7 @@ public final class SessionRepository: @unchecked Sendable {
             SELECT * FROM sessions WHERE status NOT IN ('trashed','purging')
               AND NOT \(Self.hasRootTrashItem)
               AND json_valid(session_defaults_json)
+              AND json_extract(session_defaults_json, '$.plannedCaptureCount') IS NULL
               AND json_type(session_defaults_json, '$.selectedCaptureOrder')='array'
             """)
         var updated = 0

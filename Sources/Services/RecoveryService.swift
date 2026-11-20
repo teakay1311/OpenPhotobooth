@@ -63,8 +63,32 @@ public final class RecoveryService: @unchecked Sendable {
             let tempURL = try? layout.absoluteURL(forRelativePath: payload.tempRelativePath)
             // DB commit trước khi file tồn tại là không hợp lệ (§10.2): nếu DB đã có revision
             // với requestID này → intent đã commit; đảm bảo file khớp.
-            let existing = (try? db.query("SELECT id, relative_path, sha256 FROM photo_revisions WHERE capture_request_id=?", [.text(payload.requestID)])) ?? []
+            let captureFirst = (try? sessions.getSession(id: payload.sessionID))?.defaults.plannedCaptureCount != nil
+            let existing = (try? db.query("""
+                SELECT pr.id, pr.relative_path, pr.sha256, sh.session_id, sh.capture_index
+                FROM photo_revisions pr JOIN session_shots sh ON sh.id=pr.shot_id
+                WHERE pr.capture_request_id=?
+                """, [.text(payload.requestID)])) ?? []
             if let row = existing.first {
+                if captureFirst {
+                    do {
+                        guard intent.rootID == payload.sessionID,
+                              row["session_id"].stringValue == payload.sessionID,
+                              row["capture_index"]?.intValue == payload.captureIndex,
+                              row["sha256"].stringValue == payload.sha256,
+                              let revision = try sessions.getPhotoRevision(id: row["id"].stringValue) else {
+                            throw AppError.invalidState("Thông tin ảnh đã ghi không khớp lượt chụp")
+                        }
+                        _ = try sessions.verifiedPhotoImage(revision)
+                        try trashRepo.updateIntent(id: intent.id, status: .committed)
+                        report.committedIntents += 1
+                    } catch {
+                        let message = "Không xác minh được ảnh đã ghi của lượt \(payload.captureIndex)"
+                        report.issues.append(message)
+                        try? trashRepo.updateIntent(id: intent.id, status: .failed, error: message)
+                    }
+                    continue
+                }
                 // Đã commit trước crash: kiểm tra file tồn tại
                 let rel = row["relative_path"].stringValue
                 if let url = try? layout.absoluteURL(forRelativePath: rel),
@@ -86,6 +110,12 @@ public final class RecoveryService: @unchecked Sendable {
                         // Tránh fallback (width=0, height=0) vi phạm CHECK.
                         let fileData = try Data(contentsOf: fURL)
                         let (decodedW, decodedH) = AssetStore.imageDimensions(of: fileData)
+                        if captureFirst && (decodedW == nil || decodedH == nil ||
+                                            ImageNormalizer.uprightImage(data: fileData) == nil) {
+                            quarantine(url: fURL, report: &report, reason: "Không giải mã được ảnh đã ghi")
+                            try trashRepo.updateIntent(id: intent.id, status: .failed, error: "Ảnh không giải mã được")
+                            continue
+                        }
                         let width = decodedW ?? 1
                         let height = decodedH ?? 1
                         // Đọc EXIF orientation để giữ orientation gốc (nếu có).

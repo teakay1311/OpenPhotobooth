@@ -9,6 +9,7 @@ import CoreGraphics
 ///   → crop/placement → mask (rect/rounded/ellipse) → rotate slot → composite.
 public enum CompositeRenderer {
     public static var geometryVersion: Int { 1 }
+    static let renderCacheVersion = 2
 
     // MARK: - Entry
 
@@ -42,7 +43,8 @@ public enum CompositeRenderer {
 
         // Background layer
         if let bg = snap.background, let image = model.assetImages[bg.assetID] {
-            if let layer = placeLayer(CIImage(cgImage: image), canvasWidth: W, canvasHeight: H, placement: bg.placement) {
+            let pixels = try ImageNormalizer.orientedFrameLayer(image, orientation: bg.imageOrientation)
+            if let layer = placeLayer(pixels, canvasWidth: W, canvasHeight: H, placement: bg.placement) {
                 canvas = layer.composited(over: canvas)
             }
         }
@@ -59,7 +61,8 @@ public enum CompositeRenderer {
 
         // Foreground overlay (luôn trên ảnh — §18.5)
         if let fg = snap.foreground, let image = model.assetImages[fg.assetID] {
-            if let layer = placeLayer(CIImage(cgImage: image), canvasWidth: W, canvasHeight: H, placement: fg.placement) {
+            let pixels = try ImageNormalizer.orientedFrameLayer(image, orientation: fg.imageOrientation)
+            if let layer = placeLayer(pixels, canvasWidth: W, canvasHeight: H, placement: fg.placement) {
                 canvas = layer.composited(over: canvas)
             }
         }
@@ -80,13 +83,10 @@ public enum CompositeRenderer {
 
     static func renderSlot(slot: SnapshotSlot, source: CGImage, model: CompositionModel,
                            scale: Double, canvasWidth: Int, canvasHeight: Int) -> CIImage? {
-        // Slot pixel trong target space (top-left coords)
-        let slotTopLeft = slot.rect.pixelRect(canvasWidth: canvasWidth, canvasHeight: canvasHeight)
-        guard slotTopLeft.width >= 1, slotTopLeft.height >= 1 else { return nil }
-        // Chuyển sang hệ CI (y-up)
-        let slotRectCI = CGRect(x: slotTopLeft.minX,
-                                y: Double(canvasHeight) - slotTopLeft.maxY,
-                                width: slotTopLeft.width, height: slotTopLeft.height)
+        let mask = MaskBuilder.CanvasSlot(slot: slot, width: canvasWidth, height: canvasHeight)
+        let slotTopLeft = mask.topLeft
+        guard mask.canRender else { return nil }
+        let slotRectCI = mask.rect
 
         var photo = CIImage(cgImage: source)
         let resolved = ResolvedPhotoParams.resolve(defaults: model.defaults,
@@ -110,59 +110,24 @@ public enum CompositeRenderer {
         var content = photo.transformed(by: CGAffineTransform(a: s, b: 0, c: 0, d: s, tx: ciX, ty: ciY))
             .cropped(to: slotRectCI)
 
-        // 4. Xoay slot quanh tâm trước, rồi mask cùng lúc để cạnh slot xoay khớp (§7.3)
-        if slot.rotationDegrees.truncatingRemainder(dividingBy: 360) != 0 {
-            let radians = CGFloat(-slot.rotationDegrees * Double.pi / 180) // clockwise màn hình
-            let center = CGPoint(x: slotRectCI.midX, y: slotRectCI.midY)
-            let rt = CGAffineTransform(translationX: center.x, y: center.y)
-                .concatenating(CGAffineTransform(rotationAngle: radians))
-                .concatenating(CGAffineTransform(translationX: -center.x, y: -center.y))
-            let bbox = FrameGeometry.rotatedPixelBounds(slot.rect, rotationDegrees: slot.rotationDegrees,
-                                                        canvasWidth: canvasWidth, canvasHeight: canvasHeight)
-            let bboxCI = CGRect(x: bbox.minX, y: CGFloat(canvasHeight) - bbox.maxY,
-                                width: bbox.width, height: bbox.height).insetBy(dx: -2, dy: -2)
-            content = content.transformed(by: rt).clampedToExtent().cropped(to: bboxCI)
+        if mask.rotates {
+            content = content.transformed(by: mask.rotation).clampedToExtent().cropped(to: mask.bounds)
         }
 
-        // 5. Mask slot (§7.3) — mask vẽ trong hệ canvas CI
-        let radius = SlotGeometry.cornerRadiusPixels(slot.cornerRadius, slotPixel: slotTopLeft,
-                                                     canvasWidth: canvasWidth, canvasHeight: canvasHeight)
-        guard var maskImage = MaskBuilder.slotMask(canvasWidth: canvasWidth, canvasHeight: canvasHeight,
-                                                   slotRect: slotRectCI, maskType: slot.maskType,
-                                                   cornerRadius: radius) else { return nil }
-        // Offset cần áp cho mask sau khi round-trip qua CGImage (extent reset về (0,0))
-        var maskOffset: CGPoint? = nil
-        if slot.rotationDegrees.truncatingRemainder(dividingBy: 360) != 0 {
-            let radians = CGFloat(-slot.rotationDegrees * Double.pi / 180)
-            let center = CGPoint(x: slotRectCI.midX, y: slotRectCI.midY)
-            let rt = CGAffineTransform(translationX: center.x, y: center.y)
-                .concatenating(CGAffineTransform(rotationAngle: radians))
-                .concatenating(CGAffineTransform(translationX: -center.x, y: -center.y))
-            let bbox = FrameGeometry.rotatedPixelBounds(slot.rect, rotationDegrees: slot.rotationDegrees,
-                                                        canvasWidth: canvasWidth, canvasHeight: canvasHeight)
-            let bboxCI = CGRect(x: bbox.minX, y: CGFloat(canvasHeight) - bbox.maxY,
-                                width: bbox.width, height: bbox.height).insetBy(dx: -2, dy: -2)
-            let maskCI = CIImage(cgImage: maskImage)
-            if let rotated = CIContextHolder.shared.context.createCGImage(
-                maskCI.transformed(by: rt).clampedToExtent().cropped(to: bboxCI), from: bboxCI) {
-                // CIImage(cgImage:) đặt extent tại (0,0) — phải dịch mask về đúng vị trí bbox trên canvas,
-                // nếu không mask lệch (-bbox.minX, -bbox.minY) so với content và slot bị che mất.
-                maskImage = rotated
-                maskOffset = CGPoint(x: bboxCI.minX, y: bboxCI.minY)
-            }
+        guard let maskImage = mask.image(in: mask.canvas) else { return nil }
+        var maskImageCI = CIImage(cgImage: maskImage)
+        if mask.rotates, let rotated = CIContextHolder.shared.context.createCGImage(
+            maskImageCI.transformed(by: mask.rotation).clampedToExtent().cropped(to: mask.bounds), from: mask.bounds) {
+            maskImageCI = CIImage(cgImage: rotated).transformed(by: CGAffineTransform(
+                translationX: mask.bounds.minX, y: mask.bounds.minY))
         }
-        let canvasRect = CGRect(x: 0, y: 0, width: canvasWidth, height: canvasHeight)
-        let transparent = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0)).cropped(to: canvasRect)
+        let transparent = CIImage(color: .clear).cropped(to: mask.canvas)
         let blend = CIFilter(name: "CIBlendWithMask")
         blend?.setValue(content, forKey: kCIInputImageKey)
         blend?.setValue(transparent, forKey: kCIInputBackgroundImageKey)
-        var maskImageCI = CIImage(cgImage: maskImage)
-        if let offset = maskOffset {
-            maskImageCI = maskImageCI.transformed(by: CGAffineTransform(translationX: offset.x, y: offset.y))
-        }
         blend?.setValue(maskImageCI, forKey: kCIInputMaskImageKey)
         // 6. Composite trong vùng canvas
-        let masked = blend?.outputImage?.cropped(to: canvasRect)
+        let masked = blend?.outputImage?.cropped(to: mask.canvas)
         return masked
     }
 
@@ -197,6 +162,61 @@ public enum CompositeRenderer {
 
 /// Vẽ mask slot trên bitmap context (hệ y-up khớp CI).
 public enum MaskBuilder {
+    struct CanvasSlot {
+        let topLeft: CGRect
+        let rect: CGRect
+        let canvas: CGRect
+        let radius: CGFloat
+        let maskType: MaskType
+        let rotation: CGAffineTransform
+        let bounds: CGRect
+
+        var canRender: Bool { rect.width >= 1 && rect.height >= 1 }
+        var rotates: Bool { !rotation.isIdentity }
+
+        init(slot: SnapshotSlot, width: Int, height: Int) {
+            canvas = CGRect(x: 0, y: 0, width: width, height: height)
+            topLeft = slot.rect.pixelRect(canvasWidth: width, canvasHeight: height)
+            rect = CGRect(x: topLeft.minX, y: Double(height) - topLeft.maxY,
+                          width: topLeft.width, height: topLeft.height)
+            radius = SlotGeometry.cornerRadiusPixels(slot.cornerRadius, slotPixel: topLeft,
+                                                      canvasWidth: width, canvasHeight: height)
+            maskType = slot.maskType
+            if slot.rotationDegrees.truncatingRemainder(dividingBy: 360) == 0 {
+                rotation = .identity
+                bounds = rect
+            } else {
+                rotation = CGAffineTransform(translationX: -rect.midX, y: -rect.midY)
+                    .concatenating(CGAffineTransform(rotationAngle: -slot.rotationDegrees * .pi / 180))
+                    .concatenating(CGAffineTransform(translationX: rect.midX, y: rect.midY))
+                let topBounds = FrameGeometry.rotatedPixelBounds(slot.rect, rotationDegrees: slot.rotationDegrees,
+                                                                 canvasWidth: width, canvasHeight: height)
+                bounds = CGRect(x: topBounds.minX, y: Double(height) - topBounds.maxY,
+                                width: topBounds.width, height: topBounds.height).insetBy(dx: -2, dy: -2)
+            }
+        }
+
+        func image(in area: CGRect) -> CGImage? {
+            MaskBuilder.slotMask(canvasWidth: Int(area.width), canvasHeight: Int(area.height),
+                                 slotRect: rect.offsetBy(dx: -area.minX, dy: -area.minY),
+                                 maskType: maskType, cornerRadius: radius)
+        }
+
+        func coverage(in tile: CGRect) throws -> CIImage {
+            let clear = CIImage(color: .clear).cropped(to: tile)
+            let source = rotates ? tile.applying(rotation.inverted()).insetBy(dx: -2, dy: -2)
+                .integral.intersection(canvas) : tile
+            guard !source.isEmpty else { return clear }
+            guard let bitmap = image(in: source) else { throw AppError.frameFileCorrupt }
+            var coverage = CIImage(cgImage: bitmap).transformed(by: CGAffineTransform(
+                translationX: source.minX, y: source.minY))
+            if rotates {
+                coverage = coverage.transformed(by: rotation).clampedToExtent().cropped(to: bounds)
+            }
+            return coverage.composited(over: clear).cropped(to: tile)
+        }
+    }
+
     public static func slotMask(canvasWidth: Int, canvasHeight: Int,
                                 slotRect: CGRect, maskType: MaskType, cornerRadius: CGFloat) -> CGImage? {
         guard canvasWidth >= 1, canvasHeight >= 1 else { return nil }

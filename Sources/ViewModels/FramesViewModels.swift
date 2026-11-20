@@ -15,6 +15,7 @@ public final class FramesViewModel: ObservableObject {
     @Published public private(set) var categories: [Category] = []
     @Published public var importQueueURLs: [URL] = []
     @Published public var showImportSheet: Bool = false
+    @Published private(set) var duplicatingFrameIDs: Set<String> = []
 
     public let env: AppEnvironment
 
@@ -165,20 +166,34 @@ public final class FramesViewModel: ObservableObject {
         reload()
     }
 
-    public func duplicate(_ frameID: String) {
+    public func duplicate(_ frameID: String) async {
+        guard duplicatingFrameIDs.insert(frameID).inserted else { return }
+        defer { duplicatingFrameIDs.remove(frameID) }
+        let repository = env.frames
         do {
-            _ = try env.frames.duplicateFrame(id: frameID)
+            // The requested copy completes even if the initiating view disappears.
+            let copy = try await Task.detached(priority: .userInitiated) {
+                try repository.duplicateFrame(id: frameID)
+            }.value
             reload()
+            EventBus.shared.post(.frameLibraryChanged(frameID: copy.id))
             env.showToast("Đã nhân bản khung")
-        } catch { env.showToast("Nhân bản lỗi", kind: .warning) }
+        } catch { env.showToast("Nhân bản lỗi: \(error.localizedDescription)", kind: .warning) }
     }
 
     public func moveToCategory(_ frameIDs: [String], categoryID: String?) {
-        for id in frameIDs {
-            try? env.frames.setCategory(frameID: id, categoryID: categoryID)
+        let ids = Array(Set(frameIDs))
+        guard !ids.isEmpty else { return }
+        do {
+            try env.frames.setCategory(frameIDs: ids, categoryID: categoryID)
+            reload()
+            EventBus.shared.post(.categoryChanged)
+            EventBus.shared.post(.frameLibraryChanged(frameID: nil))
+            env.showToast("Đã chuyển \(ids.count) khung")
+        } catch {
+            reload()
+            env.showToast("Không thể chuyển khung: \(error.localizedDescription)", kind: .warning)
         }
-        reload()
-        EventBus.shared.post(.categoryChanged)
     }
 
     public func trash(_ frameID: String) {
@@ -189,9 +204,9 @@ public final class FramesViewModel: ObservableObject {
         } catch { env.showToast("\((error as? AppError)?.message ?? "")", kind: .warning) }
     }
 
-    public func trashSelection() {
-        for id in selection { trash(id) }
-        selection.removeAll()
+    var selectedTrashTargets: [TrashService.FrameTarget] {
+        frames.filter { selection.contains($0.id) }
+            .map { TrashService.FrameTarget(id: $0.id, name: $0.frame.name) }
     }
 
     public func createCategory(named name: String) {
@@ -324,6 +339,67 @@ struct FrameEditorImportDraft: Identifiable {
     let width: Int
     let height: Int
     let slots: [FrameSlot]
+    var imageOrientation: Int? = nil
+    var claritySHA256: String? = nil
+    var clarityEdits: [PNGSlotClarity.Edit] = []
+    var clarityApprovals: PNGSlotClarity.Approvals = [:]
+}
+
+enum SlotClarityApprovals {
+    static func retained(_ edits: [PNGSlotClarity.Edit], from old: [FrameSlot], to new: [FrameSlot],
+                         canvasWidth: Int, canvasHeight: Int) -> [PNGSlotClarity.Edit] {
+        guard !edits.isEmpty else { return [] }
+        let affected = affectedIDs(from: old, to: new, canvasWidth: canvasWidth, canvasHeight: canvasHeight)
+        return edits.filter { !affected.contains($0.slotID) }
+    }
+
+    static func retained(_ approvals: PNGSlotClarity.Approvals, from old: [FrameSlot], to new: [FrameSlot],
+                         canvasWidth: Int, canvasHeight: Int) -> PNGSlotClarity.Approvals {
+        guard !approvals.isEmpty else { return [:] }
+        let affected = affectedIDs(from: old, to: new, canvasWidth: canvasWidth, canvasHeight: canvasHeight)
+        return approvals.filter { !affected.contains($0.key) }
+    }
+
+    private static func affectedIDs(from old: [FrameSlot], to new: [FrameSlot],
+                                    canvasWidth: Int, canvasHeight: Int) -> Set<String> {
+        let before = Dictionary(uniqueKeysWithValues: old.map { ($0.id, $0) })
+        let after = Dictionary(uniqueKeysWithValues: new.map { ($0.id, $0) })
+        let changed = Set(before.keys).union(after.keys).filter { id in
+            guard let a = before[id], let b = after[id] else { return true }
+            return a.rect != b.rect || a.rotationDegrees != b.rotationDegrees ||
+                a.maskType != b.maskType || a.cornerRadius != b.cornerRadius
+        }
+        guard !changed.isEmpty else { return [] }
+        let affected = changed.flatMap { [before[$0], after[$0]].compactMap { $0 } }.compactMap(path)
+        return changed.union(new.filter { slot in
+            guard let slotPath = path(slot) else { return true }
+            return affected.contains {
+                $0.boundingBoxOfPath.intersects(slotPath.boundingBoxOfPath) && !$0.intersection(slotPath).isEmpty
+            }
+        }.map(\.id))
+
+        func path(_ slot: FrameSlot) -> CGPath? {
+            guard slot.rect.isFinite, slot.rect.isPositive, slot.rotationDegrees.isFinite, slot.cornerRadius.isFinite else {
+                return nil
+            }
+            let rect = slot.rect.pixelRect(canvasWidth: canvasWidth, canvasHeight: canvasHeight)
+            let shape: CGPath
+            switch slot.maskType {
+            case .rectangle:
+                shape = CGPath(rect: rect, transform: nil)
+            case .ellipse:
+                shape = CGPath(ellipseIn: rect, transform: nil)
+            case .roundedRectangle:
+                let radius = max(0.5, SlotGeometry.cornerRadiusPixels(slot.cornerRadius, slotPixel: rect,
+                                                                       canvasWidth: canvasWidth, canvasHeight: canvasHeight))
+                shape = CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil)
+            }
+            var transform = CGAffineTransform(translationX: rect.midX, y: rect.midY)
+                .rotated(by: slot.rotationDegrees * .pi / 180)
+                .translatedBy(x: -rect.midX, y: -rect.midY)
+            return shape.copy(using: &transform)
+        }
+    }
 }
 
 /// FrameEditorViewModel (§2.7): draft geometry, undo/redo, validator F-VAL, lưu revision.
@@ -352,11 +428,19 @@ public final class FrameEditorViewModel: ObservableObject {
     public let env: AppEnvironment
     private var undoStack: [[FrameSlot]] = []
     private var redoStack: [[FrameSlot]] = []
+    @Published private(set) var isSaving = false
+    @Published private(set) var isValidating = false
+    private var validationTask: Task<Void, Never>?
+    private var validationGeneration = 0
     private var originalRevisionID: String?
     private var originalName: String = ""
     private var explicitWhiteSelected = false
     private var sourceHadExplicitWhite = false
+    private var backgroundImageOrientation: Int?
+    private var foregroundImageOrientation: Int?
     private var imported: FrameEditorImportDraft?
+    private var importedClarityEdits: [PNGSlotClarity.Edit] = []
+    private var importedClarityApprovals: PNGSlotClarity.Approvals = [:]
     /// OwnerKey tạm cho asset nhập trong editor (§6.5). Một phiên editor dùng 1 key,
     /// moveReferences về revision thật khi save.
     private var editorStagingOwnerKey: String = "editor-\(IDFactory.new())"
@@ -374,6 +458,7 @@ public final class FrameEditorViewModel: ObservableObject {
     }
 
     public init(env: AppEnvironment) { self.env = env }
+    deinit { validationTask?.cancel() }
 
     func load(imported draft: FrameEditorImportDraft) {
         guard imported == nil else { return }
@@ -382,6 +467,8 @@ public final class FrameEditorViewModel: ObservableObject {
                                              purpose: draft.role.rawValue, ownerType: "frame_revision",
                                              ownerID: editorStagingOwnerKey)
             imported = draft
+            importedClarityEdits = draft.claritySHA256 == asset.sha256 ? draft.clarityEdits : []
+            importedClarityApprovals = draft.claritySHA256 == asset.sha256 ? draft.clarityApprovals : [:]
             draftName = draft.name
             originalName = draft.name
             canvasWidth = draft.width
@@ -389,9 +476,11 @@ public final class FrameEditorViewModel: ObservableObject {
             slots = draft.slots
             if draft.role == .frameForeground {
                 foregroundAssetID = asset.id
+                foregroundImageOrientation = draft.imageOrientation
                 foregroundPlacement = .stretchToCanvas
             } else {
                 backgroundAssetID = asset.id
+                backgroundImageOrientation = draft.imageOrientation
             }
             hasChanges = true
             validate()
@@ -401,16 +490,65 @@ public final class FrameEditorViewModel: ObservableObject {
         }
     }
 
-    func saveImportedFrame() -> Frame? {
+    func importedClarityInput() throws -> FrameClaritySheet.ImportInput? {
+        guard imported != nil, let foregroundAssetID,
+              env.assets.assetInfo(assetID: foregroundAssetID)?.relativePath.lowercased().hasSuffix(".png") == true else {
+            return nil
+        }
+        let bytes = try env.assets.loadData(assetID: foregroundAssetID)
+        guard env.assets.assetInfo(assetID: foregroundAssetID)?.sha256 == Hashing.sha256Hex(bytes) else {
+            throw AppError.frameFileCorrupt
+        }
+        let snapshot = FrameSnapshot(sourceFrameID: nil, sourceFrameRevisionID: nil,
+            canvasWidth: canvasWidth, canvasHeight: canvasHeight,
+            background: backgroundAssetID.map { SnapshotLayer(assetID: $0, placement: backgroundPlacement, imageOrientation: backgroundImageOrientation) },
+            foreground: SnapshotLayer(assetID: foregroundAssetID, placement: foregroundPlacement),
+            backgroundColorHex: backgroundColorHex, slots: slots.map(SnapshotSlot.init(from:)),
+            snapshotHash: "", explicitWhite: explicitWhiteSelected)
+        return FrameClaritySheet.ImportInput(name: draftName, original: bytes, snapshot: snapshot,
+            edits: importedClarityEdits, approvals: importedClarityApprovals)
+    }
+
+    func saveImportedFrame(approvedPNG: Data? = nil, approvedInput: FrameClaritySheet.ImportInput? = nil) async -> Frame? {
         guard canSave, let imported else { return nil }
-        let draft = FrameRevision(frameID: "", revisionNo: 1, canvasWidth: canvasWidth, canvasHeight: canvasHeight,
+        var draft = FrameRevision(frameID: "", revisionNo: 1, canvasWidth: canvasWidth, canvasHeight: canvasHeight,
                                   backgroundAssetID: backgroundAssetID, foregroundAssetID: foregroundAssetID,
                                   backgroundColorHex: backgroundColorHex, backgroundPlacement: backgroundPlacement,
                                   foregroundPlacement: foregroundPlacement)
+        draft.backgroundImageOrientation = backgroundImageOrientation
+        draft.foregroundImageOrientation = foregroundImageOrientation
         do {
-            return try env.frames.createConfiguredFrame(name: draftName, categoryID: imported.categoryID,
-                                                        draft: draft, slots: slots, stagedOwnerID: editorStagingOwnerKey,
-                                                        explicitWhite: explicitWhiteSelected)
+            if let current = try importedClarityInput() {
+                guard approvedPNG != nil, let approvedInput,
+                      current.original == approvedInput.original,
+                      current.snapshot.canvasWidth == approvedInput.snapshot.canvasWidth,
+                      current.snapshot.canvasHeight == approvedInput.snapshot.canvasHeight,
+                      current.snapshot.foreground == approvedInput.snapshot.foreground,
+                      current.snapshot.background == approvedInput.snapshot.background,
+                      current.snapshot.backgroundColorHex == approvedInput.snapshot.backgroundColorHex,
+                      current.snapshot.explicitWhite == approvedInput.snapshot.explicitWhite,
+                      current.snapshot.slots == approvedInput.snapshot.slots else {
+                    throw AppError.invalidState("Bản nháp đã thay đổi. Hãy mở lại bản xem trước.")
+                }
+            }
+            let name = draftName
+            let category = imported.categoryID
+            let slots = slots
+            let owner = editorStagingOwnerKey
+            let explicitWhite = explicitWhiteSelected
+            let repository = env.frames
+            let assets = env.assets
+            return try await Task.detached(priority: .userInitiated) { [draft] in
+                var draft = draft
+                if let approvedPNG {
+                    let asset = try assets.store(data: approvedPNG, mediaType: "image/png",
+                        purpose: AssetKind.frameForeground.rawValue, ownerType: "frame_revision", ownerID: owner)
+                    draft.foregroundAssetID = asset.id
+                    draft.foregroundImageOrientation = nil
+                }
+                return try repository.createConfiguredFrame(name: name, categoryID: category, draft: draft, slots: slots,
+                                                           stagedOwnerID: owner, explicitWhite: explicitWhite)
+            }.value
         } catch {
             env.showToast("Không thể lưu khung: \(error.localizedDescription)", kind: .warning)
             return nil
@@ -422,25 +560,42 @@ public final class FrameEditorViewModel: ObservableObject {
     }
 
     public func load(frameID: String?) {
+        backgroundImageOrientation = nil
+        foregroundImageOrientation = nil
+        backgroundAssetID = nil
+        foregroundAssetID = nil
+        var loadError: String?
         if let frameID, let f = try? env.frames.getFrame(id: frameID) {
             frame = f
             draftName = f.name
             originalName = f.name
             originalRevisionID = f.currentRevisionID
-            if let revID = f.currentRevisionID, let rev = try? env.frames.getRevision(id: revID) {
-                canvasWidth = rev.canvasWidth
-                canvasHeight = rev.canvasHeight
-                backgroundAssetID = rev.backgroundAssetID
-                foregroundAssetID = rev.foregroundAssetID
-                backgroundColorHex = rev.backgroundColorHex
-                backgroundPlacement = rev.backgroundPlacement
-                foregroundPlacement = rev.foregroundPlacement
-                slots = (try? env.frames.getSlots(revisionID: revID)) ?? []
-                let explicit = (try? env.db.query("SELECT value FROM app_state WHERE key=?", [.text("explicit_white_\(revID)")]).first?["value"]?.stringValue)
-                sourceHadExplicitWhite = (explicit == "1" || explicit == "true")
-            } else {
+            do {
+                if let revID = f.currentRevisionID {
+                    guard let rev = try env.frames.getRevision(id: revID) else {
+                        throw AppError.notFound("Bản sửa đổi của khung")
+                    }
+                    canvasWidth = rev.canvasWidth
+                    canvasHeight = rev.canvasHeight
+                    backgroundAssetID = rev.backgroundAssetID
+                    backgroundImageOrientation = rev.backgroundImageOrientation
+                    foregroundAssetID = rev.foregroundAssetID
+                    foregroundImageOrientation = rev.foregroundImageOrientation
+                    backgroundColorHex = rev.backgroundColorHex
+                    backgroundPlacement = rev.backgroundPlacement
+                    foregroundPlacement = rev.foregroundPlacement
+                    slots = (try? env.frames.getSlots(revisionID: revID)) ?? []
+                    let explicit = (try? env.db.query("SELECT value FROM app_state WHERE key=?", [.text("explicit_white_\(revID)")]).first?["value"]?.stringValue)
+                    sourceHadExplicitWhite = (explicit == "1" || explicit == "true")
+                } else {
+                    slots = []
+                    sourceHadExplicitWhite = false
+                }
+            } catch {
+                originalRevisionID = nil
                 slots = []
                 sourceHadExplicitWhite = false
+                loadError = (error as? AppError)?.message ?? error.localizedDescription
             }
         } else {
             frame = nil
@@ -451,11 +606,28 @@ public final class FrameEditorViewModel: ObservableObject {
         explicitWhiteSelected = false
         hasChanges = false
         undoStack.removeAll(); redoStack.removeAll()
+        if let loadError {
+            validationTask?.cancel()
+            validationGeneration += 1
+            isValidating = false
+            validationIssues = [ValidationIssue(code: "F-VAL-09", slotID: nil, message: loadError)]
+            previewImage = nil
+            env.showToast(loadError, kind: .warning)
+            return
+        }
         validate()
         regeneratePreview()
     }
 
     // MARK: - Mutations (một thao tác kéo = một undo §7.4)
+
+    private func replaceSlotGeometry(_ next: [FrameSlot]) {
+        importedClarityEdits = SlotClarityApprovals.retained(importedClarityEdits, from: slots, to: next,
+                                                           canvasWidth: canvasWidth, canvasHeight: canvasHeight)
+        importedClarityApprovals = SlotClarityApprovals.retained(importedClarityApprovals, from: slots, to: next,
+                                                               canvasWidth: canvasWidth, canvasHeight: canvasHeight)
+        slots = next
+    }
 
     public func beginUndoGroup() {
         undoStack.append(slots)
@@ -464,7 +636,7 @@ public final class FrameEditorViewModel: ObservableObject {
     }
 
     public func endUndoGroup(_ newSlots: [FrameSlot]) {
-        slots = newSlots
+        replaceSlotGeometry(newSlots)
         hasChanges = true
         validate()
     }
@@ -472,7 +644,7 @@ public final class FrameEditorViewModel: ObservableObject {
     public func undo() {
         guard let prev = undoStack.popLast() else { return }
         redoStack.append(slots)
-        slots = prev
+        replaceSlotGeometry(prev)
         hasChanges = true
         validate()
     }
@@ -480,7 +652,7 @@ public final class FrameEditorViewModel: ObservableObject {
     public func redo() {
         guard let next = redoStack.popLast() else { return }
         undoStack.append(slots)
-        slots = next
+        replaceSlotGeometry(next)
         hasChanges = true
         validate()
     }
@@ -546,7 +718,7 @@ public final class FrameEditorViewModel: ObservableObject {
         if let idx = slots.firstIndex(where: { $0.id == slot.id }) {
             var s = slots
             s[idx] = slot
-            slots = s
+            replaceSlotGeometry(s)
             hasChanges = true
             validate()
         }
@@ -574,8 +746,14 @@ public final class FrameEditorViewModel: ObservableObject {
     }
 
     public func setCanvas(width: Int, height: Int) {
-        canvasWidth = min(max(width, ResourceLimits.canvasMin), ResourceLimits.canvasMax)
-        canvasHeight = min(max(height, ResourceLimits.canvasMin), ResourceLimits.canvasMax)
+        let newWidth = min(max(width, ResourceLimits.canvasMin), ResourceLimits.canvasMax)
+        let newHeight = min(max(height, ResourceLimits.canvasMin), ResourceLimits.canvasMax)
+        if canvasWidth != newWidth || canvasHeight != newHeight {
+            importedClarityEdits.removeAll()
+            importedClarityApprovals.removeAll()
+        }
+        canvasWidth = newWidth
+        canvasHeight = newHeight
         hasChanges = true
         validate()
         regeneratePreview()
@@ -589,8 +767,13 @@ public final class FrameEditorViewModel: ObservableObject {
     }
 
     public func setPlacement(kind: PlacementKind, isBackground: Bool) {
+        if !isBackground && foregroundPlacement != kind {
+            importedClarityEdits.removeAll()
+            importedClarityApprovals.removeAll()
+        }
         if isBackground { backgroundPlacement = kind } else { foregroundPlacement = kind }
         hasChanges = true
+        validate()
         regeneratePreview()
     }
 
@@ -601,21 +784,29 @@ public final class FrameEditorViewModel: ObservableObject {
         defer { if accessing { url.stopAccessingSecurityScopedResource() } }
         do {
             let data = try Data(contentsOf: url)
-            let mediaType = try AssetStore.validatedFrameImage(data).mediaType
+            let image = try AssetStore.validatedFrameImport(data)
+            let mediaType = image.mediaType
             // Dùng 1 ownerKey duy nhất cho phiên editor — save() sẽ moveReferences về revision thật.
             let ownerKey = editorStagingOwnerKey
             let asset = try env.assets.store(data: data, mediaType: mediaType,
                                              purpose: role.rawValue, ownerType: "frame_revision", ownerID: ownerKey)
             if role == .frameForeground {
+                if foregroundAssetID != asset.id {
+                    importedClarityEdits.removeAll()
+                    importedClarityApprovals.removeAll()
+                }
                 foregroundAssetID = asset.id
+                foregroundImageOrientation = image.orientation
                 // JPG foreground không alpha sẽ che toàn bộ → cảnh báo (§7.2)
                 if mediaType == "image/jpeg" {
                     env.showToast("Ảnh foreground không có vùng trong suốt — sẽ che toàn bộ ảnh", kind: .warning)
                 }
             } else {
                 backgroundAssetID = asset.id
+                backgroundImageOrientation = image.orientation
             }
             hasChanges = true
+            validate()
             regeneratePreview()
         } catch {
             env.showToast("Nhập lớp lỗi: \((error as? AppError)?.message ?? "")", kind: .warning)
@@ -625,101 +816,98 @@ public final class FrameEditorViewModel: ObservableObject {
     // MARK: - Validator (§7.5)
 
     public func validate() {
-        var issues = FrameValidator.validate(
+        let issues = FrameValidator.validate(
             canvasWidth: canvasWidth, canvasHeight: canvasHeight,
             slots: slots,
             hasBackground: backgroundAssetID != nil,
             hasForeground: foregroundAssetID != nil,
             backgroundColorHex: backgroundColorHex)
 
-        // Cảnh báo và chặn lưu nếu lớp phủ kín che toàn bộ vùng ảnh của ô (DEV-P1-01, P1-03)
-        if let fgID = foregroundAssetID {
-            let isOpaque: Bool = {
-                if let data = try? env.assets.loadData(assetID: fgID) {
-                    return !FramesViewModel.hasAlphaChannel(data: data)
-                }
-                return false
-            }()
-            if isOpaque {
-                issues.append(ValidationIssue(
-                    code: "F-VAL-09",
-                    slotID: nil,
-                    message: "Lớp phủ kín (không có vùng trong suốt) sẽ che toàn bộ vùng ảnh của các ô — hãy đổi vai trò sang Lớp nền hoặc chọn ảnh có alpha"
-                ))
+        validationTask?.cancel()
+        validationGeneration += 1
+        let generation = validationGeneration
+        validationIssues = issues
+        isValidating = false
+        guard issues.isEmpty, backgroundAssetID != nil || foregroundAssetID != nil else { return }
+        var draft = FrameRevision(frameID: frame?.id ?? "", revisionNo: 1,
+            canvasWidth: canvasWidth, canvasHeight: canvasHeight, backgroundAssetID: backgroundAssetID,
+            foregroundAssetID: foregroundAssetID, backgroundColorHex: backgroundColorHex,
+            backgroundPlacement: backgroundPlacement, foregroundPlacement: foregroundPlacement)
+        draft.backgroundImageOrientation = backgroundImageOrientation
+        draft.foregroundImageOrientation = foregroundImageOrientation
+        let validationDraft = draft
+        let repository = env.frames
+        let slots = slots
+        isValidating = true
+        validationTask = Task { [weak self] in
+            let worker = Task.detached(priority: .userInitiated) { try repository.configuredIssues(draft: validationDraft, slots: slots) }
+            do {
+                let result = try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
+                guard let self, !Task.isCancelled, validationGeneration == generation else { return }
+                validationIssues = result
+                isValidating = false
+            } catch {
+                guard let self, !Task.isCancelled, validationGeneration == generation else { return }
+                validationIssues = [ValidationIssue(code: "F-VAL-09", slotID: nil,
+                    message: (error as? AppError)?.message ?? error.localizedDescription)]
+                isValidating = false
             }
         }
-        validationIssues = issues
+    }
+
+    private var needsConfigurationSave: Bool {
+        imported == nil && frame?.lifecycle == .active && frame?.validationStatus != .ready && originalRevisionID != nil
     }
 
     public var canSave: Bool {
-        hasAnyChanges && validationIssues.isEmpty && !slots.isEmpty && slots.count <= 12
+        !isSaving && !isValidating && (hasAnyChanges || needsConfigurationSave) && validationIssues.isEmpty && !slots.isEmpty && slots.count <= 12
     }
 
     // MARK: - Save (§6.5 revision mới, không sửa revision cũ, FRM-01)
 
-    public func save() -> Bool {
-        guard canSave, let frame else { return false }
-        guard slots.count >= 1 && slots.count <= 12 else { return false }
-        let indices = slots.map(\.captureIndex)
-        guard Set(indices).count == slots.count, Set(indices) == Set(1...slots.count) else { return false }
-        let trimmedName = draftName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedName.isEmpty else {
-            env.showToast("Tên khung không được để trống", kind: .warning)
-            return false
-        }
-        if !hasChanges && hasNameChange {
-            do {
-                try env.frames.renameFrame(id: frame.id, to: trimmedName)
-                originalName = trimmedName
-                EventBus.shared.post(.frameLibraryChanged(frameID: frame.id))
-                env.showToast("Đã đổi tên khung")
-                return true
-            } catch {
-                env.showToast("Đổi tên thất bại: \((error as? AppError)?.message ?? "")", kind: .warning)
-                return false
-            }
-        }
+    public func save() async -> Bool {
+        guard canSave, let frame, let expectedRevisionID = originalRevisionID else { return false }
+        let name = draftName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return false }
+        let repository = env.frames
+        let frameID = frame.id
+        let owner = editorStagingOwnerKey
+        let slots = slots
+        let explicit = explicitWhiteSelected || sourceHadExplicitWhite
+        var draft = FrameRevision(frameID: frameID, revisionNo: 1,
+            canvasWidth: canvasWidth, canvasHeight: canvasHeight, backgroundAssetID: backgroundAssetID,
+            foregroundAssetID: foregroundAssetID, backgroundColorHex: backgroundColorHex,
+            backgroundPlacement: backgroundPlacement, foregroundPlacement: foregroundPlacement,
+            geometryVersion: CompositeRenderer.geometryVersion)
+        draft.backgroundImageOrientation = backgroundImageOrientation
+        draft.foregroundImageOrientation = foregroundImageOrientation
+        let renameOnly = !hasChanges && hasNameChange && !needsConfigurationSave
+        isSaving = true
+        env.frameEditorIsSaving = true
+        defer { isSaving = false; env.frameEditorIsSaving = false }
         do {
-            if hasNameChange && trimmedName != frame.name {
-                try env.frames.renameFrame(id: frame.id, to: trimmedName)
-                originalName = trimmedName
+            let committed = try await Task.detached(priority: .userInitiated) { [draft] () throws -> FrameRevision? in
+                if renameOnly { try repository.renameFrame(id: frameID, to: name, expectedRevisionID: expectedRevisionID); return nil }
+                return try repository.saveConfiguredRevision(frameID: frameID, expectedRevisionID: expectedRevisionID,
+                    name: name, draft: draft, slots: slots, stagedOwnerID: owner, explicitWhite: explicit)
+            }.value
+            if let committed {
+                originalRevisionID = committed.id
+                self.frame?.currentRevisionID = committed.id
+                self.frame?.validationStatus = .ready
             }
-            var rev = FrameRevision(frameID: frame.id, revisionNo: 1,
-                                    canvasWidth: canvasWidth, canvasHeight: canvasHeight,
-                                    backgroundAssetID: backgroundAssetID,
-                                    foregroundAssetID: foregroundAssetID,
-                                    backgroundColorHex: backgroundColorHex,
-                                    backgroundPlacement: backgroundPlacement,
-                                    foregroundPlacement: foregroundPlacement)
-            _ = rev.revisionNo
-            rev.geometryVersion = CompositeRenderer.geometryVersion
-            let committed = try env.frames.commitRevision(frameID: frame.id, draft: rev, slots: slots)
-            try env.frames.setValidationStatus(frameID: frame.id, status: .ready)
-            // §6.5: chuyển owner references từ staging key sang revision thật để asset không bị orphan.
-            try env.assets.moveReferences(ownerType: "frame_revision",
-                                          fromOwnerID: editorStagingOwnerKey,
-                                          toOwnerID: committed.id)
-            if let bg = rev.backgroundAssetID {
-                try? env.assets.addReference(assetID: bg, ownerType: "frame_revision", ownerID: committed.id, purpose: "background")
-            }
-            if let fg = rev.foregroundAssetID {
-                try? env.assets.addReference(assetID: fg, ownerType: "frame_revision", ownerID: committed.id, purpose: "foreground")
-            }
-            // D2-A09: Ghi dấu hiệu chọn nền rõ ràng nếu người dùng chọn màu hoặc kế thừa từ revision nguồn
-            let isWhite = backgroundColorHex.trimmingCharacters(in: CharacterSet(charactersIn: "#")).uppercased().hasPrefix("FFFFFF")
-            if isWhite && (explicitWhiteSelected || sourceHadExplicitWhite) {
-                try? env.db.run("INSERT OR REPLACE INTO app_state(key, value) VALUES(?, '1')", [.text("explicit_white_\(committed.id)")])
-            }
-            // Phiên editor tiếp theo (nếu user tiếp tục chỉnh và save lại) dùng key mới.
+            self.frame?.name = name
+            originalName = name
             editorStagingOwnerKey = "editor-\(IDFactory.new())"
-            sourceHadExplicitWhite = isWhite && (explicitWhiteSelected || sourceHadExplicitWhite)
+            let white = backgroundColorHex.trimmingCharacters(in: CharacterSet(charactersIn: "#")).uppercased()
+            sourceHadExplicitWhite = (white == "FFFFFF" || white == "FFFFFFFF") && explicit
             explicitWhiteSelected = false
             hasChanges = false
-            EventBus.shared.post(.frameLibraryChanged(frameID: frame.id))
+            EventBus.shared.post(.frameLibraryChanged(frameID: frameID))
             env.showToast("Đã lưu khung")
             return true
         } catch {
-            env.showToast("Lưu thất bại: \((error as? AppError)?.message ?? "")", kind: .warning)
+            env.showToast("Lưu thất bại: \((error as? AppError)?.message ?? error.localizedDescription)", kind: .warning)
             return false
         }
     }
@@ -736,8 +924,8 @@ public final class FrameEditorViewModel: ObservableObject {
         }
         let snap = FrameSnapshot(sourceFrameID: frame?.id, sourceFrameRevisionID: originalRevisionID,
                                  canvasWidth: canvasWidth, canvasHeight: canvasHeight,
-                                 background: backgroundAssetID.map { SnapshotLayer(assetID: $0, placement: backgroundPlacement) },
-                                 foreground: foregroundAssetID.map { SnapshotLayer(assetID: $0, placement: foregroundPlacement) },
+                                 background: backgroundAssetID.map { SnapshotLayer(assetID: $0, placement: backgroundPlacement, imageOrientation: backgroundImageOrientation) },
+                                 foreground: foregroundAssetID.map { SnapshotLayer(assetID: $0, placement: foregroundPlacement, imageOrientation: foregroundImageOrientation) },
                                  backgroundColorHex: backgroundColorHex,
                                  slots: slots.map { SnapshotSlot(from: $0) },
                                  snapshotHash: "editor-preview")

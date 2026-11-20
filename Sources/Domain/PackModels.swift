@@ -47,6 +47,8 @@ public struct PackSlot: Codable, Equatable {
 public struct PackFrameAssets: Codable, Equatable {
     public var background: String?   // "sha256:<hex>" hoặc null
     public var foreground: String?
+    public var backgroundImageOrientation: Int? = nil
+    public var foregroundImageOrientation: Int? = nil
 }
 
 public struct PackFileEntry: Codable, Equatable {

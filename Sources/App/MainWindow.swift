@@ -17,6 +17,14 @@ public struct MainWindow: View {
             case .frameEditor:
                 FrameEditorView(env: env)
                     .transition(.opacity)
+            case .chooseFrame(let sessionID, let source):
+                CaptureFrameChooser(env: env, sessionID: sessionID,
+                                    onClose: {
+                    if env.engine.session?.id == sessionID { env.engine.keepSessionAndExit() }
+                    env.route = .library
+                },
+                                    onApplied: { env.finishFrameChoice(sessionID: sessionID, source: source) })
+                    .id(sessionID)
             case .review(let sessionID):
                 ReviewView(env: env, sessionID: sessionID)
                     .transition(.opacity)
@@ -67,8 +75,8 @@ public struct MainWindow: View {
             titleVisibility: .visible
         ) {
             Button("Lưu") {
-                if env.frameEditorSaveHandler?() == true {
-                    env.confirmLeaveFrameEditor()
+                Task {
+                    if await env.frameEditorSaveHandler?() == true { env.confirmLeaveFrameEditor() }
                 }
             }
             Button("Bỏ thay đổi", role: .destructive) {

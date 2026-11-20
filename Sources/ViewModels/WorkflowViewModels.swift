@@ -10,7 +10,11 @@ public final class ExportViewModel: ObservableObject {
     @Published public var quality: Int = 95
     @Published public var width: Int = 1200
     @Published public var height: Int = 1800
-    @Published public var aspectLocked = true
+    @Published public var aspectLocked = true {
+        didSet {
+            if aspectLocked && !oldValue { setWidth(width) }
+        }
+    }
     @Published public var filename: String = ""
     @Published public var folderURL: URL?
     @Published public var replaceExisting = false
@@ -54,19 +58,41 @@ public final class ExportViewModel: ObservableObject {
     }
 
     public func setWidth(_ w: Int) {
-        width = min(max(w, ResourceLimits.canvasMin), ResourceLimits.canvasMax)
-        if aspectLocked, let detail = currentDetail() {
-            let ratio = Double(detail.snapshot.canvasHeight) / Double(detail.snapshot.canvasWidth)
-            height = min(max(Int(Double(width) * ratio), ResourceLimits.canvasMin), ResourceLimits.canvasMax)
-        }
-        updatePreview()
+        setSize(w, editingWidth: true)
     }
 
     public func setHeight(_ h: Int) {
-        height = min(max(h, ResourceLimits.canvasMin), ResourceLimits.canvasMax)
-        if aspectLocked, let detail = currentDetail() {
-            let ratio = Double(detail.snapshot.canvasWidth) / Double(detail.snapshot.canvasHeight)
-            width = min(max(Int(Double(height) * ratio), ResourceLimits.canvasMin), ResourceLimits.canvasMax)
+        setSize(h, editingWidth: false)
+    }
+
+    private func setSize(_ requested: Int, editingWidth: Bool) {
+        let lower = ResourceLimits.canvasMin, upper = ResourceLimits.canvasMax
+        if aspectLocked, let snapshot = currentDetail()?.snapshot,
+           snapshot.canvasWidth > 0, snapshot.canvasHeight > 0 {
+            let primary = Double(editingWidth ? snapshot.canvasWidth : snapshot.canvasHeight)
+            let secondary = Double(editingWidth ? snapshot.canvasHeight : snapshot.canvasWidth)
+            let ratio = secondary / primary
+            let minimum = max(lower, Int(ceil(Double(lower) / ratio)))
+            let maximum = min(upper, Int(floor(Double(upper) / ratio)))
+            if minimum <= maximum {
+                var low = minimum
+                var high = min(maximum, max(minimum, requested))
+                let maxArea = ResourceLimits.maxMegapixels * 1_000_000
+                // Find the greatest valid primary size at or below the request.
+                while low < high {
+                    let mid = (low + high + 1) / 2
+                    let paired = (Double(mid) * ratio).rounded()
+                    if Double(mid) * paired <= maxArea { low = mid }
+                    else { high = mid - 1 }
+                }
+                let paired = Int((Double(low) * ratio).rounded())
+                if editingWidth { (width, height) = (low, paired) }
+                else { (width, height) = (paired, low) }
+            }
+        } else if editingWidth {
+            width = min(max(requested, lower), upper)
+        } else {
+            height = min(max(requested, lower), upper)
         }
         updatePreview()
     }
@@ -218,6 +244,12 @@ public final class FramePackImportViewModel: ObservableObject {
     /// Verify + giải nén + SHA256 chạy nền để không block MainActor (P3).
     public func loadAndValidate(url: URL) async {
         phase = .verifying
+        packData = nil
+        packResult = nil
+        packName = ""
+        warnings = []
+        choices = [:]
+        replaceConfirmPending = nil
         fatalMessage = nil
         results = nil
         itemStatuses = nil
@@ -318,8 +350,6 @@ public final class FramePackImportViewModel: ObservableObject {
 @MainActor
 public final class FullscreenViewModel: ObservableObject {
     @Published public var step: FullscreenStep = .welcome
-    @Published public private(set) var readyFrames: [FrameCardModel] = []
-    @Published public var selectedFrameID: String?
     @Published public private(set) var idleSecondsLeft: Int?
     @Published public private(set) var isStarting = false
     @Published public private(set) var isFinishing = false
@@ -338,45 +368,12 @@ public final class FullscreenViewModel: ObservableObject {
     }
 
     public func enterFullscreen() {
-        selectedFrameID = env.settings.fullscreenDefaultFrame.isEmpty ? nil : env.settings.fullscreenDefaultFrame
-        reloadFrames()
+        captureVM.plannedCaptureCount = 4
         step = .welcome
-    }
-
-    public func reloadFrames() {
-        let list = (try? env.frames.listReadyFrames()) ?? []
-        var filtered = list
-        if env.settings.fullscreenFrameFilter != "all" {
-            filtered = filtered.filter { $0.categoryID == env.settings.fullscreenFrameFilter }
-        }
-        if !filtered.contains(where: { $0.id == selectedFrameID }) {
-            selectedFrameID = nil
-        }
-        readyFrames = filtered.map { f in
-            let slots = f.currentRevisionID.flatMap { (try? env.frames.getSlots(revisionID: $0)) ?? [] } ?? []
-            let revID = f.currentRevisionID ?? f.id
-            let thumb = env.frameThumbnails.cachedThumbnail(frameID: f.id, revisionID: revID)
-            return FrameCardModel(frame: f, thumbnail: thumb, slotCount: Set(slots.map(\.captureIndex)).count)
-        }
-        for f in filtered {
-            if let revID = f.currentRevisionID {
-                if env.frameThumbnails.cachedThumbnail(frameID: f.id, revisionID: revID) == nil {
-                    let fid = f.id
-                    Task { @MainActor [weak self] in
-                        if let data = await self?.env.frameThumbnails.requestThumbnail(frameID: fid, revisionID: revID) {
-                            if let idx = self?.readyFrames.firstIndex(where: { $0.id == fid }) {
-                                self?.readyFrames[idx].thumbnail = data
-                            }
-                        }
-                    }
-                }
-            }
-        }
     }
 
     public func beginShooting() async {
         guard !exitRequested, !isStarting, !engine.isCaptureBusy, !engine.hasPhotoToSave,
-              let selectedFrameID, readyFrames.contains(where: { $0.id == selectedFrameID }),
               captureVM.isCameraReady else { return }
         isStarting = true
         defer {
@@ -386,7 +383,6 @@ public final class FullscreenViewModel: ObservableObject {
         guard await env.capturePreview.confirmVideoFallback(), !exitRequested, !Task.isCancelled else { return }
 
         engine.keepSessionAndExit()
-        captureVM.selectFrame(selectedFrameID)
         await captureVM.startNewSession()
         guard env.showFullscreen, !Task.isCancelled else {
             if engine.isCaptureBusy { engine.pause() }
@@ -402,7 +398,12 @@ public final class FullscreenViewModel: ObservableObject {
     }
 
     public func openReview() async {
-        guard !exitRequested, reviewVM == nil, let id = engine.session?.id else { return }
+        guard !exitRequested, !engine.isCancellingSession, reviewVM == nil, let id = engine.session?.id else { return }
+        guard let session = try? env.sessions.getSession(id: id) else { return }
+        if session.awaitsFrame {
+            step = .chooseFrame
+            return
+        }
         let vm = ReviewViewModel(env: env)
         reviewVM = vm
         await vm.load(sessionID: id)
@@ -464,8 +465,14 @@ public final class FullscreenViewModel: ObservableObject {
         if step == .finish { startIdleTimer() }
     }
 
+    func returnToCaptureSetupAfterCancellation() {
+        guard step == .live else { return }
+        reviewVM = nil
+        step = .captureSetup
+    }
+
     public func exitFullscreenRequested() {
-        guard !exitRequested else { return }
+        guard !engine.isCancellingSession, !exitRequested else { return }
         exitRequested = true
         pauseIdleTimer()
         if engine.isCaptureBusy { engine.pause() }
@@ -473,7 +480,7 @@ public final class FullscreenViewModel: ObservableObject {
     }
 
     func finishExitIfReady() {
-        guard exitRequested, !engine.isCaptureBusy, !isStarting, !isFinishing else { return }
+        guard exitRequested, !engine.isCancellingSession, !engine.isCaptureBusy, !isStarting, !isFinishing else { return }
         if engine.hasPhotoToSave {
             exitRequested = false
             env.showToast("Thử lưu lại ảnh trước khi thoát toàn màn hình", kind: .warning)

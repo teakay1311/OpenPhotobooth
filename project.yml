@@ -45,6 +45,10 @@ targets:
     platform: macOS
     sources:
       - path: Tests
+        excludes: [Fixtures]
+      - path: Tests/Fixtures
+        type: folder
+        buildPhase: resources
     dependencies:
       - target: OpenPhotobooth
     settings:

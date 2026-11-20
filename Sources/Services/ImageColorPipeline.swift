@@ -7,6 +7,25 @@ import CoreGraphics
 /// OutputMirror quyết định pixel ảnh nguồn chuẩn hóa; lưu snapshot trong session defaults,
 /// không xử lý chồng nhiều lần.
 public enum ImageNormalizer {
+    /// Apply stored orientation to raw frame pixels. Capture photos use uprightImage.
+    static func orientedFrameLayer(_ image: CGImage, orientation: Int?) throws -> CIImage {
+        let raw = CIImage(cgImage: image)
+        guard let orientation, orientation != 1 else { return raw }
+        guard (2...8).contains(orientation) else { throw AppError.frameFileCorrupt }
+        let oriented = raw.oriented(forExifOrientation: Int32(orientation))
+        return oriented.transformed(by: CGAffineTransform(translationX: -oriented.extent.minX,
+                                                            y: -oriented.extent.minY))
+    }
+
+    static func orientedFramePixels(_ image: CGImage, orientation: Int?) throws -> CGImage {
+        guard let orientation, orientation != 1 else { return image }
+        let oriented = try orientedFrameLayer(image, orientation: orientation)
+        guard let pixels = CIContextHolder.shared.context.createCGImage(oriented, from: oriented.extent) else {
+            throw AppError.frameFileCorrupt
+        }
+        return pixels
+    }
+
     /// Decode ảnh upright theo EXIF orientation (ImageIO transform).
     public static func uprightImage(data: Data) -> CGImage? {
         guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }

@@ -7,6 +7,8 @@ public struct FrameEditorView: View {
     @StateObject private var vm: FrameEditorViewModel
     @State private var inspectorTab: EditorTab = .slot
     @State private var showCloseConfirm = false
+    @State private var importClarity: FrameClaritySheet.ImportInput?
+    @State private var savingImport = false
     private let imported: FrameEditorImportDraft?
     private let onImportFinished: ((Frame?) -> Void)?
 
@@ -45,6 +47,8 @@ public struct FrameEditorView: View {
             Divider()
             statusBar
         }
+        .disabled(savingImport || vm.isSaving)
+        .interactiveDismissDisabled(savingImport || vm.isSaving)
         .onAppear {
             if let imported {
                 vm.load(imported: imported)
@@ -52,10 +56,18 @@ public struct FrameEditorView: View {
             }
             vm.load(frameID: env.frameEditorDraft?.frameID)
             env.frameEditorHasChanges = vm.hasAnyChanges
-            env.frameEditorSaveHandler = { vm.save() }
+            env.frameEditorSaveHandler = { await vm.save() }
         }
         .onChange(of: vm.hasAnyChanges) { hasChanges in
             if imported == nil { env.frameEditorHasChanges = hasChanges }
+        }
+        .sheet(item: $importClarity) { input in
+            FrameClaritySheet(env: env, input: input) { submission in
+                guard let frame = await vm.saveImportedFrame(approvedPNG: submission.result.data, approvedInput: input) else { return false }
+                importClarity = nil
+                onImportFinished?(frame)
+                return true
+            }
         }
         .onDisappear {
             if imported != nil {
@@ -83,11 +95,24 @@ public struct FrameEditorView: View {
                 .frame(width: 200)
                 .help("Tên chỉ được lưu khi bấm Lưu")
             PrimaryButton(title: "Lưu", systemImage: "checkmark",
-                          disabledReason: vm.canSave ? nil : (vm.hasAnyChanges ? "Validator chưa pass" : "Chưa có thay đổi")) {
+                          disabledReason: vm.canSave ? nil : (vm.isValidating ? "Đang kiểm tra ô ảnh…" : (vm.hasAnyChanges ? "Hãy kiểm tra các vấn đề của khung" : "Chưa có thay đổi"))) {
                 if let onImportFinished {
-                    if let frame = vm.saveImportedFrame() { onImportFinished(frame) }
-                } else if vm.save() {
-                    env.closeFrameEditor()
+                    do {
+                        if let input = try vm.importedClarityInput() { importClarity = input }
+                        else {
+                            guard !savingImport else { return }
+                            savingImport = true
+                            Task {
+                                let frame = await vm.saveImportedFrame()
+                                savingImport = false
+                                if let frame { onImportFinished(frame) }
+                            }
+                        }
+                    } catch {
+                        env.showToast((error as? AppError)?.message ?? error.localizedDescription, kind: .warning)
+                    }
+                } else {
+                    Task { if await vm.save() { env.closeFrameEditor() } }
                 }
             }
             Button { vm.undo() } label: { Image(systemName: "arrow.uturn.backward") }
@@ -314,7 +339,9 @@ public struct FrameEditorView: View {
 
     private var statusBar: some View {
         HStack {
-            if vm.validationIssues.isEmpty {
+            if vm.isValidating {
+                ProgressView("Đang kiểm tra ô ảnh…").controlSize(.small)
+            } else if vm.validationIssues.isEmpty {
                 Label("Validator: hợp lệ", systemImage: "checkmark.seal.fill").foregroundStyle(.green)
             } else {
                 Menu {

@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import CoreImage
 
 /// FramePackService (§13): xuất/nhập `.photoframepack` — manifest schemaVersion 1,
 /// packFormatVersion 1; verify trước preview; không giải nén vào thư viện đang hoạt động.
@@ -114,7 +115,9 @@ public final class FramePackService: @unchecked Sendable {
                              zOrder: s.zOrder, mask: s.maskType.rawValue, cornerRadius: s.cornerRadius,
                              cropMode: s.defaultCropMode.rawValue)
                 },
-                assets: PackFrameAssets(background: bgRef, foreground: fgRef),
+                assets: PackFrameAssets(background: bgRef, foreground: fgRef,
+                    backgroundImageOrientation: rev.backgroundImageOrientation,
+                    foregroundImageOrientation: rev.foregroundImageOrientation),
                 backgroundColor: rev.backgroundColorHex,
                 backgroundPlacement: rev.backgroundPlacement.rawValue,
                 foregroundPlacement: rev.foregroundPlacement.rawValue,
@@ -165,7 +168,18 @@ public final class FramePackService: @unchecked Sendable {
         }
         var warnings: [String] = []
         // Validate slot geometry + range/finite (không tin manifest chỉ vì JSON hợp lệ §13.1)
+        var frameIDs: Set<String> = []
         for frame in manifest.frames {
+            guard !frame.frameId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  frameIDs.insert(frame.frameId).inserted else {
+                throw AppError.unsafeFramePack("ID khung bị trống hoặc trùng trong manifest")
+            }
+            for (reference, orientation) in [(frame.assets.background, frame.assets.backgroundImageOrientation),
+                                             (frame.assets.foreground, frame.assets.foregroundImageOrientation)] {
+                if let orientation, !(1...8).contains(orientation) || (orientation != 1 && reference == nil) {
+                    throw AppError.unsafeFramePack("Hướng ảnh không hợp lệ trong khung '\(frame.name)'")
+                }
+            }
             // F-VAL-02: ít nhất 1 ô ảnh — không cho khung 0 slot vào thư viện
             guard !frame.slots.isEmpty else {
                 throw AppError.unsafeFramePack("Khung '\(frame.name)' không có ô ảnh")
@@ -257,15 +271,26 @@ public final class FramePackService: @unchecked Sendable {
         for packFrame in result.manifest.frames {
             var thumbData: Data? = nil
             var assetCount = 0
-            for ref in [packFrame.assets.background, packFrame.assets.foreground].compactMap({ $0 }) {
+            for (reference, orientation) in [(packFrame.assets.background, packFrame.assets.backgroundImageOrientation),
+                                             (packFrame.assets.foreground, packFrame.assets.foregroundImageOrientation)] {
+                guard let ref = reference else { continue }
                 let sha = ref.replacingOccurrences(of: "sha256:", with: "")
                 if let data = extracted.first(where: { $0.key.contains(sha) })?.value {
-                    thumbData = data
+                    if let orientation, orientation != 1 {
+                        let image = try AssetStore.validatedFrameImage(data).image
+                        var oriented = try ImageNormalizer.orientedFrameLayer(image, orientation: orientation)
+                        let scale = min(1, 240 / max(oriented.extent.width, oriented.extent.height))
+                        oriented = oriented.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+                        thumbData = CIContextHolder.shared.context.pngRepresentation(
+                            of: oriented, format: .RGBA8, colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
+                    } else {
+                        thumbData = data
+                    }
                     assetCount += 1
                 }
             }
             let contentHash = Self.packContentHash(packFrame: packFrame)
-            let isDup = existingHashes.contains(contentHash)
+            let isDup = !contentHash.isEmpty && existingHashes.contains(contentHash)
             packEntries.append(PackEntry(frame: packFrame, thumbnailData: thumbData,
                                          assetCount: assetCount, isDuplicate: isDup,
                                          existingFrameID: nil))
@@ -277,6 +302,13 @@ public final class FramePackService: @unchecked Sendable {
 
     private func verifiedAssets(data: Data, manifest: PackManifest) throws -> [String: Data] {
         let entries = try ZipArchive.read(data: data)
+        let orientedSHAs = Set(manifest.frames.flatMap { frame in
+            [(frame.assets.background, frame.assets.backgroundImageOrientation),
+             (frame.assets.foreground, frame.assets.foregroundImageOrientation)].compactMap { reference, orientation in
+                guard let orientation, orientation != 1 else { return nil as String? }
+                return reference?.replacingOccurrences(of: "sha256:", with: "")
+            }
+        })
         var extracted: [String: Data] = [:]
         var totalUncompressed = 0
         for entry in entries {
@@ -293,35 +325,65 @@ public final class FramePackService: @unchecked Sendable {
                 guard actual == declared.sha256, declared.size == d.count else {
                     throw AppError.unsafeFramePack("Checksum không khớp: \(entry.name)")
                 }
-                _ = try AssetStore.validatedFrameImage(d)
+                let image = try AssetStore.validatedFrameImage(d)
+                if orientedSHAs.contains(actual), image.mediaType != "image/jpeg" {
+                    throw AppError.unsafeFramePack("Hướng EXIF chỉ áp dụng cho lớp JPEG")
+                }
             }
             extracted[entry.name] = d
         }
         return extracted
     }
 
-    static func packContentHash(packFrame: PackFrame) -> String {
-        var material = "\(packFrame.canvas.width)x\(packFrame.canvas.height)|\(packFrame.backgroundColor ?? "#FFFFFFFF")"
-        material += "|\(packFrame.assets.background ?? "-")|\(packFrame.assets.foreground ?? "-")"
-        for s in packFrame.slots.sorted(by: { $0.zOrder < $1.zOrder }) {
-            material += "|\(s.captureIndex),\(s.x),\(s.y),\(s.width),\(s.height),\(s.rotationDegrees ?? 0),\(s.zOrder),\(s.mask ?? "rectangle")"
+    static func packContentHash(packFrame f: PackFrame) -> String {
+        struct Layer: Encodable { let sha: String; let placement: String; let orientation: Int? }
+        struct Slot: Encodable {
+            let index: Int; let geometry: [Double]; let mask: String; let crop: String
         }
-        return Hashing.sha256Hex(Data(material.utf8))
+        struct Content: Encodable {
+            let width: Int; let height: Int; let color: [Double]; let explicitWhite: Bool
+            let background: Layer?; let foreground: Layer?; let slots: [Slot]
+        }
+        func layer(_ ref: String?, _ placement: String?, _ fallback: PlacementKind, _ orientation: Int?) -> Layer? {
+            ref.map { Layer(sha: $0.hasPrefix("sha256:") ? String($0.dropFirst(7)).lowercased() : $0.lowercased(),
+                            placement: (PlacementKind(rawValue: placement ?? "") ?? fallback).rawValue,
+                            orientation: orientation == 1 ? nil : orientation) }
+        }
+        let color = ColorHex.toCGColor(f.backgroundColor ?? "#FFFFFFFF")
+            .converted(to: CGColorSpaceCreateDeviceRGB(), intent: .defaultIntent, options: nil)?.components ?? [1,1,1,1]
+        let slots = f.slots.enumerated().sorted {
+            ($0.element.zOrder, $0.offset) < ($1.element.zOrder, $1.offset)
+        }.map { _, s in
+            Slot(index: s.captureIndex,
+                 geometry: [s.x,s.y,s.width,s.height,s.rotationDegrees ?? 0,s.cornerRadius ?? 0].map { $0 == 0 ? 0 : $0 },
+                 mask: (MaskType(rawValue: s.mask ?? "") ?? .rectangle).rawValue,
+                 crop: (CropMode(rawValue: s.cropMode ?? "") ?? .autoFace).rawValue)
+        }
+        let content = Content(width: f.canvas.width, height: f.canvas.height,
+            color: color.map(Double.init), explicitWhite: f.explicitWhite ?? false,
+            background: layer(f.assets.background, f.backgroundPlacement, .aspectFill, f.assets.backgroundImageOrientation),
+            foreground: layer(f.assets.foreground, f.foregroundPlacement, .aspectFit, f.assets.foregroundImageOrientation), slots: slots)
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(content) else { return "" }
+        return Hashing.sha256Hex(data)
     }
 
     func createContentHash(frameID: String) throws -> String? {
-        guard let frame = try frames.getFrame(id: frameID),
-              let revID = frame.currentRevisionID,
+        guard let frame = try frames.getFrame(id: frameID), let revID = frame.currentRevisionID,
               let rev = try frames.getRevision(id: revID) else { return nil }
         let slots = try frames.getSlots(revisionID: revID)
-        let bg = rev.backgroundAssetID.flatMap { assets.assetInfo(assetID: $0)?.sha256 } ?? "-"
-        let fg = rev.foregroundAssetID.flatMap { assets.assetInfo(assetID: $0)?.sha256 } ?? "-"
-        var material = "\(rev.canvasWidth)x\(rev.canvasHeight)|\(rev.backgroundColorHex)"
-        material += "|\(bg)|\(fg)"
-        for s in slots.sorted(by: { $0.zOrder < $1.zOrder }) {
-            material += "|\(s.captureIndex),\(s.x),\(s.y),\(s.width),\(s.height),\(s.rotationDegrees),\(s.zOrder),\(s.maskType.rawValue)"
-        }
-        return Hashing.sha256Hex(Data(material.utf8))
+        let explicit = try db.query("SELECT value FROM app_state WHERE key=?", [.text("explicit_white_\(revID)")]).first?["value"].stringValue
+        return Self.packContentHash(packFrame: PackFrame(frameId: frameID, name: frame.name, category: nil,
+            canvas: PackCanvas(width: rev.canvasWidth, height: rev.canvasHeight),
+            slots: slots.map { PackSlot(id: $0.id, captureIndex: $0.captureIndex, x: $0.x, y: $0.y,
+                width: $0.width, height: $0.height, rotationDegrees: $0.rotationDegrees, zOrder: $0.zOrder,
+                mask: $0.maskType.rawValue, cornerRadius: $0.cornerRadius, cropMode: $0.defaultCropMode.rawValue) },
+            assets: PackFrameAssets(background: rev.backgroundAssetID.flatMap { assets.assetInfo(assetID: $0)?.sha256 },
+                                    foreground: rev.foregroundAssetID.flatMap { assets.assetInfo(assetID: $0)?.sha256 },
+                                    backgroundImageOrientation: rev.backgroundImageOrientation,
+                                    foregroundImageOrientation: rev.foregroundImageOrientation),
+            backgroundColor: rev.backgroundColorHex, backgroundPlacement: rev.backgroundPlacement.rawValue,
+            foregroundPlacement: rev.foregroundPlacement.rawValue, explicitWhite: explicit == "1" || explicit == "true"))
     }
 
     // MARK: - Import (§13.2, PACK-01..05)
@@ -396,6 +458,11 @@ public final class FramePackService: @unchecked Sendable {
         guard validated.manifest == result.manifest else {
             throw AppError.unsafeFramePack("Gói khung đã thay đổi sau khi xem trước")
         }
+        let framesByID = Dictionary(uniqueKeysWithValues: validated.manifest.frames.map { ($0.frameId, $0) })
+        var choiceIDs: Set<String> = []
+        guard choices.allSatisfy({ framesByID[$0.packFrameID] != nil && choiceIDs.insert($0.packFrameID).inserted }) else {
+            throw AppError.unsafeFramePack("Lựa chọn chứa ID khung trùng hoặc không có trong manifest")
+        }
         let extracted = try verifiedAssets(data: data, manifest: validated.manifest)
         var statuses: [String: PackItemStatus] = [:]
         let existingNames = try frames.listFrames().map(\.name)
@@ -404,7 +471,7 @@ public final class FramePackService: @unchecked Sendable {
                 statuses[choice.packFrameID] = .unselected
                 continue
             }
-            guard let packFrame = result.manifest.frames.first(where: { $0.frameId == choice.packFrameID }) else {
+            guard let packFrame = framesByID[choice.packFrameID] else {
                 statuses[choice.packFrameID] = .failedBeforeWrite("Không tìm thấy khung trong manifest")
                 continue
             }
@@ -444,110 +511,61 @@ public final class FramePackService: @unchecked Sendable {
     private func importFrame(packFrame: PackFrame, extracted: [String: Data],
                              forceNewID: Bool, existingNames: [String],
                              onEnteredWriteZone: () -> Void) throws -> String {
-        let ownerKey = "pack-\(packFrame.frameId)-\(forceNewID ? "copy" : "replace")-\(IDFactory.new())"
-        onEnteredWriteZone()
-        do {
-            // Tải asset
-            var bgAsset: AssetStore.StoredAsset?
-            var fgAsset: AssetStore.StoredAsset?
-            if let bgRef = packFrame.assets.background {
-                let sha = bgRef.replacingOccurrences(of: "sha256:", with: "")
-                if let data = extracted.first(where: { $0.key.contains(sha) })?.value {
-                    let isJpeg = data.count >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF
-                    let mediaType = isJpeg ? "image/jpeg" : "image/png"
-                    bgAsset = try assets.store(data: data, mediaType: mediaType, purpose: AssetKind.frameBackground.rawValue,
-                                               ownerType: "frame_revision", ownerID: ownerKey)
-                }
-            }
-            if let fgRef = packFrame.assets.foreground {
-                let sha = fgRef.replacingOccurrences(of: "sha256:", with: "")
-                if let data = extracted.first(where: { $0.key.contains(sha) })?.value {
-                    let isJpeg = data.count >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF
-                    let mediaType = isJpeg ? "image/jpeg" : "image/png"
-                    fgAsset = try assets.store(data: data, mediaType: mediaType, purpose: AssetKind.frameForeground.rawValue,
-                                               ownerType: "frame_revision", ownerID: ownerKey)
-                }
-            }
-            // Category display name → tạo nếu chưa có (không fail cả pack nếu category lỗi)
-            var categoryID: String? = nil
-            if let catName = packFrame.category, !catName.isEmpty {
-                categoryID = try? frames.createCategory(name: catName).id
-                if categoryID == nil, let all = try? frames.listCategories() {
-                    categoryID = all.first { $0.name.lowercased() == catName.lowercased() }?.id
-                }
-            }
-
-            if !forceNewID, let existing = try frames.listFrames().first(where: {
-                $0.name.lowercased() == packFrame.name.lowercased()
-            }), let _ = existing.currentRevisionID {
-                // Thay thế: tạo revision mới trên frame được chọn (PACK-05), session cũ giữ snapshot
-                var rev = FrameRevision(frameID: existing.id, revisionNo: 1,
-                                        canvasWidth: packFrame.canvas.width, canvasHeight: packFrame.canvas.height,
-                                        backgroundAssetID: bgAsset?.id, foregroundAssetID: fgAsset?.id,
-                                        backgroundColorHex: packFrame.backgroundColor ?? "#FFFFFFFF",
-                                        backgroundPlacement: PlacementKind(rawValue: packFrame.backgroundPlacement ?? "") ?? .aspectFill,
-                                        foregroundPlacement: PlacementKind(rawValue: packFrame.foregroundPlacement ?? "") ?? .aspectFit)
-                _ = rev.revisionNo
-                let slots = packFrame.slots.map { s in
-                    FrameSlot(id: IDFactory.new(), frameRevisionID: rev.id,
-                              captureIndex: s.captureIndex, x: s.x, y: s.y, width: s.width, height: s.height,
-                              rotationDegrees: s.rotationDegrees ?? 0, zOrder: s.zOrder,
-                              maskType: MaskType(rawValue: s.mask ?? "") ?? .rectangle,
-                              cornerRadius: s.cornerRadius ?? 0,
-                              defaultCropMode: CropMode(rawValue: s.cropMode ?? "") ?? .autoFace)
-                }
-                let committed = try frames.commitRevision(frameID: existing.id, draft: rev, slots: slots)
-                // Trạng thái theo validator thật (F-VAL) — không set .ready mù (§7.5)
-                let issues = FrameValidator.validate(canvasWidth: rev.canvasWidth, canvasHeight: rev.canvasHeight,
-                                                     slots: slots, hasBackground: bgAsset != nil,
-                                                     hasForeground: fgAsset != nil,
-                                                     backgroundColorHex: rev.backgroundColorHex)
-                try frames.setValidationStatus(frameID: existing.id, status: issues.isEmpty ? .ready : .invalid)
-                // Chuyển owner references từ key tạm sang revision thật (tránh orphan).
-                try assets.moveReferences(ownerType: "frame_revision", fromOwnerID: ownerKey, toOwnerID: committed.id)
-                if packFrame.explicitWhite == true {
-                    try? db.run("INSERT OR REPLACE INTO app_state(key, value) VALUES(?, '1')", [.text("explicit_white_\(committed.id)")])
-                }
-                if let cid = categoryID { try frames.setCategory(frameID: existing.id, categoryID: cid) }
-                return existing.id
-            }
-
-            // Bản sao: frame mới + ID mới (PACK-04)
-            let name = FrameRepository.uniqueName(base: packFrame.name, existing: existingNames)
-            let newFrame = try frames.createEmptyFrame(name: name, categoryID: categoryID,
-                                                       canvasWidth: packFrame.canvas.width,
-                                                       canvasHeight: packFrame.canvas.height)
-            var rev = FrameRevision(frameID: newFrame.id, revisionNo: 1,
-                                    canvasWidth: packFrame.canvas.width, canvasHeight: packFrame.canvas.height,
-                                    backgroundAssetID: bgAsset?.id, foregroundAssetID: fgAsset?.id,
-                                    backgroundColorHex: packFrame.backgroundColor ?? "#FFFFFFFF",
-                                    backgroundPlacement: PlacementKind(rawValue: packFrame.backgroundPlacement ?? "") ?? .aspectFill,
-                                    foregroundPlacement: PlacementKind(rawValue: packFrame.foregroundPlacement ?? "") ?? .aspectFit)
-            _ = rev.revisionNo
-            let slots = packFrame.slots.map { s in
-                FrameSlot(id: IDFactory.new(), frameRevisionID: rev.id,
-                          captureIndex: s.captureIndex, x: s.x, y: s.y, width: s.width, height: s.height,
-                          rotationDegrees: s.rotationDegrees ?? 0, zOrder: s.zOrder,
-                          maskType: MaskType(rawValue: s.mask ?? "") ?? .rectangle,
-                          cornerRadius: s.cornerRadius ?? 0,
-                          defaultCropMode: CropMode(rawValue: s.cropMode ?? "") ?? .autoFace)
-            }
-            let committed = try frames.commitRevision(frameID: newFrame.id, draft: rev, slots: slots)
-            // Trạng thái theo validator thật (F-VAL) — không set .ready mù (§7.5)
-            let issues = FrameValidator.validate(canvasWidth: rev.canvasWidth, canvasHeight: rev.canvasHeight,
-                                                 slots: slots, hasBackground: bgAsset != nil,
-                                                 hasForeground: fgAsset != nil,
-                                                 backgroundColorHex: rev.backgroundColorHex)
-            try frames.setValidationStatus(frameID: newFrame.id, status: issues.isEmpty ? .ready : .invalid)
-            // Chuyển owner references từ key tạm sang revision thật
-            try assets.moveReferences(ownerType: "frame_revision", fromOwnerID: ownerKey, toOwnerID: committed.id)
-            if packFrame.explicitWhite == true {
-                try? db.run("INSERT OR REPLACE INTO app_state(key, value) VALUES(?, '1')", [.text("explicit_white_\(committed.id)")])
-            }
-            return newFrame.id
-        } catch {
-            try? assets.removeReferences(ownerType: "frame_revision", ownerID: ownerKey)
-            throw error
+        func bytes(_ reference: String?) throws -> Data? {
+            guard let reference else { return nil }
+            let sha = reference.replacingOccurrences(of: "sha256:", with: "")
+            guard let data = extracted.first(where: {
+                ($0.key as NSString).lastPathComponent.split(separator: ".").first.map(String.init) == sha
+            })?.value else { throw AppError.missingFrameAssets }
+            return data
         }
+        let background = try bytes(packFrame.assets.background)
+        let foreground = try bytes(packFrame.assets.foreground)
+        var draft = FrameRevision(frameID: "", revisionNo: 1,
+            canvasWidth: packFrame.canvas.width, canvasHeight: packFrame.canvas.height,
+            backgroundAssetID: packFrame.assets.background, foregroundAssetID: packFrame.assets.foreground,
+            backgroundColorHex: packFrame.backgroundColor ?? "#FFFFFFFF",
+            backgroundPlacement: PlacementKind(rawValue: packFrame.backgroundPlacement ?? "") ?? .aspectFill,
+            foregroundPlacement: PlacementKind(rawValue: packFrame.foregroundPlacement ?? "") ?? .aspectFit)
+        let slots = packFrame.slots.enumerated().sorted {
+            ($0.element.zOrder, $0.offset) < ($1.element.zOrder, $1.offset)
+        }.map { _, s in
+            FrameSlot(captureIndex: s.captureIndex, x: s.x, y: s.y, width: s.width, height: s.height,
+                rotationDegrees: s.rotationDegrees ?? 0, zOrder: s.zOrder,
+                maskType: MaskType(rawValue: s.mask ?? "") ?? .rectangle, cornerRadius: s.cornerRadius ?? 0,
+                defaultCropMode: CropMode(rawValue: s.cropMode ?? "") ?? .autoFace)
+        }
+        draft.backgroundImageOrientation = packFrame.assets.backgroundImageOrientation
+        draft.foregroundImageOrientation = packFrame.assets.foregroundImageOrientation
+        let overlay = try foreground.map {
+            try ImageNormalizer.orientedFramePixels(AssetStore.validatedFrameImage($0).image,
+                                                   orientation: draft.foregroundImageOrientation)
+        }
+        if let issue = try FrameRepository.configuredIssues(draft: draft, slots: slots, foreground: overlay).first {
+            throw AppError.invalidState(issue.message)
+        }
+        let ownerKey = "pack-\(IDFactory.new())"
+        onEnteredWriteZone()
+        defer { try? assets.removeReferences(ownerType: "frame_revision", ownerID: ownerKey) }
+        for (data, role) in [(background, AssetKind.frameBackground), (foreground, AssetKind.frameForeground)] {
+            guard let data else { continue }
+            let media = try AssetStore.validatedFrameImage(data).mediaType
+            let asset = try assets.store(data: data, mediaType: media, purpose: role.rawValue,
+                ownerType: "frame_revision", ownerID: ownerKey)
+            if role == .frameBackground { draft.backgroundAssetID = asset.id }
+            else { draft.foregroundAssetID = asset.id }
+        }
+        if !forceNewID, let existing = try frames.listFrames().first(where: {
+            $0.name.lowercased() == packFrame.name.lowercased()
+        }), let revisionID = existing.currentRevisionID {
+            _ = try frames.saveConfiguredRevision(frameID: existing.id, expectedRevisionID: revisionID,
+                name: existing.name, draft: draft, slots: slots, stagedOwnerID: ownerKey,
+                explicitWhite: packFrame.explicitWhite == true, categoryName: packFrame.category)
+            return existing.id
+        }
+        let name = FrameRepository.uniqueName(base: packFrame.name, existing: try frames.listFrames().map(\.name))
+        return try frames.createConfiguredFrame(name: name, categoryID: nil, draft: draft, slots: slots,
+            stagedOwnerID: ownerKey, explicitWhite: packFrame.explicitWhite == true,
+            categoryName: packFrame.category).id
     }
 }

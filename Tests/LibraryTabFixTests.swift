@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 import SwiftUI
 import AppKit
 import CoreGraphics
@@ -114,7 +115,7 @@ final class LibraryTabFixTests: XCTestCase {
 
         // Kiểm tra bộ lọc "Tất cả"
         vm.filter = .all
-        vm.reload()
+        await vm.reload().value
         let allIDs = Set(vm.cards.map(\.id))
         XCTAssertTrue(allIDs.contains(s1))
         XCTAssertTrue(allIDs.contains(s2))
@@ -124,7 +125,7 @@ final class LibraryTabFixTests: XCTestCase {
 
         // Kiểm tra bộ lọc "Chưa đủ ảnh" (Incomplete)
         vm.filter = .incomplete
-        vm.reload()
+        await vm.reload().value
         let incompleteIDs = Set(vm.cards.map(\.id))
         XCTAssertTrue(incompleteIDs.contains(s1), "Phiên thường 1/2 phải nằm ở Chưa đủ ảnh")
         XCTAssertTrue(incompleteIDs.contains(s2), "LIB-01: Phiên 4/6 chụp thêm phải nằm ở Chưa đủ ảnh!")
@@ -134,7 +135,7 @@ final class LibraryTabFixTests: XCTestCase {
 
         // Kiểm tra bộ lọc "Đủ ảnh" (Completed)
         vm.filter = .completed
-        vm.reload()
+        await vm.reload().value
         let completedIDs = Set(vm.cards.map(\.id))
         XCTAssertFalse(completedIDs.contains(s1))
         XCTAssertFalse(completedIDs.contains(s2), "LIB-01: Phiên 4/6 KHÔNG được nằm ở Đủ ảnh!")
@@ -144,7 +145,7 @@ final class LibraryTabFixTests: XCTestCase {
 
         // Kiểm tra nhãn tiến độ và trạng thái thẻ
         vm.filter = .all
-        vm.reload()
+        await vm.reload().value
         guard let card2 = vm.cards.first(where: { $0.id == s2 }),
               let card3 = vm.cards.first(where: { $0.id == s3 }),
               let card4 = vm.cards.first(where: { $0.id == s4 }) else {
@@ -394,11 +395,11 @@ final class LibraryTabFixTests: XCTestCase {
     func testT06_SortPickerAndToolbarLayout() async throws {
         let vm = LibraryViewModel(env: env)
         vm.sortNewest = true
-        vm.reload()
+        await vm.reload().value
         XCTAssertTrue(vm.sortNewest)
 
         vm.sortNewest = false
-        vm.reload()
+        await vm.reload().value
         XCTAssertFalse(vm.sortNewest)
 
         let artifactDir = try XCTUnwrap(tempDir)
@@ -429,9 +430,15 @@ final class LibraryTabFixTests: XCTestCase {
         let sID = try await seedTestSession(slotsCount: 2, selectionCount: nil, committedShots: 1)
         let vm = LibraryViewModel(env: env)
         vm.filter = .incomplete
-        vm.startEventMonitoring()
+        await vm.startEventMonitoring().value
 
         XCTAssertEqual(vm.cards.count, 1)
+        let updated = expectation(description: "EventBus reload publishes the incomplete list")
+        let subscription = vm.$cards.dropFirst().first(where: \.isEmpty).sink { _ in updated.fulfill() }
+        defer {
+            subscription.cancel()
+            vm.stopEventMonitoring()
+        }
 
         // Chụp thêm ảnh thứ 2 để phiên hoàn thành
         let imgData = createDummyImageData()
@@ -441,20 +448,17 @@ final class LibraryTabFixTests: XCTestCase {
         EventBus.shared.post(.shotCommitted(sessionID: sID, captureIndex: 2, photoRevisionID: "rev2"))
         EventBus.shared.post(.sessionChanged(sessionID: sID, revision: 2))
 
-        // Chờ debounce 100ms
-        try await Task.sleep(nanoseconds: 200_000_000)
+        await fulfillment(of: [updated], timeout: 2)
 
         // Phiên giờ đã đủ 2/2 nên sẽ rời khỏi filter .incomplete
         XCTAssertEqual(vm.cards.count, 0, "Sau khi có event và debounce, card 2/2 đã rời bộ lọc incomplete")
-
-        vm.stopEventMonitoring()
     }
 
     // MARK: - T08: Khóa ảnh thu nhỏ theo revision và chống ghi đè ngược thứ tự (LIB-06)
     func testT08_ThumbnailRevisionLock() async throws {
         let sID = try await seedTestSession(slotsCount: 2, selectionCount: nil, committedShots: 2)
         let vm = LibraryViewModel(env: env)
-        vm.reload()
+        await vm.reload().value
 
         guard let cardModel = vm.cards.first(where: { $0.id == sID }) else {
             XCTFail("Missing card")
@@ -466,7 +470,7 @@ final class LibraryTabFixTests: XCTestCase {
         // Tạo preview cho initialRev
         let data1 = await vm.generatePreview(for: cardModel)
         XCTAssertNotNil(data1)
-        XCTAssertNotNil(env.thumbnails.cachedData(key: "session-\(sID)-\(initialRev)"))
+        XCTAssertNotNil(env.thumbnails.cachedData(key: "session-r\(CompositeRenderer.renderCacheVersion)-\(sID)-\(initialRev)"))
 
         // Bump session revision lên initialRev + 1
         _ = try env.sessions.bumpRevision(sessionID: sID)
@@ -476,7 +480,7 @@ final class LibraryTabFixTests: XCTestCase {
         // Thử render lại với model mang revision cũ: phải bị từ chối do lệch revision!
         let dataStale = await vm.generatePreview(for: cardModel)
         // Cache của newRev không bị ảnh hưởng bởi render cũ
-        XCTAssertNil(env.thumbnails.cachedData(key: "session-\(sID)-\(newRev)"))
+        XCTAssertNil(env.thumbnails.cachedData(key: "session-r\(CompositeRenderer.renderCacheVersion)-\(sID)-\(newRev)"))
         _ = dataStale
     }
 
@@ -486,7 +490,7 @@ final class LibraryTabFixTests: XCTestCase {
         let sID = try await seedTestSession(slotsCount: 4, selectionCount: 6, committedShots: 6, selectedOrder: nil)
 
         let vm = LibraryViewModel(env: env)
-        vm.reload()
+        await vm.reload().value
 
         let card = vm.cards.first(where: { $0.id == sID })
         XCTAssertNotNil(card)

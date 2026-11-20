@@ -53,11 +53,35 @@ public final class CaptureEngine: ObservableObject {
     }
     public private(set) var lastShotContext: ShotContext?
 
+    enum CancellationPhase: Equatable {
+        case confirming
+        case waitingForShot
+        case saveFailed(message: String, index: Int)
+        case confirmingDiscard(message: String, index: Int)
+    }
+
+    private struct Cancellation {
+        let sessionID: String
+        let snapshotID: String
+        let remainingTime: Duration?
+        let heldTimerState: State?
+        var interruption: PauseReason?
+        var savedShotKind: ShotKind?
+    }
+
+    @Published private(set) var cancellationPhase: CancellationPhase?
+    private var cancellation: Cancellation?
+    private var timerDeadline: ContinuousClock.Instant?
+    var isCancellingSession: Bool { cancellationPhase != nil }
+
+    var onSessionCancelled: ((String) -> Void)?
+    var onCancellationError: ((AppError) -> Void)?
     public var onShotCommitted: ((Int, PhotoRevision, ShotKind) -> Void)?
     public var onSessionStatusChanged: ((SessionStatus) -> Void)?
 
     private let camera: CameraServing
     private let safetySave: SafetySaveService
+    private let trashService: TrashService
     private let sessions: SessionRepository
     private let audio: AudioService
     private let coordinator: OperationCoordinator
@@ -86,10 +110,11 @@ public final class CaptureEngine: ObservableObject {
     public private(set) var intervalSeconds: Int = 2
 
     public init(camera: CameraServing, safetySave: SafetySaveService,
-                sessions: SessionRepository, audio: AudioService,
+                sessions: SessionRepository, trashService: TrashService, audio: AudioService,
                 coordinator: OperationCoordinator = OperationCoordinator.shared) {
         self.camera = camera
         self.safetySave = safetySave
+        self.trashService = trashService
         self.sessions = sessions
         self.audio = audio
         self.coordinator = coordinator
@@ -115,7 +140,7 @@ public final class CaptureEngine: ObservableObject {
     // MARK: - Điều kiện/bảng hành động (§5.2)
 
     public var canStart: Bool {
-        guard session != nil, snapshot != nil else { return false }
+        guard !isCancellingSession, session != nil, snapshot != nil else { return false }
         switch state {
         case .ready, .paused: return true
         default: return false
@@ -130,6 +155,7 @@ public final class CaptureEngine: ObservableObject {
     }
 
     public var canChangeCamera: Bool {
+        guard !isCancellingSession else { return false }
         switch state {
         case .ready, .paused, .recoverableError, .idle, .reviewing: return true
         case .intermission, .countdown, .capturing, .persisting: return false // Intermission còn lượt là bận (§3.5 BUG-CAM-02)
@@ -163,10 +189,12 @@ public final class CaptureEngine: ObservableObject {
                              defaults: SessionDefaultsSnapshot,
                              countdown: Int, interval: Int,
                              frameName: String? = nil) throws -> CaptureSessionRecord {
-        guard state == .idle || state == .completed else {
+        guard !isCancellingSession, state == .idle || state == .completed else {
             throw AppError.invalidState("Đang có phiên hoạt động")
         }
-        guard snapshot.requiredCaptureCount >= 1 else { throw AppError.frameUnconfigured }
+        guard snapshot.requiredCaptureCount >= 1 || defaults.plannedCaptureCount != nil else {
+            throw AppError.frameUnconfigured
+        }
         let record = try sessions.createSession(snapshot: snapshot, mode: mode,
                                                 cameraID: cameraID, defaults: defaults,
                                                 frameNameAtCapture: frameName,
@@ -175,6 +203,7 @@ public final class CaptureEngine: ObservableObject {
         session = record
         self.snapshot = snapshot
         committedShots = [:]
+        lastShotContext = nil
         countdownSeconds = countdown
         intervalSeconds = interval
         state = .ready
@@ -182,7 +211,7 @@ public final class CaptureEngine: ObservableObject {
     }
 
     public var canAdoptSession: Bool {
-        !isCaptureBusy && !hasPhotoToSave && !isNavigationSafePointHold
+        !isCancellingSession && !isCaptureBusy && !hasPhotoToSave && !isNavigationSafePointHold
     }
 
     /// Tiếp tục phiên đã có (recovery / "Tiếp tục phiên cũ" §10.3).
@@ -198,7 +227,7 @@ public final class CaptureEngine: ObservableObject {
             lastShotContext = nil
             pendingRetakeKeepCrop = false
         }
-        updateCaptureDetail(detail)
+        updateCaptureDetail(detail, reverify: true)
         state = forReview ? .reviewing : .ready
         countdownSeconds = detail.session.countdownSeconds
         intervalSeconds = detail.session.intermissionSeconds
@@ -206,7 +235,7 @@ public final class CaptureEngine: ObservableObject {
     }
 
     public func resetToIdle() {
-        guard !hasPhotoToSave, !isCaptureBusy, !captureInFlight else { return }
+        guard !isCancellingSession, !hasPhotoToSave, !isCaptureBusy, !captureInFlight else { return }
         isNavigationSafePointHold = false
         pendingRetakeKeepCrop = false
         pauseRequested = false
@@ -239,14 +268,24 @@ public final class CaptureEngine: ObservableObject {
         }
     }
 
-    private func updateCaptureDetail(_ detail: SessionDetail) {
+    private func updateCaptureDetail(_ detail: SessionDetail, reverify: Bool = false) {
         session = detail.session
         snapshot = detail.snapshot
         let valid = detail.session.captureIndices(in: detail.snapshot)
-        committedShots = detail.currentRevisions().filter { valid.contains($0.key) }
+        let current = detail.currentRevisions().filter { valid.contains($0.key) && $0.value.state == .available }
+        if detail.session.defaults.plannedCaptureCount != nil {
+            let known = committedShots
+            committedShots = current.filter { index, revision in
+                (!reverify && known[index]?.id == revision.id && FileManager.default.fileExists(atPath: (try? sessions.fileURL(for: revision).path) ?? "")) ||
+                    (try? sessions.verifiedPhotoImage(revision)) != nil
+            }
+        } else {
+            committedShots = current
+        }
     }
 
     private func prepareCapture() throws {
+        guard !isCancellingSession else { throw AppError.busy("Đang xử lý yêu cầu hủy phiên") }
         guard let id = session?.id else { throw AppError.invalidState("Không có phiên chụp") }
         if sessionLockToken == nil {
             sessionLockToken = try coordinator.acquire(key: "session:\(id)", reason: "CaptureEngine: capturing")
@@ -366,6 +405,7 @@ public final class CaptureEngine: ObservableObject {
 
     /// Esc hủy đếm ngược — không ghi ảnh (CAP-04).
     public func cancelCountdown() {
+        guard !isCancellingSession else { return }
         switch state {
         case .countdown, .intermission:
             timerToken += 1
@@ -378,6 +418,10 @@ public final class CaptureEngine: ObservableObject {
     }
 
     public func pause(reason: PauseReason = .user) {
+        if isCancellingSession {
+            if reason != .user { cancellation?.interruption = reason }
+            return
+        }
         switch state {
         case .countdown(_, let index, let kind):
             pauseAtIndex(index, kind: kind, reason: reason)
@@ -419,7 +463,7 @@ public final class CaptureEngine: ObservableObject {
     /// "Giữ phiên và thoát" (§2.2 Paused) — session đã lưu paused trong DB, engine về idle.
     /// Phiên đã hoàn thành giữ nguyên trạng thái completed (không hạ xuống paused).
     public func keepSessionAndExit() {
-        guard !hasPhotoToSave, !isCaptureBusy else { return }
+        guard !isCancellingSession, !hasPhotoToSave, !isCaptureBusy else { return }
         if let session {
             if let current = try? sessions.getSession(id: session.id),
                current.status == .inProgress || current.status == .reviewable || current.status == .draft {
@@ -469,7 +513,7 @@ public final class CaptureEngine: ObservableObject {
 
     /// Rời RecoverableError về Ready hoặc đếm ngược lại lượt retake/additional (CAP-01).
     public func retryFromError() {
-        guard !hasPhotoToSave else { return }
+        guard !isCancellingSession, !hasPhotoToSave else { return }
         guard case .recoverableError(_, let captureIndex) = state else { return }
         releaseSessionLock()
         if let ctx = lastShotContext, ctx.kind == .retake, ctx.captureIndex == captureIndex {
@@ -493,7 +537,7 @@ public final class CaptureEngine: ObservableObject {
     }
 
     public func complete() {
-        guard !hasPhotoToSave else { return }
+        guard !isCancellingSession, !hasPhotoToSave else { return }
         if let session {
             onSessionStatusChanged?(.completed)
         }
@@ -509,9 +553,156 @@ public final class CaptureEngine: ObservableObject {
         lastShotContext = nil
     }
 
+    // MARK: - Cancel capture session
+
+    var canCancelSession: Bool {
+        guard !isCancellingSession, let session, session.status != .completed,
+              lastShotContext?.kind != .retake, lastShotContext?.kind != .additional,
+              !isNavigationSafePointHold else { return false }
+        switch state {
+        case .ready:
+            return !allShotsCommitted
+        case .countdown, .capturing, .persisting, .intermission, .paused, .recoverableError:
+            return true
+        default:
+            return false
+        }
+    }
+
+    func requestSessionCancellation() throws {
+        guard canCancelSession, let sessionID = session?.id, let snapshotID = snapshot?.id else {
+            throw AppError.invalidState("Phiên hiện tại không thể hủy")
+        }
+        try prepareCapture()
+        var heldState: State?
+        var remaining: Duration?
+        switch state {
+        case .countdown, .intermission:
+            heldState = state
+            remaining = timerDeadline.map { max(.zero, ContinuousClock.now.duration(to: $0)) }
+            holdCountdownTimer()
+        default:
+            break
+        }
+        cancellation = Cancellation(sessionID: sessionID, snapshotID: snapshotID,
+                                    remainingTime: remaining, heldTimerState: heldState,
+                                    interruption: pauseRequested ? pendingPauseReason : nil)
+        cancellationPhase = .confirming
+    }
+
+    func returnFromSessionCancellation() {
+        switch cancellationPhase {
+        case .confirmingDiscard(let message, let index):
+            cancellationPhase = .saveFailed(message: message, index: index)
+            return
+        case .confirming, .saveFailed:
+            break
+        default:
+            return
+        }
+        guard let request = cancellation else { return }
+        clearCancellation()
+
+        if captureInFlight {
+            if let reason = request.interruption { pause(reason: reason) }
+            return
+        }
+        pauseRequested = false
+        pendingPauseReason = nil
+        if let reason = request.interruption, let next = nextPendingIndex, !hasPhotoToSave {
+            if request.savedShotKind != nil || request.heldTimerState != nil || state == .ready {
+                pauseAtIndex(next, kind: .normal, reason: reason)
+                return
+            }
+        }
+        if let shotKind = request.savedShotKind {
+            continueAfterSavedShot(kind: shotKind)
+            return
+        }
+        switch request.heldTimerState {
+        case .countdown(let seconds, let index, let kind):
+            scheduleCountdown(seconds: seconds, index: index, kind: kind, duration: request.remainingTime)
+        case .intermission(let index, let seconds):
+            scheduleIntermission(nextIndex: index, duration: request.remainingTime ?? .seconds(seconds))
+        default:
+            if !hasPhotoToSave { releaseSessionLock() }
+        }
+    }
+
+    func confirmSessionCancellation() {
+        guard cancellationPhase == .confirming else { return }
+        cancellationPhase = .waitingForShot
+        finishCancellationIfReady()
+    }
+
+    func retrySaveForSessionCancellation() async {
+        guard case .saveFailed = cancellationPhase, let pendingPhoto, !captureInFlight else { return }
+        cancellationPhase = .waitingForShot
+        await performCapture(index: pendingPhoto.index, kind: pendingPhoto.kind,
+                             token: timerToken, retry: pendingPhoto)
+    }
+
+    func requestDiscardForSessionCancellation() {
+        guard case .saveFailed(let message, let index) = cancellationPhase else { return }
+        cancellationPhase = .confirmingDiscard(message: message, index: index)
+    }
+
+    func discardForSessionCancellation() {
+        guard case .confirmingDiscard = cancellationPhase, !captureInFlight else { return }
+        moveCancelledSessionToTrash(discardPending: true)
+    }
+
+    private func clearCancellation() {
+        cancellation = nil
+        cancellationPhase = nil
+    }
+
+    private func showCancellationSaveFailure(message: String? = nil) {
+        guard let pendingPhoto else { return }
+        cancellationPhase = .saveFailed(message: message ?? lastError?.message ?? "Chưa lưu được ảnh",
+                                        index: pendingPhoto.index)
+    }
+
+    private func finishCancellationIfReady() {
+        guard cancellationPhase == .waitingForShot, !captureInFlight else { return }
+        if hasPhotoToSave {
+            showCancellationSaveFailure()
+        } else {
+            moveCancelledSessionToTrash(discardPending: false)
+        }
+    }
+
+    private func moveCancelledSessionToTrash(discardPending: Bool) {
+        guard let request = cancellation, request.sessionID == session?.id,
+              request.snapshotID == snapshot?.id, let sessionLockToken else { return }
+        let pending: TrashService.PendingCapture? = discardPending ? pendingPhoto.map {
+            .init(index: $0.index, requestID: $0.requestID, sha256: Hashing.sha256Hex($0.payload.data))
+        } : nil
+        do {
+            try trashService.cancelCaptureSession(sessionID: request.sessionID, snapshotID: request.snapshotID,
+                                                  pending: pending, parentToken: sessionLockToken)
+            pendingPhoto = nil
+            lastError = nil
+            state = .ready
+            clearCancellation()
+            resetToIdle()
+            onSessionCancelled?(request.sessionID)
+        } catch {
+            let failure = (error as? AppError) ?? .ioFailure(error.localizedDescription)
+            if hasPhotoToSave {
+                showCancellationSaveFailure(message: failure.message)
+            } else {
+                clearCancellation()
+                pauseAtIndex(nextPendingIndex ?? requiredIndices.max() ?? 1, kind: .normal,
+                             reason: request.interruption ?? .user)
+                onCancellationError?(failure)
+            }
+        }
+    }
+
     // MARK: - Timer (§5.3)
 
-    private func scheduleCountdown(seconds: Int, index: Int, kind: ShotKind) {
+    private func scheduleCountdown(seconds: Int, index: Int, kind: ShotKind, duration: Duration? = nil) {
         if pauseRequested {
             let reason = pendingPauseReason ?? .user
             pauseRequested = false
@@ -531,9 +722,11 @@ public final class CaptureEngine: ObservableObject {
                                       keepCrop: pendingRetakeKeepCrop)
         timerToken += 1
         let token = timerToken
+        let deadline = ContinuousClock.now + (duration ?? .seconds(max(seconds, 0)))
+        timerDeadline = deadline
         state = .countdown(remainingSeconds: max(seconds, 1), captureIndex: index, kind: kind)
         Task { [weak self] in
-            await self?.runTimer(seconds: seconds, token: token) { remaining in
+            await self?.runTimer(until: deadline, token: token) { remaining in
                 .countdown(remainingSeconds: remaining, captureIndex: index, kind: kind)
             } tick: { remaining in
                 if remaining <= 3 { self?.audio.handle(.countdownTick(last: remaining == 1)) }
@@ -545,7 +738,7 @@ public final class CaptureEngine: ObservableObject {
         }
     }
 
-    private func scheduleIntermission(nextIndex: Int) {
+    private func scheduleIntermission(nextIndex: Int, duration: Duration? = nil) {
         if pauseRequested {
             let reason = pendingPauseReason ?? .user
             pauseRequested = false
@@ -563,9 +756,12 @@ public final class CaptureEngine: ObservableObject {
         timerToken += 1
         let token = timerToken
         let seconds = intervalSeconds
-        state = .intermission(nextIndex: nextIndex, remainingSeconds: max(seconds, 1))
+        let deadline = ContinuousClock.now + (duration ?? .seconds(max(seconds, 0)))
+        timerDeadline = deadline
+        let remaining = duration.map { max(1, Int($0.components.seconds) + ($0.components.attoseconds > 0 ? 1 : 0)) }
+        state = .intermission(nextIndex: nextIndex, remainingSeconds: remaining ?? max(seconds, 1))
         Task { [weak self] in
-            await self?.runTimer(seconds: seconds, token: token) { remaining in
+            await self?.runTimer(until: deadline, token: token) { remaining in
                 .intermission(nextIndex: nextIndex, remainingSeconds: remaining)
             } tick: { _ in
             } finish: { [weak self] in
@@ -586,12 +782,11 @@ public final class CaptureEngine: ObservableObject {
         }
     }
 
-    private func runTimer(seconds: Int, token: Int,
+    private func runTimer(until deadline: ContinuousClock.Instant, token: Int,
                           update: @escaping (Int) -> State,
                           tick: @escaping (Int) -> Void,
                           finish: @escaping () async -> Void) async {
         let clock = ContinuousClock()
-        let deadline = clock.now + .seconds(TimeInterval(max(seconds, 0)))
         while true {
             guard token == timerToken else { return }
             let now = clock.now
@@ -603,7 +798,7 @@ public final class CaptureEngine: ObservableObject {
             state = update(shown)
             tick(shown)
             do {
-                try await clock.sleep(until: clock.now + .seconds(1), tolerance: .milliseconds(40))
+                try await clock.sleep(until: min(deadline, now + .seconds(1)), tolerance: .milliseconds(40))
             } catch {
                 return
             }
@@ -615,7 +810,7 @@ public final class CaptureEngine: ObservableObject {
     // MARK: - Capture + persist barrier (I-01, I-09, §5.3)
 
     public func retryPendingSave() async {
-        guard let pendingPhoto, pendingPhoto.sessionID == session?.id,
+        guard !isCancellingSession, let pendingPhoto, pendingPhoto.sessionID == session?.id,
               case .recoverableError = state, !captureInFlight else { return }
         guard prepareCaptureOrReport() else { return }
         pauseRequested = true
@@ -625,8 +820,8 @@ public final class CaptureEngine: ObservableObject {
     }
 
     private func performCapture(index: Int, kind: ShotKind, token: Int, retry: PendingPhoto? = nil, expectedSessionID: String? = nil, expectedSnapshotID: String? = nil) async {
-        guard token == timerToken, sessionLockToken != nil,
-              !captureInFlight, !hasPhotoToSave || retry != nil else { return }
+        guard token == timerToken, sessionLockToken != nil, !captureInFlight,
+              (!isCancellingSession && !hasPhotoToSave) || retry != nil else { return }
         guard let session, let snap = snapshot else {
             state = .recoverableError(message: "Không có phiên chụp", captureIndex: index)
             return
@@ -634,7 +829,10 @@ public final class CaptureEngine: ObservableObject {
         if let expectedSessionID, session.id != expectedSessionID { return }
         if let expectedSnapshotID, snap.id != expectedSnapshotID { return }
         captureInFlight = true
-        defer { captureInFlight = false }
+        defer {
+            captureInFlight = false
+            finishCancellationIfReady()
+        }
         do {
             let photo: PendingPhoto
             if let retry {
@@ -676,6 +874,12 @@ public final class CaptureEngine: ObservableObject {
                                                parentToken: sessionLockToken)
                 }
                 pendingRetakeKeepCrop = false
+            }
+
+            if isCancellingSession {
+                cancellation?.savedShotKind = kind
+                state = .ready
+                return
             }
 
             // Safe point thoát / tạm dừng (§Bước 2 / L1): kiểm tra trước khi lên lịch lượt kế
@@ -721,27 +925,7 @@ public final class CaptureEngine: ObservableObject {
                 return
             }
 
-            let required = session.captureIndices(in: snap)
-            if required.isSubset(of: Set(committedShots.keys)) {
-                if currentStatus != .completed {
-                    try? sessions.setStatus(sessionID: session.id, status: .reviewable)
-                    onSessionStatusChanged?(.reviewable)
-                }
-                state = .reviewing
-                audio.handle(.completed)
-                releaseSessionLock()
-            } else if kind != .normal {
-                state = .reviewing
-                releaseSessionLock()
-            } else if session.captureMode == .manual {
-                state = .ready   // CAP-10: chờ người dùng bấm Chụp tiếp
-                releaseSessionLock()
-            } else if let next = nextPendingIndex {
-                scheduleIntermission(nextIndex: next)
-            } else {
-                state = .reviewing
-                releaseSessionLock()
-            }
+            continueAfterSavedShot(kind: kind)
         } catch {
             timerToken += 1
             pauseRequested = false
@@ -753,8 +937,33 @@ public final class CaptureEngine: ObservableObject {
             if kind != .retake, (try? sessions.getSession(id: session.id)?.status) != .completed {
                 try? sessions.setStatus(sessionID: session.id, status: .paused)
             }
-            if !hasPhotoToSave { releaseSessionLock() }
+            if !isCancellingSession && !hasPhotoToSave { releaseSessionLock() }
             audio.handle(.warning)
+        }
+    }
+
+    private func continueAfterSavedShot(kind: ShotKind) {
+        guard let session else { return }
+        let currentStatus = (try? sessions.getSession(id: session.id))?.status ?? session.status
+        if allShotsCommitted {
+            if currentStatus != .completed {
+                try? sessions.setStatus(sessionID: session.id, status: .reviewable)
+                onSessionStatusChanged?(.reviewable)
+            }
+            state = .reviewing
+            audio.handle(.completed)
+            releaseSessionLock()
+        } else if kind != .normal {
+            state = .reviewing
+            releaseSessionLock()
+        } else if session.captureMode == .manual {
+            state = .ready   // CAP-10: chờ người dùng bấm Chụp tiếp
+            releaseSessionLock()
+        } else if let next = nextPendingIndex {
+            scheduleIntermission(nextIndex: next)
+        } else {
+            state = .reviewing
+            releaseSessionLock()
         }
     }
 
@@ -786,6 +995,10 @@ public final class CaptureEngine: ObservableObject {
     }
 
     private func pauseForCameraInterruption() {
+        if isCancellingSession {
+            cancellation?.interruption = .cameraDisconnected
+            return
+        }
         guard !pauseRequested else { return }
         switch state {
         case .countdown, .intermission, .capturing, .persisting:

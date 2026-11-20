@@ -38,6 +38,8 @@ public struct FrameRevision: Identifiable, Equatable, Codable, Sendable {
     public var backgroundColorHex: String
     public var backgroundPlacement: PlacementKind
     public var foregroundPlacement: PlacementKind
+    public var backgroundImageOrientation: Int? = nil
+    public var foregroundImageOrientation: Int? = nil
     public var geometryVersion: Int
     public var createdAtMs: Int64
 
@@ -98,8 +100,11 @@ public struct SnapshotLayer: Codable, Equatable, Sendable {
     public var assetID: String
     public var placement: PlacementKind
 
-    public init(assetID: String, placement: PlacementKind) {
+    public var imageOrientation: Int?
+
+    public init(assetID: String, placement: PlacementKind, imageOrientation: Int? = nil) {
         self.assetID = assetID; self.placement = placement
+        self.imageOrientation = imageOrientation == 1 ? nil : imageOrientation
     }
 }
 
@@ -157,6 +162,15 @@ public struct FrameSnapshot: Equatable, Codable, Identifiable, Sendable {
         self.explicitWhite = explicitWhite
     }
 
+    static func awaitingFrame() -> FrameSnapshot {
+        var snapshot = FrameSnapshot(sourceFrameID: nil, sourceFrameRevisionID: nil,
+                                     canvasWidth: ResourceLimits.canvasMin, canvasHeight: ResourceLimits.canvasMin,
+                                     background: nil, foreground: nil, backgroundColorHex: "#FFFFFFFF",
+                                     slots: [], snapshotHash: "")
+        snapshot.snapshotHash = snapshot.hashForContent()
+        return snapshot
+    }
+
     public var requiredCaptureCount: Int {
         Set(slots.map(\.captureIndex)).count
     }
@@ -173,21 +187,29 @@ public struct FrameSnapshot: Equatable, Codable, Identifiable, Sendable {
         guard order.count == requiredCaptureCount, Set(order).count == order.count else {
             throw AppError.invalidState("Cần chọn đúng số ảnh khác nhau cho khung")
         }
-        let assignment = Dictionary(uniqueKeysWithValues: zip(requiredIndices.sorted(), order))
-        var assigned = self
+        var assigned = previewAssigningPhotos(in: order)
         assigned.id = IDFactory.new()
         assigned.createdAtMs = Time.nowMs()
-        assigned.slots = slots.map { slot in
-            var copy = slot
-            copy.captureIndex = assignment[slot.captureIndex] ?? slot.captureIndex
-            return copy
-        }
         assigned.snapshotHash = assigned.hashForContent()
         return assigned
     }
 
+    func previewAssigningPhotos(in order: [Int]) -> FrameSnapshot {
+        let assignment = Dictionary(uniqueKeysWithValues: zip(requiredIndices.sorted(), order))
+        var preview = self
+        preview.slots = slots.compactMap { slot in
+            guard let index = assignment[slot.captureIndex] else { return nil }
+            var assigned = slot
+            assigned.captureIndex = index
+            return assigned
+        }
+        return preview
+    }
+
     public func hashForContent() -> String {
         var material = "\(canvasWidth)x\(canvasHeight)|\(backgroundColorHex)|\(background?.assetID ?? "-")|\(foreground?.assetID ?? "-")|\(geometryVersion)|\(explicitWhite ?? false)"
+        if let orientation = background?.imageOrientation, orientation != 1 { material += "|bg-exif:\(orientation)" }
+        if let orientation = foreground?.imageOrientation, orientation != 1 { material += "|fg-exif:\(orientation)" }
         for s in slots.sorted(by: { $0.zOrder < $1.zOrder }) {
             material += "|\(s.captureIndex),\(s.x),\(s.y),\(s.width),\(s.height),\(s.rotationDegrees),\(s.zOrder),\(s.maskType.rawValue),\(s.cornerRadius),\(s.defaultCropMode.rawValue)"
         }

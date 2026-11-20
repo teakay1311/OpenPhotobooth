@@ -26,7 +26,7 @@ public struct FrameCardModel: Identifiable, Equatable {
     }
 }
 
-public struct SessionCardModel: Identifiable, Equatable {
+public struct SessionCardModel: Identifiable, Equatable, Sendable {
     public var id: String { card.id }
     public var card: SessionRepository.SessionCard
     public var frameName: String

@@ -8,6 +8,9 @@ public struct FrameImportSheet: View {
     let urls: [URL]
     let categoryID: String?
     let onFinished: () -> Void
+    let sessionPhotoCount: Int?
+    let sessionDetail: SessionDetail?
+    let onSessionFrameSaved: ((Frame, Bool) -> Void)?
 
     @Environment(\.dismiss) private var dismiss
 
@@ -15,12 +18,16 @@ public struct FrameImportSheet: View {
     @State private var frameName: String = ""
     @State private var selectedLayout: FrameImportLayoutKind = .grid2x2
     @State private var currentImage: CGImage?
+    @State private var imageOrientation: Int?
     @State private var currentData: Data?
     @State private var alpha: PNGAutoAlignmentService.AlphaGrid?
-    private var hasAlpha: Bool { alpha?.hasTransparency == true }
+    @State private var hasAlpha = false
+    @State private var detected: AutoAlignmentResult?
+    @State private var loadTask: Task<Void, Never>?
+    @State private var loadGeneration = 0
+    @State private var showManualControls = false
     @State private var previewTask: Task<Void, Never>?
     @State private var previewGeneration = 0
-    @State private var previewPending = false
     @State private var dragOrigin: SlotRect?
     @State private var advancedDraft: FrameEditorImportDraft?
     @State private var isPNG: Bool = false
@@ -34,14 +41,30 @@ public struct FrameImportSheet: View {
     @State private var fileError: String? = nil
     @State private var selectedSlotIndex: Int = 0
     @State private var compositePreview: CGImage?
+    @State private var clarityResult: PNGSlotClarity.Result?
+    @State private var clarityAutomatic: PNGSlotClarity.Result?
+    @State private var clarityError: String?
+    @State private var clarityProgress: String?
+    @State private var clarityEdits: [PNGSlotClarity.Edit] = []
+    @State private var clarityApprovals: PNGSlotClarity.Approvals = [:]
+    @State private var beforeBulkApproval: PNGSlotClarity.Approvals?
+    @State private var clarityReview: FrameClaritySheet.ImportInput?
+    @State private var slotIDs: [String] = []
     @State private var savedFrameIDs: [String] = []
     @State private var isSaving: Bool = false
+    @State private var failedSave: SaveAttempt?
+    @State private var saveError: String?
     @State private var showConfirmStop: Bool = false
 
-    public init(env: AppEnvironment, urls: [URL], categoryID: String? = nil, onFinished: @escaping () -> Void) {
+    public init(env: AppEnvironment, urls: [URL], categoryID: String? = nil,
+                sessionPhotoCount: Int? = nil, sessionDetail: SessionDetail? = nil,
+                onSessionFrameSaved: ((Frame, Bool) -> Void)? = nil, onFinished: @escaping () -> Void) {
         self.env = env
         self.urls = urls
         self.categoryID = categoryID
+        self.sessionPhotoCount = sessionPhotoCount
+        self.sessionDetail = sessionDetail
+        self.onSessionFrameSaved = onSessionFrameSaved
         self.onFinished = onFinished
     }
 
@@ -53,25 +76,50 @@ public struct FrameImportSheet: View {
             if let err = fileError {
                 errorStateView(err)
             } else if currentImage != nil {
-                mainContent
+                mainContent.disabled(isSaving)
             } else {
-                ProgressView("Đang nạp tệp…").padding(40)
+                ProgressView("Đang phân tích khung…").padding(40)
             }
 
             Divider()
             bottomBar
         }
         .frame(minWidth: 840, idealWidth: 960, maxWidth: 1100, minHeight: 640, idealHeight: 720, maxHeight: 860)
+        .interactiveDismissDisabled(isSaving)
         .onAppear {
             loadCurrentFile()
         }
-        .onDisappear { invalidateCompositePreview() }
+        .onDisappear {
+            loadTask?.cancel()
+            loadGeneration += 1
+            invalidateCompositePreview()
+        }
         .sheet(item: $advancedDraft) { draft in
             FrameEditorView(env: env, imported: draft) { frame in
                 advancedDraft = nil
                 if let frame { didSave(frame) }
             }
             .frame(minWidth: 840, minHeight: 580)
+        }
+        .sheet(item: $clarityReview) { input in
+            FrameClaritySheet(env: env, input: input) { submission in
+                guard input.importGeneration == previewGeneration, input.original == currentData,
+                      input.snapshot.slots == previewSnapshot.slots else { return false }
+                let approvalsChanged = clarityApprovals != submission.state.approvals
+                clarityEdits = submission.state.edits
+                clarityApprovals = submission.state.approvals
+                if clarityResult?.data == submission.result.data, compositePreview != nil {
+                    clarityResult = submission.result
+                    if approvalsChanged {
+                        beforeBulkApproval = submission.beforeBulkApproval
+                        saveError = nil
+                    }
+                } else {
+                    updateCompositePreview(approved: submission.result, automatic: submission.automatic)
+                    beforeBulkApproval = submission.beforeBulkApproval
+                }
+                return true
+            }
         }
         .confirmationDialog("Huỷ bản nháp khung?", isPresented: $showConfirmStop) {
             Button("Tiếp tục nhập", role: .cancel) { }
@@ -146,7 +194,7 @@ public struct FrameImportSheet: View {
             if isAutoAligned {
                 HStack(spacing: 6) {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                    Text("Tự căn 4 ô thành công từ vùng trong suốt của PNG")
+                    Text("Đã tìm thấy \(slots.count) ô ảnh")
                         .font(.caption.weight(.medium))
                     Spacer()
                 }
@@ -159,8 +207,13 @@ public struct FrameImportSheet: View {
             } else if requiresInspection {
                 HStack(spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                    Text("Kiểm tra vị trí ô: \(inspectionReason ?? "Chưa đạt điều kiện tự căn")")
-                        .font(.caption.weight(.medium))
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(slots.isEmpty ? "Chọn vị trí đặt ảnh" : "Kiểm tra các ô được gợi ý")
+                            .font(.caption.weight(.medium))
+                        if let inspectionReason, inspectionReason != "Chọn vị trí đặt ảnh" {
+                            Text(inspectionReason).font(.caption)
+                        }
+                    }
                     Spacer()
                 }
                 .padding(.horizontal, 14)
@@ -185,10 +238,30 @@ public struct FrameImportSheet: View {
                 .clipShape(RoundedRectangle(cornerRadius: 6))
                 .padding(.horizontal, 14)
             }
+            if let error = clarityError {
+                HStack {
+                    Text(error).foregroundStyle(.red)
+                    Button("Thử lại") { updateCompositePreview() }
+                }
+            } else if let result = clarityResult {
+                let pending = result.pending(clarityApprovals)
+                if pending.isEmpty {
+                    Button("Đã kiểm tra \(result.slots.count)/\(result.slots.count) ô ảnh") {
+                        openClarityReview()
+                    }
+                    .buttonStyle(.borderless)
+                } else {
+                    Button("Xem lại ô \(pending.map { String($0.number) }.joined(separator: ", "))") {
+                        openClarityReview()
+                    }
+                }
+            } else if let clarityProgress {
+                ProgressView(clarityProgress).controlSize(.small)
+            }
 
             ZStack {
                 Color(nsColor: .windowBackgroundColor)
-                if let preview = compositePreview {
+                if let preview = compositePreview ?? (imageOrientation == nil ? currentImage : nil) {
                     GeometryReader { geo in
                         let fitSize = calculateAspectFitSize(
                             contentWidth: CGFloat(canvasWidth),
@@ -222,7 +295,7 @@ public struct FrameImportSheet: View {
                                             lineWidth: isSelected ? 2.5 : 1.5
                                         )
                                         .background(
-                                            isSelected ? Color.accentColor.opacity(0.1) : Color.clear
+                                            showManualControls && isSelected ? Color.accentColor.opacity(0.1) : Color.clear
                                         )
 
                                     Text("Ô \(idx + 1)")
@@ -282,105 +355,113 @@ public struct FrameImportSheet: View {
 
                 Divider()
 
-                // Chọn bố cục
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Bố cục").font(.subheadline.weight(.medium))
-                    Picker("", selection: $selectedLayout) {
-                        ForEach(FrameImportLayoutKind.allCases) { layout in
-                            Text(layout.rawValue).tag(layout)
+                if !hasAlpha {
+                    // Chọn bố cục
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Bố cục").font(.subheadline.weight(.medium))
+                        Picker("", selection: $selectedLayout) {
+                            ForEach(FrameImportLayoutKind.allCases) { layout in
+                                Text(layout.rawValue).tag(layout)
+                            }
                         }
-                    }
-                    .pickerStyle(.segmented)
-                    .onChange(of: selectedLayout) { _, newLayout in
-                        onLayoutChanged(newLayout)
+                        .pickerStyle(.segmented)
+                        .onChange(of: selectedLayout) { _, newLayout in
+                            onLayoutChanged(newLayout)
+                        }
+
+                        // Layout Diagram
+                        layoutDiagram(selectedLayout)
+                            .frame(height: 60)
+                            .frame(maxWidth: .infinity)
+                            .background(Color.secondary.opacity(0.08))
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                            .padding(.top, 4)
                     }
 
-                    // Layout Diagram
-                    layoutDiagram(selectedLayout)
-                        .frame(height: 60)
-                        .frame(maxWidth: .infinity)
-                        .background(Color.secondary.opacity(0.08))
-                        .clipShape(RoundedRectangle(cornerRadius: 6))
-                        .padding(.top, 4)
+                    Divider()
+
                 }
 
-                Divider()
+                if !hasAlpha || !slots.isEmpty {
+                    DisclosureGroup("Chỉnh vị trí ô", isExpanded: $showManualControls) {
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack {
+                                Text("Chỉnh ô ảnh").font(.subheadline.weight(.semibold))
+                                Spacer()
+                                Picker("Ô", selection: $selectedSlotIndex) {
+                                    ForEach(0..<slots.count, id: \.self) { i in
+                                        Text("Ô \(i + 1)").tag(i)
+                                    }
+                                }
+                                .frame(width: 90)
+                            }
 
-                // Chỉnh vị trí ô
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Text("Chỉnh ô ảnh").font(.subheadline.weight(.semibold))
-                        Spacer()
-                        Picker("Ô", selection: $selectedSlotIndex) {
-                            ForEach(0..<slots.count, id: \.self) { i in
-                                Text("Ô \(i + 1)").tag(i)
+                            if selectedSlotIndex >= 0 && selectedSlotIndex < slots.count {
+                                let curSlot = slots[selectedSlotIndex]
+                                VStack(alignment: .leading, spacing: 6) {
+                                    HStack {
+                                        Text("Vị trí X").font(.caption)
+                                        Spacer()
+                                        Text(String(format: "%.1f%%", curSlot.x * 100)).font(.caption.monospacedDigit())
+                                    }
+                                    Slider(value: Binding(
+                                        get: { curSlot.x },
+                                        set: { updateSlot(selectedSlotIndex, x: $0) }
+                                    ), in: 0...0.9)
+
+                                    HStack {
+                                        Text("Vị trí Y").font(.caption)
+                                        Spacer()
+                                        Text(String(format: "%.1f%%", curSlot.y * 100)).font(.caption.monospacedDigit())
+                                    }
+                                    Slider(value: Binding(
+                                        get: { curSlot.y },
+                                        set: { updateSlot(selectedSlotIndex, y: $0) }
+                                    ), in: 0...0.9)
+
+                                    HStack {
+                                        Text("Chiều rộng").font(.caption)
+                                        Spacer()
+                                        Text(String(format: "%.1f%%", curSlot.width * 100)).font(.caption.monospacedDigit())
+                                    }
+                                    Slider(value: Binding(
+                                        get: { curSlot.width },
+                                        set: { updateSlot(selectedSlotIndex, width: $0) }
+                                    ), in: 0.05...1.0)
+
+                                    HStack {
+                                        Text("Chiều cao").font(.caption)
+                                        Spacer()
+                                        Text(String(format: "%.1f%%", curSlot.height * 100)).font(.caption.monospacedDigit())
+                                    }
+                                    Slider(value: Binding(
+                                        get: { curSlot.height },
+                                        set: { updateSlot(selectedSlotIndex, height: $0) }
+                                    ), in: 0.05...1.0)
+                                }
+                            }
+
+                            HStack(spacing: 8) {
+                                Button("Tự căn lại") {
+                                    runAutoAlignment(layout: selectedLayout)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+
+                                if !hasAlpha {
+                                    Button("Đặt lại mẫu") {
+                                        slots = PNGAutoAlignmentService.defaultSlots(for: selectedLayout)
+                                        slotIDs = slots.map { _ in IDFactory.new() }
+                                        isAutoAligned = false
+                                        requiresInspection = false
+                                        inspectionReason = nil
+                                        updateCompositePreview()
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.small)
+                                }
                             }
                         }
-                        .frame(width: 90)
-                    }
-
-                    if selectedSlotIndex >= 0 && selectedSlotIndex < slots.count {
-                        let curSlot = slots[selectedSlotIndex]
-                        VStack(alignment: .leading, spacing: 6) {
-                            HStack {
-                                Text("Vị trí X").font(.caption)
-                                Spacer()
-                                Text(String(format: "%.1f%%", curSlot.x * 100)).font(.caption.monospacedDigit())
-                            }
-                            Slider(value: Binding(
-                                get: { curSlot.x },
-                                set: { updateSlot(selectedSlotIndex, x: $0) }
-                            ), in: 0...0.9)
-
-                            HStack {
-                                Text("Vị trí Y").font(.caption)
-                                Spacer()
-                                Text(String(format: "%.1f%%", curSlot.y * 100)).font(.caption.monospacedDigit())
-                            }
-                            Slider(value: Binding(
-                                get: { curSlot.y },
-                                set: { updateSlot(selectedSlotIndex, y: $0) }
-                            ), in: 0...0.9)
-
-                            HStack {
-                                Text("Chiều rộng").font(.caption)
-                                Spacer()
-                                Text(String(format: "%.1f%%", curSlot.width * 100)).font(.caption.monospacedDigit())
-                            }
-                            Slider(value: Binding(
-                                get: { curSlot.width },
-                                set: { updateSlot(selectedSlotIndex, width: $0) }
-                            ), in: 0.05...1.0)
-
-                            HStack {
-                                Text("Chiều cao").font(.caption)
-                                Spacer()
-                                Text(String(format: "%.1f%%", curSlot.height * 100)).font(.caption.monospacedDigit())
-                            }
-                            Slider(value: Binding(
-                                get: { curSlot.height },
-                                set: { updateSlot(selectedSlotIndex, height: $0) }
-                            ), in: 0.05...1.0)
-                        }
-                    }
-
-                    HStack(spacing: 8) {
-                        Button("Tự căn lại") {
-                            runAutoAlignment(layout: selectedLayout)
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-
-                        Button("Đặt lại mẫu") {
-                            slots = PNGAutoAlignmentService.defaultSlots(for: selectedLayout)
-                            isAutoAligned = false
-                            requiresInspection = false
-                            inspectionReason = nil
-                            revalidateBlockage()
-                            updateCompositePreview()
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
                     }
                 }
 
@@ -473,7 +554,7 @@ public struct FrameImportSheet: View {
 
     private var bottomBar: some View {
         HStack(spacing: 12) {
-            Button("Chỉnh nâng cao…") {
+            Button("Chỉnh bố cục…") {
                 openInFrameEditor()
             }
             .buttonStyle(.bordered)
@@ -482,26 +563,81 @@ public struct FrameImportSheet: View {
 
             Spacer()
 
-            if isSaving {
-                ProgressView().scaleEffect(0.8)
-                Text("Đang lưu…").font(.caption).foregroundStyle(.secondary)
+            VStack(alignment: .trailing, spacing: 4) {
+                if let reason = saveBlockReason, !isSaving {
+                    Text(reason).font(.caption).foregroundStyle(.secondary)
+                } else if isRetryingSave, let saveError {
+                    Text(saveError).font(.caption).foregroundStyle(.red)
+                } else if pendingSlotCount > 0 {
+                    Text("Còn \(pendingSlotCount) ô cần xem lại. Xác nhận sẽ giữ các vùng đó như trong bản xem trước.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                HStack(spacing: 8) {
+                    if beforeBulkApproval != nil && compositePreview != nil {
+                        Button("Hoàn tác xác nhận") {
+                            guard let previous = beforeBulkApproval, let clarityResult else { return }
+                            clarityApprovals = clarityResult.retained(previous)
+                            beforeBulkApproval = nil
+                            saveError = nil
+                        }
+                        .disabled(isSaving)
+                    }
+                    if isSaving {
+                        ProgressView().controlSize(.small)
+                        Text("Đang lưu…").font(.caption)
+                    }
+                    Button { saveAndUse() } label: {
+                        Label(primarySaveTitle, systemImage: "checkmark")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(saveBlockReason != nil || isSaving)
+                }
             }
-
-            Button {
-                saveAndUse()
-            } label: {
-                Label(urls.count > 1 && currentIndex < urls.count - 1 ? "Lưu và tiếp tục" : "Lưu và dùng",
-                      systemImage: "checkmark")
-            }
-            .buttonStyle(.borderedProminent)
-            .disabled(!canSave || isSaving)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
     }
 
-    private var canSave: Bool {
-        fileError == nil && currentImage != nil && !frameName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && blockedSlots.isEmpty
+    // Each generated slot has a distinct capture index. Edited frames return through the chooser.
+    private var requiredPhotoCount: Int { slots.count }
+
+    private var saveTitle: String {
+        guard let count = sessionPhotoCount else {
+            return urls.count > 1 && currentIndex < urls.count - 1 ? "Lưu và tiếp tục" : "Lưu khung"
+        }
+        if count == requiredPhotoCount { return "Lưu và dùng cho phiên này" }
+        return count > requiredPhotoCount ? "Lưu khung và chọn ảnh" : "Lưu khung"
+    }
+
+    private var pendingSlotCount: Int {
+        clarityResult?.pending(clarityApprovals).count ?? 0
+    }
+
+    private var primarySaveTitle: String {
+        if isRetryingSave { return "Thử lưu lại" }
+        guard pendingSlotCount > 0 else { return saveTitle }
+        if sessionPhotoCount == requiredPhotoCount { return "Xác nhận, lưu và dùng cho phiên này" }
+        if let count = sessionPhotoCount, count > requiredPhotoCount { return "Xác nhận, lưu và chọn ảnh" }
+        if sessionPhotoCount == nil, currentIndex + 1 < urls.count { return "Xác nhận, lưu và tiếp tục" }
+        return "Xác nhận và lưu khung"
+    }
+
+    private var saveBlockReason: String? {
+        if fileError != nil { return "Không thể đọc tệp khung." }
+        if currentImage == nil { return "Đang đọc tệp khung…" }
+        if frameName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "Nhập tên khung để lưu." }
+        if slots.isEmpty || requiresInspection { return "Hãy xác nhận bố cục các ô ảnh." }
+        if let issue = FrameValidator.validate(canvasWidth: canvasWidth, canvasHeight: canvasHeight, slots: frameSlots,
+                                               hasBackground: !hasAlpha, hasForeground: hasAlpha,
+                                               backgroundColorHex: "#FFFFFFFF").first { return issue.message }
+        if let clarityError { return clarityError }
+        if !blockedSlots.isEmpty { return "Lớp phủ che kín ô \(blockedSlots.map(String.init).joined(separator: ", "))." }
+        if (hasAlpha || sessionPhotoCount == requiredPhotoCount) && compositePreview == nil {
+            return "Đang dựng bản xem trước…"
+        }
+        if hasAlpha && (clarityResult?.slots.isEmpty != false ||
+                        clarityResult?.slots.count != slots.count) { return "Chưa có kết quả kiểm tra ô ảnh." }
+        return nil
     }
 
     // MARK: Actions & Logic
@@ -511,66 +647,89 @@ public struct FrameImportSheet: View {
             finishAndDismiss()
             return
         }
+        loadTask?.cancel()
+        loadGeneration += 1
+        let generation = loadGeneration
         let url = urls[currentIndex]
         invalidateCompositePreview()
         fileError = nil
         alpha = nil
+        hasAlpha = false
+        detected = nil
         currentImage = nil
+        imageOrientation = nil
         currentData = nil
+        slots = []
+        slotIDs = []
+        clarityEdits = []
+        clarityApprovals = [:]
+        failedSave = nil
+        saveError = nil
+        dragOrigin = nil
+        selectedSlotIndex = 0
+        showManualControls = false
         compositePreview = nil
         frameName = url.deletingPathExtension().lastPathComponent
 
-        let accessing = url.startAccessingSecurityScopedResource()
-        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
-
-        guard let data = try? Data(contentsOf: url) else {
-            fileError = "Không thể đọc tệp: \(url.lastPathComponent)"
-            return
+        loadTask = Task {
+            let worker = Task.detached(priority: .userInitiated) {
+                let accessing = url.startAccessingSecurityScopedResource()
+                defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+                if let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+                   size > ResourceLimits.maxAssetBytes {
+                    throw AppError.resourceLimitExceeded("Tệp ảnh vượt giới hạn dung lượng")
+                }
+                let data = try Data(contentsOf: url)
+                let validated = try AssetStore.validatedFrameImport(data, minimumDimension: ResourceLimits.canvasMin)
+                let detection = validated.mediaType == "image/png"
+                    ? PNGAutoAlignmentService.detectOpenings(validated.image) : nil
+                let alpha = detection.flatMap { result in
+                    result.pngStatus == .opaque
+                        ? nil : PNGAutoAlignmentService.AlphaGrid(image: validated.image)
+                }
+                return (data, validated, alpha, detection)
+            }
+            do {
+                let (data, validated, grid, result) = try await withTaskCancellationHandler {
+                    try await worker.value
+                } onCancel: {
+                    worker.cancel()
+                }
+                guard !Task.isCancelled, loadGeneration == generation else { return }
+                currentData = data
+                currentImage = validated.image
+                imageOrientation = validated.orientation
+                canvasWidth = validated.width
+                canvasHeight = validated.height
+                isPNG = validated.mediaType == "image/png"
+                alpha = grid
+                hasAlpha = result.map { $0.pngStatus != .opaque } ?? false
+                detected = hasAlpha ? result : nil
+                selectedLayout = Double(validated.width) / Double(validated.height) < 0.65 ? .strip1x4 : .grid2x2
+                runAutoAlignment(layout: selectedLayout)
+            } catch {
+                guard !Task.isCancelled, loadGeneration == generation else { return }
+                let message = (error as? AppError)?.message ?? error.localizedDescription
+                fileError = "\(url.lastPathComponent): \(message)"
+            }
         }
-
-        let validated: (image: CGImage, mediaType: String)
-        do {
-            validated = try AssetStore.validatedFrameImage(data, minimumDimension: ResourceLimits.canvasMin)
-        } catch {
-            fileError = "\(url.lastPathComponent): \(error.localizedDescription)"
-            return
-        }
-        let image = validated.image
-        let w = image.width
-        let h = image.height
-        currentData = data
-        currentImage = image
-        canvasWidth = w
-        canvasHeight = h
-        isPNG = validated.mediaType == "image/png"
-        if isPNG && FramesViewModel.hasAlphaChannel(data: data) {
-            alpha = PNGAutoAlignmentService.AlphaGrid(image: image)
-        }
-
-        // Tự động suy luận bố cục phù hợp dựa trên tỷ lệ canvas
-        let aspect = Double(w) / Double(max(h, 1))
-        if aspect < 0.65 {
-            selectedLayout = .strip1x4
-        } else {
-            selectedLayout = .grid2x2
-        }
-
-        runAutoAlignment(layout: selectedLayout)
     }
 
     private func onLayoutChanged(_ layout: FrameImportLayoutKind) {
-        invalidateCompositePreview()
         runAutoAlignment(layout: layout)
     }
 
     private func runAutoAlignment(layout: FrameImportLayoutKind) {
         guard currentImage != nil else { return }
-        let result = PNGAutoAlignmentService.align(alpha: alpha, layout: layout)
+        let result = detected ?? PNGAutoAlignmentService.align(alpha: alpha, layout: layout)
         slots = result.slots
+        slotIDs = slots.map { _ in IDFactory.new() }
+        clarityEdits = []
+        clarityApprovals = [:]
+        selectedSlotIndex = 0
         isAutoAligned = result.isAutoAligned
         requiresInspection = result.requiresInspection
         inspectionReason = result.inspectionReason
-        blockedSlots = result.blockedSlotIndices
         updateCompositePreview()
     }
 
@@ -595,65 +754,159 @@ public struct FrameImportSheet: View {
     private func updateSlot(_ index: Int, x: Double? = nil, y: Double? = nil, width: Double? = nil, height: Double? = nil) {
         guard index >= 0 && index < slots.count else { return }
         var s = slots[index]
+        let old = s
         if let x { s.x = max(0, min(1 - s.width, x)) }
         if let y { s.y = max(0, min(1 - s.height, y)) }
-        if let width { s.width = max(0.05, min(1.0 - s.x, width)) }
-        if let height { s.height = max(0.05, min(1.0 - s.y, height)) }
+        if let width {
+            s.width = hasAlpha ? min(1.0 - s.x, max(1.0 / Double(canvasWidth), width))
+                : max(0.05, min(1.0 - s.x, width))
+        }
+        if let height {
+            s.height = hasAlpha ? min(1.0 - s.y, max(1.0 / Double(canvasHeight), height))
+                : max(0.05, min(1.0 - s.y, height))
+        }
+        guard s != old else { return }
+        let previous = frameSlots
         slots[index] = s
-        revalidateBlockage()
+        clarityEdits = SlotClarityApprovals.retained(clarityEdits, from: previous, to: frameSlots,
+                                                   canvasWidth: canvasWidth, canvasHeight: canvasHeight)
+        clarityApprovals = SlotClarityApprovals.retained(clarityApprovals, from: previous, to: frameSlots,
+                                                       canvasWidth: canvasWidth, canvasHeight: canvasHeight)
         updateCompositePreview()
-    }
-
-    private func revalidateBlockage() {
-        blockedSlots = hasAlpha ? alpha?.blockedSlots(slots) ?? [] : []
     }
 
     private var frameSlots: [FrameSlot] {
         slots.enumerated().map { index, slot in
-            FrameSlot(captureIndex: index + 1, x: slot.x, y: slot.y, width: slot.width, height: slot.height,
+            FrameSlot(id: slotIDs[index], captureIndex: index + 1, x: slot.x, y: slot.y, width: slot.width, height: slot.height,
                       zOrder: index, maskType: .rectangle, cornerRadius: 0, defaultCropMode: .autoFace)
         }
     }
 
-    private func updateCompositePreview() {
-        guard let image = currentImage else { return }
-        guard previewTask == nil else {
-            previewPending = true
-            return
-        }
+    private var previewSnapshot: FrameSnapshot {
+        let layer = SnapshotLayer(assetID: "prepared-import", placement: hasAlpha ? .stretchToCanvas : .aspectFill, imageOrientation: imageOrientation)
+        return FrameSnapshot(sourceFrameID: nil, sourceFrameRevisionID: nil,
+                             canvasWidth: canvasWidth, canvasHeight: canvasHeight,
+                             background: hasAlpha ? nil : layer, foreground: hasAlpha ? layer : nil,
+                             backgroundColorHex: "#FFFFFFFF", slots: frameSlots.map(SnapshotSlot.init(from:)),
+                             snapshotHash: "import-preview")
+    }
+
+    private func openClarityReview() {
+        guard let currentData, hasAlpha, !requiresInspection, !slots.isEmpty, !isSaving else { return }
+        clarityReview = FrameClaritySheet.ImportInput(name: frameName, original: currentData,
+            snapshot: previewSnapshot, edits: clarityEdits, approvals: clarityApprovals,
+            automatic: clarityAutomatic, currentResult: clarityResult, importGeneration: previewGeneration)
+    }
+
+    private struct ImportPreview {
+        let image: CGImage
+        let clarity: PNGSlotClarity.Result?
+        let automatic: PNGSlotClarity.Result?
+        let blocked: [Int]?
+    }
+
+    private func updateCompositePreview(approved: PNGSlotClarity.Result? = nil,
+                                        automatic approvedAutomatic: PNGSlotClarity.Result? = nil) {
+        invalidateCompositePreview()
+        guard let originalImage = currentImage, let data = currentData else { return }
+        if hasAlpha && (slots.isEmpty || requiresInspection) { return }
+        previewGeneration += 1
         let generation = previewGeneration
         let isOverlay = hasAlpha
         let width = canvasWidth
         let height = canvasHeight
-        let slots = frameSlots.map(SnapshotSlot.init(from:))
+        let snapshot = previewSnapshot
+        let slots = snapshot.slots
+        let configuredSlots = frameSlots
+        let edits = clarityEdits
         let defaults = env.settings.sessionDefaultsSnapshot()
+        let sessionDetail = sessionPhotoCount == requiredPhotoCount ? sessionDetail : nil
+        let builder = env.renderBuilder
+        if isOverlay { clarityProgress = "Đang kiểm tra \(slots.count) ô ảnh…" }
+        let report: @Sendable (Int, Int) -> Void = { index, count in
+            Task { @MainActor in
+                if previewGeneration == generation, previewTask != nil {
+                    clarityProgress = "Đang xử lý ô \(index)/\(count)"
+                }
+            }
+        }
         previewTask = Task {
-            let rendered = await Task.detached(priority: .userInitiated) {
-                let layer = SnapshotLayer(assetID: "prepared-import",
-                                          placement: isOverlay ? .stretchToCanvas : .aspectFill)
-                let snapshot = FrameSnapshot(sourceFrameID: nil, sourceFrameRevisionID: nil,
-                                             canvasWidth: width, canvasHeight: height,
-                                             background: isOverlay ? nil : layer, foreground: isOverlay ? layer : nil,
-                                             backgroundColorHex: "#FFFFFFFF", slots: slots, snapshotHash: "import-preview")
+            let worker = Task.detached(priority: .userInitiated) { () throws -> ImportPreview in
+                let clarity: PNGSlotClarity.Result?
+                let automatic: PNGSlotClarity.Result?
+                let image: CGImage
+                if isOverlay {
+                    let result: PNGSlotClarity.Result
+                    if let approved, let approvedAutomatic {
+                        automatic = approvedAutomatic
+                        result = approved
+                    } else {
+                        let base = try PNGSlotClarity.prepare(data: data, snapshot: snapshot, progress: report)
+                        automatic = base
+                        result = try PNGSlotClarity.refine(data: data, snapshot: snapshot, automatic: base,
+                                                           edits: edits)
+                    }
+                    guard let cleaned = CGImage.createFrom(data: result.data) else { throw AppError.frameFileCorrupt }
+                    clarity = result
+                    image = cleaned
+                } else {
+                    clarity = nil
+                    automatic = nil
+                    image = originalImage
+                }
+                try Task.checkCancellation()
+                let blocked: [Int]?
+                if isOverlay {
+                    let layout = FrameRevision(frameID: "", revisionNo: 1, canvasWidth: width, canvasHeight: height,
+                                               foregroundPlacement: .stretchToCanvas)
+                    blocked = try PNGAutoAlignmentService.blockedSlots(overlay: image, draft: layout, slots: configuredSlots)
+                } else {
+                    blocked = nil
+                }
+                guard let layer = snapshot.foreground ?? snapshot.background else { throw AppError.missingFrameAssets }
+                let scale = min(1, 1024.0 / Double(max(width, height)))
+                let options = RenderOptions(targetWidth: max(1, Int((Double(width) * scale).rounded())),
+                                            targetHeight: max(1, Int((Double(height) * scale).rounded())),
+                                            transparentBackground: isOverlay)
+                if var draft = sessionDetail {
+                    let order = draft.currentRevisions(includeUnassigned: true)
+                        .filter { $0.value.state == .available }.keys.sorted()
+                    let assigned = try snapshot.assigningPhotos(in: order)
+                    draft.session.defaults.selectedCaptureOrder = order
+                    draft.snapshot = assigned
+                    draft.placements = [:]
+                    var model = await builder.buildModel(detail: draft, targetWidth: options.targetWidth,
+                                                         targetHeight: options.targetHeight,
+                                                         transparentBackground: isOverlay)
+                    guard model.sources.count == order.count else {
+                        throw AppError.invalidState("Không thể dựng bản xem trước từ ảnh của phiên.")
+                    }
+                    model.assetImages[layer.assetID] = image
+                    return ImportPreview(image: try CompositeRenderer.render(model: model), clarity: clarity, automatic: automatic, blocked: blocked)
+                }
                 let sources = Dictionary(uniqueKeysWithValues: slots.compactMap { slot in
                     SampleImageFactory.shared.sample(index: slot.captureIndex, size: CGSize(width: 400, height: 400))
                         .map { (slot.captureIndex, RenderSource(image: $0)) }
                 })
-                let scale = min(1, 1024.0 / Double(max(width, height)))
                 let model = CompositionModel(snapshot: snapshot, sources: sources, faces: [:], defaults: defaults,
-                                             overrides: [:], placements: [:], cropModes: [:],
-                                             assetImages: [layer.assetID: image],
-                                             options: RenderOptions(targetWidth: max(1, Int((Double(width) * scale).rounded())),
-                                                                    targetHeight: max(1, Int((Double(height) * scale).rounded()))))
-                return try? CompositeRenderer.render(model: model)
-            }.value
-            guard !Task.isCancelled, previewGeneration == generation else { return }
-            compositePreview = rendered
-            previewTask = nil
-            if previewPending {
-                previewPending = false
-                updateCompositePreview()
+                                             overrides: [:], placements: [:],
+                                             cropModes: [:], assetImages: [layer.assetID: image], options: options)
+                return ImportPreview(image: try CompositeRenderer.render(model: model), clarity: clarity, automatic: automatic, blocked: blocked)
             }
+            do {
+                let result = try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
+                guard !Task.isCancelled, previewGeneration == generation else { return }
+                compositePreview = result.image
+                clarityResult = result.clarity
+                clarityAutomatic = result.automatic
+                clarityApprovals = result.clarity?.retained(clarityApprovals) ?? [:]
+                if let blocked = result.blocked { blockedSlots = blocked }
+            } catch {
+                guard !Task.isCancelled, previewGeneration == generation else { return }
+                clarityError = (error as? AppError)?.message ?? error.localizedDescription
+            }
+            previewTask = nil
+            clarityProgress = nil
         }
     }
 
@@ -661,31 +914,73 @@ public struct FrameImportSheet: View {
         previewGeneration += 1
         previewTask?.cancel()
         previewTask = nil
-        previewPending = false
+        compositePreview = nil
+        clarityResult = nil
+        clarityAutomatic = nil
+        blockedSlots = []
+        beforeBulkApproval = nil
+        saveError = nil
+        clarityError = nil
+        clarityProgress = nil
+    }
+
+    private struct SavePayload: Equatable, Sendable {
+        let name: String
+        let data: Data
+        let mediaType: String
+        let role: AssetKind
+        let categoryID: String?
+        let slots: [FrameSlot]
+    }
+
+    private struct SaveAttempt {
+        let id = IDFactory.new()
+        let payload: SavePayload
+    }
+
+    private var savePayload: SavePayload? {
+        guard let data = hasAlpha ? clarityResult?.data : currentData else { return nil }
+        return SavePayload(name: frameName.trimmingCharacters(in: .whitespacesAndNewlines), data: data,
+                           mediaType: isPNG ? "image/png" : "image/jpeg",
+                           role: hasAlpha ? .frameForeground : .frameBackground, categoryID: categoryID, slots: frameSlots)
+    }
+
+    private var isRetryingSave: Bool {
+        guard saveError != nil, pendingSlotCount == 0, let failedSave, let savePayload else { return false }
+        return failedSave.payload == savePayload
     }
 
     private func saveAndUse() {
-        guard let data = currentData, canSave else { return }
+        guard !isSaving, saveBlockReason == nil, let payload = savePayload else { return }
+        if let result = clarityResult {
+            let approved = result.approving(clarityApprovals)
+            guard result.pending(approved).isEmpty else { return }
+            if approved != clarityApprovals, beforeBulkApproval == nil {
+                beforeBulkApproval = clarityApprovals
+            }
+            clarityApprovals = approved
+        }
+        let attempt = failedSave.flatMap { $0.payload == payload ? $0 : nil } ?? SaveAttempt(payload: payload)
+        let destination = attempt.id
+        let useInSession = sessionPhotoCount == requiredPhotoCount
+        let repository = env.frames
         isSaving = true
-
-        let name = frameName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let mediaType = isPNG ? "image/png" : "image/jpeg"
-        let role: AssetKind = hasAlpha ? .frameForeground : .frameBackground
-
-        do {
-            let frame = try env.frames.createConfiguredFrame(
-                name: name,
-                imageData: data,
-                mediaType: mediaType,
-                role: role,
-                categoryID: categoryID,
-                slots: frameSlots
-            )
-            isSaving = false
-            didSave(frame)
-        } catch {
-            isSaving = false
-            env.showToast("Không thể lưu khung '\(name)': \((error as? AppError)?.message ?? error.localizedDescription)", kind: .warning)
+        saveError = nil
+        Task {
+            defer { isSaving = false }
+            do {
+                let frame = try await Task.detached(priority: .userInitiated) {
+                    try repository.createConfiguredFrame(name: payload.name, imageData: payload.data,
+                        mediaType: payload.mediaType, role: payload.role, categoryID: payload.categoryID,
+                        slots: payload.slots, retryID: destination)
+                }.value
+                failedSave = nil
+                beforeBulkApproval = nil
+                didSave(frame, applyToSession: useInSession)
+            } catch {
+                failedSave = attempt
+                saveError = "Không thể lưu khung: \((error as? AppError)?.message ?? error.localizedDescription)"
+            }
         }
     }
 
@@ -698,7 +993,12 @@ public struct FrameImportSheet: View {
         }
     }
 
-    private func didSave(_ frame: Frame) {
+    private func didSave(_ frame: Frame, applyToSession: Bool = false) {
+        if let onSessionFrameSaved {
+            onSessionFrameSaved(frame, applyToSession)
+            dismiss()
+            return
+        }
         savedFrameIDs.append(frame.id)
         if currentIndex + 1 < urls.count {
             currentIndex += 1
@@ -713,21 +1013,14 @@ public struct FrameImportSheet: View {
         advancedDraft = FrameEditorImportDraft(
             name: frameName, categoryID: categoryID, data: data, mediaType: isPNG ? "image/png" : "image/jpeg",
             role: hasAlpha ? .frameForeground : .frameBackground, width: canvasWidth, height: canvasHeight,
-            slots: frameSlots
+            slots: frameSlots, imageOrientation: imageOrientation, claritySHA256: hasAlpha ? Hashing.sha256Hex(data) : nil,
+            clarityEdits: clarityEdits, clarityApprovals: clarityApprovals
         )
     }
 
     private func finishAndDismiss() {
-        if let lastID = savedFrameIDs.last {
-            do {
-                let frame = try env.selectFrameForCapture(lastID)
-                env.requestNavigation(to: .capture)
-                env.showToast("Đã nhập \(savedFrameIDs.count) khung và chọn \(frame.name) cho màn Chụp")
-            } catch AppError.frameLockedDuringCapture {
-                env.showToast("Đã lưu khung vào thư viện để dùng từ phiên sau")
-            } catch {
-                env.showToast("Đã lưu khung. Không thể chọn: \(error.localizedDescription)", kind: .warning)
-            }
+        if !savedFrameIDs.isEmpty {
+            env.showToast("Đã lưu \(savedFrameIDs.count) khung vào thư viện")
         }
         EventBus.shared.post(.frameLibraryChanged(frameID: nil))
         onFinished()

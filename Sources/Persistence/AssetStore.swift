@@ -148,6 +148,26 @@ public final class AssetStore: @unchecked Sendable {
         return (image, type == UTType.png.identifier ? "image/png" : "image/jpeg")
     }
 
+    static func validatedFrameImport(_ data: Data, minimumDimension: Int = 1) throws
+        -> (image: CGImage, mediaType: String, orientation: Int?, width: Int, height: Int) {
+        let validated = try validatedFrameImage(data, minimumDimension: minimumDimension)
+        var orientation: Int?
+        if validated.mediaType == "image/jpeg",
+           let source = CGImageSourceCreateWithData(data as CFData, nil),
+           let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+           let value = properties[kCGImagePropertyOrientation] {
+            guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+                  number.doubleValue == Double(number.intValue), (1...8).contains(number.intValue) else {
+                throw AppError.invalidState("Hướng EXIF của ảnh JPEG không hợp lệ")
+            }
+            orientation = number.intValue == 1 ? nil : number.intValue
+        }
+        let swapped = orientation.map { (5...8).contains($0) } ?? false
+        return (validated.image, validated.mediaType, orientation,
+                swapped ? validated.image.height : validated.image.width,
+                swapped ? validated.image.width : validated.image.height)
+    }
+
     public func assetInfo(assetID: String) -> StoredAsset? {
         let rows = (try? db.query("SELECT id, sha256, relative_path, width, height FROM assets WHERE id=?", [.text(assetID)])) ?? []
         guard let r = rows.first else { return nil }
@@ -218,7 +238,7 @@ public final class AssetStore: @unchecked Sendable {
 }
 
 extension CGImage {
-    /// Decode CGImage từ data + tôn trọng EXIF orientation (chuẩn hóa ngay đầu pipeline §8.4).
+    /// Decode raw pixels. Frame layers apply stored orientation and capture photos normalize separately.
     public static func createFrom(data: Data) -> CGImage? {
         guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
         let options: [CFString: Any] = [kCGImageSourceShouldCacheImmediately: true]

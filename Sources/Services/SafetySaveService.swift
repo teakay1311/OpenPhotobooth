@@ -57,7 +57,7 @@ public final class SafetySaveService: @unchecked Sendable {
                   Hashing.sha256Hex(fileURL: try sessions.fileURL(for: revision)) == sha else {
                 throw AppError.ioFailure("Không xác minh được ảnh đã lưu của lượt này")
             }
-            if let prior = try photoIntent(sessionID: sessionID, requestID: requestID) {
+            if let prior = try trashRepo.savePhotoIntent(sessionID: sessionID, requestID: requestID) {
                 try trashRepo.updateIntent(id: prior.id, status: .committed)
             }
             return revision
@@ -65,7 +65,7 @@ public final class SafetySaveService: @unchecked Sendable {
 
         let intent: OperationIntentRecord
         let payloadObj: SavePhotoIntentPayload
-        if let prior = try photoIntent(sessionID: sessionID, requestID: requestID) {
+        if let prior = try trashRepo.savePhotoIntent(sessionID: sessionID, requestID: requestID) {
             let saved = try JSONDecoder().decode(SavePhotoIntentPayload.self, from: Data(prior.payloadJSON.utf8))
             guard saved.sessionID == sessionID, saved.captureIndex == captureIndex, saved.sha256 == sha else {
                 throw AppError.ioFailure("Yêu cầu ghi ảnh không khớp lượt đang chờ")
@@ -127,17 +127,6 @@ public final class SafetySaveService: @unchecked Sendable {
             try? trashRepo.updateIntent(id: intent.id, status: .rollbackRequired, error: error.localizedDescription)
             throw error
         }
-    }
-
-    private func photoIntent(sessionID: String, requestID: String) throws -> OperationIntentRecord? {
-        let row = try db.query("""
-            SELECT id FROM operation_intents
-            WHERE op_type='savePhoto' AND root_id=?
-              AND json_extract(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END, '$.requestID')=?
-            ORDER BY created_at_ms LIMIT 1
-            """, [.text(sessionID), .text(requestID)]).first
-        guard let row else { return nil }
-        return try trashRepo.getIntent(id: row["id"].stringValue)
     }
 
     static func isWritable(_ url: URL) -> Bool {

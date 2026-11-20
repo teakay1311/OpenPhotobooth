@@ -17,6 +17,7 @@ let package = Package(
             name: "OpenPhotoboothTests",
             dependencies: ["OpenPhotobooth"],
             path: "Tests",
+            resources: [.copy("Fixtures")],
             linkerSettings: [.linkedLibrary("sqlite3")]
         )
     ]

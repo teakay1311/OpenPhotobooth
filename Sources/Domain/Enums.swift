@@ -167,18 +167,26 @@ public enum SkinSmoothPreset: String, CaseIterable {
 
 public enum FullscreenStep: Equatable {
     case welcome
-    case selectFrame
+    case captureSetup
+    case chooseFrame
     case live
     case review
     case finish
 }
 
 public enum ScreenRoute: Hashable {
+    public enum FrameChooserSource: Hashable {
+        case capture, library
+
+        var reviewRoute: ScreenRoute { self == .capture ? .capture : .library }
+    }
+
     case capture
     case frames
     case library
     case trash
     case settings
     case frameEditor(frameID: String?)
+    case chooseFrame(sessionID: String, source: FrameChooserSource)
     case review(sessionID: String)
 }

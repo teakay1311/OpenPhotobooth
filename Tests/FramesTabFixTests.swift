@@ -48,6 +48,10 @@ final class FramesTabFixTests: XCTestCase {
         await vm.loadAndValidate(url: packURL)
         XCTAssertEqual(vm.phase, .ready)
         XCTAssertNotNil(vm.packResult)
+        let entry = try XCTUnwrap(vm.packResult?.entries.first)
+        XCTAssertTrue(entry.isDuplicate)
+        XCTAssertEqual(vm.choices[entry.id]?.policy, .skip)
+        vm.choices[entry.id] = (.copy, true) // This test explicitly exercises repeated Copy, not default Skip.
 
         let initialFrameCount = try env.frames.listFrames().count
 

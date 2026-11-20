@@ -225,6 +225,9 @@ public struct SessionDefaultsSnapshot: Codable, Equatable, Sendable {
     public var outputMirror: Bool
     public var rotation: Int?
     public var smartFace: Bool?
+    public var autoFacePlacementVersion: Int? = nil
+    public var plannedCaptureCount: Int? = nil
+    public var appliedFrameName: String? = nil
     public var selectionCaptureCount: Int? = nil
     public var selectedCaptureOrder: [Int]? = nil
 
@@ -247,7 +250,7 @@ public struct SessionDefaultsSnapshot: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case parameterVersion, presetID, presetName, presetResolvedParameters
         case presetIntensity, color, skinSmooth, outputMirror, rotation, smartFace
-        case selectionCaptureCount, selectedCaptureOrder
+        case selectionCaptureCount, selectedCaptureOrder, plannedCaptureCount, appliedFrameName, autoFacePlacementVersion
     }
 
     public init(from decoder: Decoder) throws {
@@ -262,6 +265,9 @@ public struct SessionDefaultsSnapshot: Codable, Equatable, Sendable {
         outputMirror = try c.decodeIfPresent(Bool.self, forKey: .outputMirror) ?? false
         rotation = try c.decodeIfPresent(Int.self, forKey: .rotation) ?? 0
         smartFace = try c.decodeIfPresent(Bool.self, forKey: .smartFace) ?? true
+        autoFacePlacementVersion = try c.decodeIfPresent(Int.self, forKey: .autoFacePlacementVersion)
+        plannedCaptureCount = try c.decodeIfPresent(Int.self, forKey: .plannedCaptureCount)
+        appliedFrameName = try c.decodeIfPresent(String.self, forKey: .appliedFrameName)
         selectionCaptureCount = try c.decodeIfPresent(Int.self, forKey: .selectionCaptureCount)
         selectedCaptureOrder = try c.decodeIfPresent([Int].self, forKey: .selectedCaptureOrder)
     }
@@ -277,6 +283,9 @@ public struct SessionDefaultsSnapshot: Codable, Equatable, Sendable {
         try values.encode(outputMirror, forKey: .outputMirror)
         try values.encodeIfPresent(rotation, forKey: .rotation)
         try values.encodeIfPresent(smartFace, forKey: .smartFace)
+        try values.encodeIfPresent(autoFacePlacementVersion, forKey: .autoFacePlacementVersion)
+        try values.encodeIfPresent(plannedCaptureCount, forKey: .plannedCaptureCount)
+        try values.encodeIfPresent(appliedFrameName, forKey: .appliedFrameName)
         try values.encodeIfPresent(selectionCaptureCount, forKey: .selectionCaptureCount)
         try values.encodeIfPresent(selectedCaptureOrder, forKey: .selectedCaptureOrder)
     }

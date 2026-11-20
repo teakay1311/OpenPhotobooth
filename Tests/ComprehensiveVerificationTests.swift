@@ -6,13 +6,15 @@ import UniformTypeIdentifiers
 
 final class ComprehensiveVerificationTests: XCTestCase {
     var env: AppEnvironment!
-    let fixturesDir = URL(fileURLWithPath: "/tmp/openphotobooth_test_env/fixtures")
+    var fixturesDir: URL!
     let exportsDir = FileManager.default.temporaryDirectory.appendingPathComponent("openphotobooth_test_exports/destination_valid", isDirectory: true)
 
     @MainActor
     override func setUp() async throws {
         env = AppEnvironment(inMemory: true)
         try FrameSeeder.seedIfNeeded(db: env.db, frameRepo: env.frames, presetRepo: env.presets, assets: env.assets)
+        fixturesDir = env.layout.rootURL.appendingPathComponent("fixtures", isDirectory: true)
+        try prepareFixtures()
         try? FileManager.default.createDirectory(at: exportsDir, withIntermediateDirectories: true)
         cleanExportsDir()
     }
@@ -1312,7 +1314,7 @@ final class ComprehensiveVerificationTests: XCTestCase {
             width: 500, height: 500, orientation: 1, codec: "png", colorProfile: nil)
 
         let libraryVM = LibraryViewModel(env: env)
-        libraryVM.reload()
+        await libraryVM.reload().value
         guard let card = libraryVM.cards.first(where: { $0.id == session.id }) else {
             XCTFail("Session card not found")
             return
@@ -1327,6 +1329,36 @@ final class ComprehensiveVerificationTests: XCTestCase {
     }
 
     // MARK: - Helpers
+    // The suite owns its inputs; it must not depend on a previous agent's /tmp files.
+    private func prepareFixtures() throws {
+        try FileManager.default.createDirectory(at: fixturesDir, withIntermediateDirectories: true)
+        let marker = makeSamplePNG(width: 500, height: 500)
+        try marker.write(to: fixturesDir.appendingPathComponent("marker_L.png"))
+        let cg = try XCTUnwrap(CGImage.createFrom(data: marker))
+        let jpg = try ExportService.encode(cg: cg, format: .jpeg, quality: 90)
+        try jpg.write(to: fixturesDir.appendingPathComponent("sample.jpg"))
+        let opaque = try ExportService.encode(cg: XCTUnwrap(CGImage.createFrom(data: jpg)), format: .png, quality: 100)
+        try opaque.write(to: fixturesDir.appendingPathComponent("opaque.png"))
+        try Data("not an image".utf8).write(to: fixturesDir.appendingPathComponent("corrupt.png"))
+        let sha = Hashing.sha256Hex(marker), path = "assets/\(Hashing.sha256Hex(marker)).png"
+        let frame = PackFrame(frameId: "fixture", name: "Fixture", category: nil,
+            canvas: PackCanvas(width: 500, height: 500),
+            slots: [PackSlot(id: "slot", captureIndex: 1, x: 0.1, y: 0.1, width: 0.8, height: 0.8,
+                rotationDegrees: 0, zOrder: 0, mask: "rectangle", cornerRadius: 0, cropMode: "fill")],
+            assets: PackFrameAssets(background: "sha256:\(sha)", foreground: nil), backgroundColor: nil,
+            backgroundPlacement: nil, foregroundPlacement: nil, explicitWhite: nil)
+        let manifest = PackManifest(schemaVersion: 1, packFormatVersion: 1, packId: "fixture", name: "Fixture",
+            createdAt: "2026-01-01T00:00:00Z", frames: [frame],
+            files: [PackFileEntry(path: path, sha256: sha, size: marker.count)])
+        let header = ZipArchive.Entry(name: "manifest.json", data: try JSONEncoder().encode(manifest))
+        let asset = ZipArchive.Entry(name: path, data: marker)
+        try ZipArchive.archive(entries: [header, asset]).write(to: fixturesDir.appendingPathComponent("valid.photoframepack"))
+        try ZipArchive.archive(entries: [header, asset, .init(name: "../outside", data: Data([1]))])
+            .write(to: fixturesDir.appendingPathComponent("zip_slip.photoframepack"))
+        try ZipArchive.archive(entries: [header, .init(name: path, data: opaque)])
+            .write(to: fixturesDir.appendingPathComponent("bad_checksum.photoframepack"))
+    }
+
     private func makeSamplePNG(width: Int = 200, height: Int = 200) -> Data {
         let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
                             space: CGColorSpaceCreateDeviceRGB(),

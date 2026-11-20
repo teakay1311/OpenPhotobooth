@@ -19,8 +19,12 @@ public struct CaptureSessionRecord: Identifiable, Equatable, Codable, Sendable {
     public var countdownSeconds: Int
     public var intermissionSeconds: Int
 
+    public var awaitsFrame: Bool {
+        defaults.plannedCaptureCount != nil && defaults.selectedCaptureOrder == nil
+    }
+
     public var pendingSelectionCount: Int? {
-        guard defaults.selectedCaptureOrder == nil,
+        guard defaults.plannedCaptureCount == nil, defaults.selectedCaptureOrder == nil,
               let count = defaults.selectionCaptureCount,
               (1...ResourceLimits.maxCaptureIndices).contains(count) else { return nil }
         return count
@@ -29,6 +33,7 @@ public struct CaptureSessionRecord: Identifiable, Equatable, Codable, Sendable {
     public var captureCount: Int { pendingSelectionCount ?? requiredCaptureCount }
 
     public func captureIndices(in snapshot: FrameSnapshot) -> Set<Int> {
+        if awaitsFrame, let count = defaults.plannedCaptureCount { return Set(1...count) }
         if let count = pendingSelectionCount { return Set(1...count) }
         return snapshot.requiredIndices
     }
@@ -146,9 +151,9 @@ public struct SessionDetail: Equatable, Sendable {
     }
 
     /// Ảnh nguồn đang dùng theo capture index (chỉ những lượt đã chụp).
-    public func currentRevisions() -> [Int: PhotoRevision] {
+    public func currentRevisions(includeUnassigned: Bool = false) -> [Int: PhotoRevision] {
         var result: [Int: PhotoRevision] = [:]
-        let selected = session.defaults.selectedCaptureOrder.map(Set.init)
+        let selected = includeUnassigned ? nil : session.defaults.selectedCaptureOrder.map(Set.init)
         for shot in shots {
             if let selected, !selected.contains(shot.captureIndex) { continue }
             guard let revID = shot.currentPhotoRevisionID,
@@ -169,7 +174,7 @@ public struct SessionDetail: Equatable, Sendable {
     public var missingIndices: Set<Int> { session.captureIndices(in: snapshot).subtracting(availableIndicesForSnapshot) }
     public var missingCount: Int { missingIndices.count }
     public var needsPhotoSelection: Bool { session.pendingSelectionCount != nil && missingIndices.isEmpty }
-    public var hasEnoughPhotos: Bool { session.pendingSelectionCount == nil && missingIndices.isEmpty }
+    public var hasEnoughPhotos: Bool { !session.awaitsFrame && session.pendingSelectionCount == nil && missingIndices.isEmpty }
     public var nextPendingIndex: Int? { missingIndices.min() }
 }
 

@@ -1,4 +1,6 @@
 import Foundation
+import CoreGraphics
+import ImageIO
 
 /// TrashService (§12): soft-delete, restore, purge 30×24h. KHÔNG đụng Finder Trash,
 /// không đụng file xuất ngoài (I-07), không xóa preset built-in.
@@ -24,9 +26,10 @@ public final class TrashService: @unchecked Sendable {
 
     // MARK: - Root lock
 
-    private func withRootLock<T>(_ rootKey: String, _ body: () throws -> T) throws -> T {
+    private func withRootLock<T>(_ rootKey: String, parentToken: OperationCoordinator.OperationToken? = nil,
+                                 _ body: () throws -> T) throws -> T {
         // Đồng bộ với OperationCoordinator cho các thao tác phiên / tài nguyên (DATA-01)
-        let opToken = try coordinator.acquire(key: rootKey, reason: "TrashService: \(rootKey)")
+        let opToken = try coordinator.acquire(key: rootKey, reason: "TrashService: \(rootKey)", parentToken: parentToken)
         defer { opToken.release() }
 
         lock.lock()
@@ -55,12 +58,38 @@ public final class TrashService: @unchecked Sendable {
     // MARK: - Soft delete (§12.3)
 
     public func trashSession(sessionID: String) throws {
-        try withRootLock("session:\(sessionID)") {
+        try trashSession(sessionID: sessionID, snapshotID: nil, pending: nil, parentToken: nil)
+    }
+
+    struct PendingCapture {
+        let index: Int
+        let requestID: String
+        let sha256: String
+    }
+
+    func cancelCaptureSession(sessionID: String, snapshotID: String, pending: PendingCapture?,
+                              parentToken: OperationCoordinator.OperationToken?) throws {
+        try trashSession(sessionID: sessionID, snapshotID: snapshotID, pending: pending, parentToken: parentToken)
+    }
+
+    private func trashSession(sessionID: String, snapshotID: String?, pending: PendingCapture?,
+                              parentToken: OperationCoordinator.OperationToken?) throws {
+        try withRootLock("session:\(sessionID)", parentToken: parentToken) {
             guard let session = try db.query("SELECT * FROM sessions WHERE id=? AND status NOT IN ('trashed','purging')", [.text(sessionID)]).first,
                   let name = Self.sessionDisplayName(session),
                   try trashRepo.find(rootType: .session, rootID: sessionID) == nil else {
                 throw AppError.invalidState("Phiên không còn đủ điều kiện chuyển vào Thùng rác")
             }
+            // A previous cancellation may still own moved files even if the session row is active.
+            _ = try SessionRepository(db: db, layout: layout).activeSession(id: sessionID)
+            if let snapshotID {
+                guard session["active_frame_snapshot_id"].stringValue == snapshotID,
+                      ["draft", "in_progress", "paused", "reviewable"].contains(session["status"].stringValue),
+                      try !trashRepo.pendingIntents(opType: "trash").contains(where: { $0.rootID == sessionID }) else {
+                    throw AppError.invalidState("Phiên đã thay đổi hoặc cần phục hồi trước khi hủy")
+                }
+            }
+            let pendingSave = try pending.map { try resolvePendingCapture($0, sessionID: sessionID) }
             let busyPhoto = try db.query("""
                 SELECT id FROM trash_items WHERE root_type='photo' AND original_parent_id=?
                   AND status IN ('purging','restoring') LIMIT 1
@@ -73,10 +102,15 @@ public final class TrashService: @unchecked Sendable {
             let bytes = FileLayout.directorySize(paths.active)
             let now = Time.nowMs(clock)
             let itemID = IDFactory.new()
-            let journal = Journal(itemID: itemID, rootType: .session, previousStatus: nil)
+            let journal = Journal(itemID: itemID, rootType: .session, previousStatus: nil,
+                                  discardedCapture: pendingSave?.discarded,
+                                  captureCancellation: snapshotID == nil ? nil : true)
             let intent = try trashRepo.createIntent(opType: "trash", rootID: sessionID, payloadJSON: try journal.json())
             var moved = false
             do {
+                if let discarded = journal.discardedCapture {
+                    try moveDiscardedCapture(discarded, sessionID: sessionID, trashIntentID: intent.id, restoring: false)
+                }
                 if paths.inActive {
                     try FileManager.default.moveItem(at: paths.active, to: paths.trash)
                     moved = true
@@ -89,17 +123,138 @@ public final class TrashService: @unchecked Sendable {
                         VALUES(?, 'session', ?, ?, ?, ?, NULL, ?, 'trashed', NULL)
                         """, [.text(itemID), .text(sessionID), .text(name),
                               .int(now), .int(TrashPolicy.expiresAt(deletedAtMs: now)), .int(bytes)])
+                    if let saveIntentID = pendingSave?.intentID {
+                        try trashRepo.finishIntent(id: saveIntentID,
+                                                   status: journal.discardedCapture == nil ? .committed : .failed, tx: tx)
+                    }
                     try trashRepo.finishIntent(id: intent.id, status: .committed, tx: tx)
                 }
             } catch {
                 try recordRollback(intent, error: error) {
                     if moved { try FileManager.default.moveItem(at: paths.trash, to: paths.active) }
+                    if let discarded = journal.discardedCapture {
+                        try moveDiscardedCapture(discarded, sessionID: sessionID, trashIntentID: intent.id, restoring: true)
+                    }
                 }
                 throw error
+            }
+            if let discarded = journal.discardedCapture {
+                do {
+                    try clearDiscardedCapture(discarded, sessionID: sessionID, trashIntentID: intent.id)
+                } catch {
+                    Log.store.warning("Dọn ảnh đã bỏ còn chờ phục hồi: \(error.localizedDescription, privacy: .private)")
+                }
             }
             EventBus.shared.post(.trashChanged)
             EventBus.shared.post(.sessionChanged(sessionID: sessionID, revision: 0))
         }
+    }
+
+    private struct DiscardedCapture: Codable {
+        let originalPaths: [String]
+    }
+
+    private func resolvePendingCapture(_ pending: PendingCapture, sessionID: String) throws
+        -> (intentID: String?, discarded: DiscardedCapture?) {
+        let intent = try trashRepo.savePhotoIntent(sessionID: sessionID, requestID: pending.requestID)
+        let row = try db.query("""
+            SELECT s.session_id, s.capture_index, r.relative_path, r.sha256
+            FROM photo_revisions r JOIN session_shots s ON r.shot_id=s.id
+            WHERE r.capture_request_id=?
+            """, [.text(pending.requestID)]).first
+        if let row {
+            guard row["session_id"].stringValue == sessionID, row["capture_index"]?.intValue == pending.index,
+                  row["sha256"].stringValue == pending.sha256 else {
+                throw AppError.ioFailure("Không xác minh được bản ghi của ảnh đang lưu")
+            }
+            let url = try captureOriginalURL(row["relative_path"].stringValue, sessionID: sessionID)
+            guard let values = try fileValues(url), values.isRegularFile == true, values.isSymbolicLink != true,
+                  Hashing.sha256Hex(fileURL: url) == pending.sha256 else {
+                throw AppError.ioFailure("Không xác minh được tệp của ảnh đã ghi nhận")
+            }
+            return (intent?.id, nil)
+        }
+        guard let intent else { return (nil, nil) }
+        let saved = try JSONDecoder().decode(SafetySaveService.SavePhotoIntentPayload.self, from: Data(intent.payloadJSON.utf8))
+        guard saved.sessionID == sessionID, saved.captureIndex == pending.index,
+              saved.requestID == pending.requestID, saved.sha256 == pending.sha256,
+              saved.tempRelativePath == saved.intendedRelativePath + ".partial" else {
+            throw AppError.invalidState("Thông tin tệp đang lưu không khớp lượt chụp")
+        }
+        let paths = [saved.intendedRelativePath, saved.tempRelativePath]
+        for path in paths {
+            _ = try captureOriginalURL(path, sessionID: sessionID)
+            guard try db.scalarInt("SELECT COUNT(*) FROM photo_revisions WHERE relative_path=?", [.text(path)]) == 0 else {
+                throw AppError.invalidState("Tệp đã được liên kết với một ảnh đã lưu")
+            }
+        }
+        return (intent.id, DiscardedCapture(originalPaths: paths))
+    }
+
+    private func captureOriginalURL(_ path: String, sessionID: String) throws -> URL {
+        let prefix = "Sessions/\(sessionID)/Originals/"
+        guard path.hasPrefix(prefix) else { throw AppError.invalidState("Tệp ảnh không thuộc phiên") }
+        let name = path.dropFirst(prefix.count)
+        guard !name.isEmpty, !name.contains("/") else { throw AppError.invalidState("Tên tệp ảnh không hợp lệ") }
+        let url = try layout.absoluteURL(forRelativePath: path)
+        let expected = layout.rootURL.resolvingSymlinksInPath().appendingPathComponent(path)
+        guard url.resolvingSymlinksInPath().path == expected.path else {
+            throw AppError.invalidState("Đường dẫn tệp ảnh không an toàn")
+        }
+        return url
+    }
+
+    private static let captureStagingPrefix = "capture-discard-"
+
+    private func captureStagingURL(_ id: String) throws -> URL {
+        guard UUID(uuidString: id) != nil, try isSessionDirectory(layout.trashStagingDir) else {
+            throw AppError.invalidState("Vùng tạm của thao tác hủy không hợp lệ")
+        }
+        return layout.trashStagingDir.appendingPathComponent(Self.captureStagingPrefix + id, isDirectory: true)
+    }
+
+    private func moveDiscardedCapture(_ discarded: DiscardedCapture, sessionID: String,
+                                      trashIntentID: String, restoring: Bool) throws {
+        let fm = FileManager.default
+        let stage = try captureStagingURL(trashIntentID)
+        let hasStage = try isSessionDirectory(stage)
+        if restoring && !hasStage { return }
+        if !hasStage { try fm.createDirectory(at: stage, withIntermediateDirectories: false) }
+        for path in discarded.originalPaths {
+            let original = try captureOriginalURL(path, sessionID: sessionID)
+            let staged = stage.appendingPathComponent(original.lastPathComponent)
+            let from = restoring ? staged : original
+            let to = restoring ? original : staged
+            guard let values = try fileValues(from) else { continue }
+            guard values.isRegularFile == true, values.isSymbolicLink != true, try fileValues(to) == nil else {
+                throw AppError.invalidState("Xung đột khi di chuyển tệp của lượt chụp đang chờ")
+            }
+            try fm.moveItem(at: from, to: to)
+        }
+        if restoring { try removeEmptyCaptureStage(stage) }
+    }
+
+    private func clearDiscardedCapture(_ discarded: DiscardedCapture, sessionID: String, trashIntentID: String) throws {
+        let stage = try captureStagingURL(trashIntentID)
+        guard try isSessionDirectory(stage) else { return }
+        for path in discarded.originalPaths {
+            let original = try captureOriginalURL(path, sessionID: sessionID)
+            let staged = stage.appendingPathComponent(original.lastPathComponent)
+            guard let values = try fileValues(staged) else { continue }
+            guard values.isRegularFile == true, values.isSymbolicLink != true else {
+                throw AppError.invalidState("Tệp chờ dọn của lượt chụp không hợp lệ")
+            }
+            try FileManager.default.removeItem(at: staged)
+        }
+        try removeEmptyCaptureStage(stage)
+    }
+
+    private func removeEmptyCaptureStage(_ stage: URL) throws {
+        let fm = FileManager.default
+        guard try fm.contentsOfDirectory(atPath: stage.path).isEmpty else {
+            throw AppError.invalidState("Vùng tạm hủy ảnh còn tệp ngoài thao tác")
+        }
+        try fm.removeItem(at: stage)
     }
 
     private static func sessionDisplayName(_ row: SQLiteRow) -> String? {
@@ -111,14 +266,61 @@ public final class TrashService: @unchecked Sendable {
     }
 
     public func trashFrame(frameID: String) throws {
-        try withRootLock("frame:\(frameID)") {
-            guard let frame = try db.query("SELECT * FROM frames WHERE id=? AND lifecycle='active'", [.text(frameID)]).first else {
-                throw AppError.notFound("frame \(frameID)")
+        try trashFrame(frameID: frameID, confirmedName: nil)
+        EventBus.shared.post(.trashChanged)
+        EventBus.shared.post(.frameLibraryChanged(frameID: frameID))
+    }
+
+    struct FrameTarget: Identifiable, Equatable, Sendable {
+        let id: String
+        let name: String
+    }
+
+    struct FrameBatchResult: Sendable {
+        var moved: [String] = []
+        var failures: [String: String] = [:]
+    }
+
+    func activeFrameTargets(_ ids: [String]) throws -> [FrameTarget] {
+        try ids.compactMap { id in
+            try db.query("SELECT name FROM frames WHERE id=? AND lifecycle='active'", [.text(id)])
+                .first.map { FrameTarget(id: id, name: $0["name"].stringValue) }
+        }
+    }
+
+    func trashFrames(_ targets: [FrameTarget]) -> FrameBatchResult {
+        var result = FrameBatchResult()
+        var seen: Set<String> = []
+        for target in targets where seen.insert(target.id).inserted {
+            do {
+                try trashFrame(frameID: target.id, confirmedName: target.name)
+                result.moved.append(target.id)
+            } catch AppError.notFound {
+                result.failures[target.id] = "Khung đã rời thư viện"
+            } catch {
+                result.failures[target.id] = (error as? AppError)?.message ?? error.localizedDescription
             }
+        }
+        if !result.moved.isEmpty {
+            EventBus.shared.post(.trashChanged)
+            EventBus.shared.post(.frameLibraryChanged(frameID: nil))
+        }
+        return result
+    }
+
+    private func trashFrame(frameID: String, confirmedName: String?) throws {
+        try withRootLock("frame:\(frameID)") {
             let itemID = IDFactory.new()
             let journal = Journal(itemID: itemID, rootType: .frame, previousStatus: nil)
             let payload = try journal.json()
             try db.withTransaction { tx in
+                guard let frame = try tx.query("SELECT * FROM frames WHERE id=? AND lifecycle='active'",
+                                               [.text(frameID)]).first else {
+                    throw AppError.notFound("frame \(frameID)")
+                }
+                if let confirmedName, frame["name"].stringValue != confirmedName {
+                    throw AppError.invalidState("Tên khung đã thay đổi. Hãy xác nhận lại.")
+                }
                 let intent = try trashRepo.createIntent(opType: "trash", rootID: frameID, payloadJSON: payload, tx: tx)
                 try tx.run("UPDATE frames SET lifecycle='trashed', updated_at_ms=? WHERE id=?", [.int(Time.nowMs()), .text(frameID)])
                 let now = Time.nowMs(clock)
@@ -138,8 +340,6 @@ public final class TrashService: @unchecked Sendable {
                           .int(Int64(bytes))])
                 try trashRepo.finishIntent(id: intent.id, status: .committed, tx: tx)
             }
-            EventBus.shared.post(.trashChanged)
-            EventBus.shared.post(.frameLibraryChanged(frameID: frameID))
         }
     }
 
@@ -203,7 +403,7 @@ public final class TrashService: @unchecked Sendable {
 
     // MARK: - Restore (§12.4)
 
-    public enum ItemOperationResult: Equatable {
+    public enum ItemOperationResult: Equatable, Sendable {
         case processed
         case skipped(reason: String)
         case failed(reason: String)
@@ -410,28 +610,32 @@ public final class TrashService: @unchecked Sendable {
     private func purgeResult(_ item: TrashItem, onlyExpired: Bool) -> ItemOperationResult {
         do {
             return try withRootLock(try operationKey(for: item)) {
-                let fresh = try currentItem(item)
-                if onlyExpired, fresh.status != .trashed || fresh.expiresAtMs > Time.nowMs(clock) {
-                    return .skipped(reason: "Mục chưa đủ điều kiện tự động dọn")
-                }
-                let paths = try purgePaths(fresh, allowMissing: fresh.status == .purgeFailed)
-                var photoPath: String?
-                if fresh.rootType == .photo {
-                    let photo = try photoLocation(fresh)
-                    guard !photo.parentInTrash else {
-                        return .skipped(reason: "Tạm dừng dọn riêng ảnh con khi phiên cha đang ở trong Thùng rác")
-                    }
-                    try verifyPhotoFile(photo)
-                    photoPath = photo.relativePath
-                }
-                let intent = try begin(fresh, op: "purge", status: .purging, photoPath: photoPath)
-                return runPurge(fresh, intent: intent, paths: paths)
+                return try purgeLocked(item, onlyExpired: onlyExpired)
             }
         } catch AppError.invalidState(let reason) {
             return .skipped(reason: reason)
         } catch {
             return .skipped(reason: error.localizedDescription)
         }
+    }
+
+    private func purgeLocked(_ item: TrashItem, onlyExpired: Bool) throws -> ItemOperationResult {
+        let fresh = try currentItem(item)
+        if onlyExpired, fresh.status != .trashed || fresh.expiresAtMs > Time.nowMs(clock) {
+            return .skipped(reason: "Mục chưa đủ điều kiện tự động dọn")
+        }
+        let paths = try purgePaths(fresh, allowMissing: fresh.status == .purgeFailed)
+        var photoPath: String?
+        if fresh.rootType == .photo {
+            let photo = try photoLocation(fresh)
+            guard !photo.parentInTrash else {
+                return .skipped(reason: "Tạm dừng dọn riêng ảnh con khi phiên cha đang ở trong Thùng rác")
+            }
+            try verifyPhotoFile(photo)
+            photoPath = photo.relativePath
+        }
+        let intent = try begin(fresh, op: "purge", status: .purging, photoPath: photoPath)
+        return runPurge(fresh, intent: intent, paths: paths)
     }
 
     @discardableResult
@@ -579,6 +783,7 @@ public final class TrashService: @unchecked Sendable {
         let revisionIDs = try tx.query("SELECT id FROM frame_revisions WHERE frame_id=?", [.text(frameID)]).map { $0["id"].stringValue }
         try tx.run("DELETE FROM frames WHERE id=?", [.text(frameID)]) // cascade revisions + slots
         for revID in revisionIDs {
+            try tx.run("DELETE FROM app_state WHERE key=?", [.text("frame_layer_exif_\(revID)")])
             try tx.run("DELETE FROM asset_references WHERE owner_type='frame_revision' AND owner_id=?", [.text(revID)])
         }
     }
@@ -593,6 +798,8 @@ public final class TrashService: @unchecked Sendable {
         let rootType: TrashRootType
         let previousStatus: TrashStatus?
         var photoPath: String? = nil
+        var discardedCapture: DiscardedCapture? = nil
+        var captureCancellation: Bool? = nil
 
         func json() throws -> String {
             String(decoding: try JSONEncoder().encode(self), as: UTF8.self)
@@ -814,6 +1021,19 @@ public final class TrashService: @unchecked Sendable {
                 }
             }
         }
+        let stageDirectories = try FileManager.default.contentsOfDirectory(at: layout.trashStagingDir, includingPropertiesForKeys: nil)
+        for stage in stageDirectories where stage.lastPathComponent.hasPrefix(Self.captureStagingPrefix) {
+            let id = String(stage.lastPathComponent.dropFirst(Self.captureStagingPrefix.count))
+            do {
+                guard let intent = try trashRepo.getIntent(id: id), intent.opType == "trash",
+                      intent.status == .committed, let discarded = Self.decodeJournal(intent)?.discardedCapture else { continue }
+                try withRootLock("session:\(intent.rootID)") {
+                    try clearDiscardedCapture(discarded, sessionID: intent.rootID, trashIntentID: id)
+                }
+            } catch {
+                report.issues.append("Dọn tệp hủy ảnh \(id.prefix(8)): \(error.localizedDescription)")
+            }
+        }
         return report
     }
 
@@ -841,6 +1061,9 @@ public final class TrashService: @unchecked Sendable {
         try validateSessionFiles(id, at: paths.inTrash ? paths.trash : (paths.inActive ? paths.active : nil))
         if paths.inTrash {
             try FileManager.default.moveItem(at: paths.trash, to: paths.active)
+        }
+        if let discarded = Self.decodeJournal(intent)?.discardedCapture {
+            try moveDiscardedCapture(discarded, sessionID: id, trashIntentID: intent.id, restoring: true)
         }
         try trashRepo.updateIntent(id: intent.id, status: .failed, error: "Đã hoàn tác chuyển phiên vào Thùng rác")
     }
@@ -963,5 +1186,136 @@ public final class TrashService: @unchecked Sendable {
 
     public func estimateTrashBytes() -> Int64 {
         (try? trashRepo.totalBytes()) ?? 0
+    }
+}
+
+
+extension TrashService {
+    public struct PurgePlan: Equatable, Sendable {
+        public let requested: [TrashItem]
+        public let targets: [TrashItem]
+        public let includedChildren: [TrashItem]
+        public var affectedIDs: Set<String> { Set((targets + includedChildren).map(\.id)) }
+        public var estimatedBytes: Int64 { targets.reduce(0) { $0 + $1.estimatedBytes } }
+    }
+
+    /// A session owns its files and deleted-photo rows; never purge those children twice.
+    public func purgePlan(items: [TrashItem]) throws -> PurgePlan {
+        let all = try trashRepo.list()
+        let requested = items.sorted { $0.id < $1.id }
+        let parents = Set(requested.filter { $0.rootType == .session }.map(\.rootID))
+        let targets = requested.filter { !($0.rootType == .photo && parents.contains($0.originalParentID ?? "")) }
+        let children = all.filter { $0.rootType == .photo && parents.contains($0.originalParentID ?? "") }.sorted { $0.id < $1.id }
+        return PurgePlan(requested: requested, targets: targets, includedChildren: children)
+    }
+
+    public struct BatchPurgeResult: Sendable {
+        public var results: [String: ItemOperationResult] = [:]
+        public var scopeChanged = false
+    }
+
+    public func purgeConfirmed(_ plan: PurgePlan) -> BatchPurgeResult {
+        var report = BatchPurgeResult()
+        let childrenByParent = Dictionary(grouping: plan.includedChildren, by: { $0.originalParentID ?? "" })
+        for target in plan.targets {
+            do {
+                let result: ItemOperationResult = try withRootLock(try operationKey(for: target)) {
+                    let fresh = try currentItem(target)
+                    let expected = childrenByParent[target.rootID] ?? []
+                    let actual = target.rootType == .session
+                        ? try db.query("SELECT * FROM trash_items WHERE root_type='photo' AND original_parent_id=? ORDER BY id",
+                                       [.text(target.rootID)]).map(TrashRepository.item(from:))
+                        : []
+                    guard fresh == target, actual == expected else {
+                        report.scopeChanged = true
+                        return .skipped(reason: "Phạm vi đã thay đổi; cần xác nhận lại")
+                    }
+                    return try purgeLocked(fresh, onlyExpired: false)
+                }
+                report.results[target.id] = result
+                if result == .processed {
+                    for child in childrenByParent[target.rootID] ?? [] {
+                        report.results[child.id] = .processed
+                    }
+                }
+            } catch AppError.busy(let reason) {
+                report.results[target.id] = .skipped(reason: reason)
+            } catch {
+                report.scopeChanged = true
+                report.results[target.id] = .skipped(reason: (error as? AppError)?.message ?? error.localizedDescription)
+            }
+            if report.scopeChanged { break }
+        }
+        return report
+    }
+
+    struct PreviewPhoto: Identifiable, Equatable, Sendable {
+        let id: String
+        let label: String
+    }
+
+    private func previewPhotosLocked(_ item: TrashItem) throws -> [PreviewPhoto] {
+        if item.rootType == .photo { return [PreviewPhoto(id: item.rootID, label: item.displayName)] }
+        guard item.rootType == .session else { return [] }
+        return try db.query("""
+            SELECT r.id, sh.capture_index FROM photo_revisions r
+            JOIN session_shots sh ON sh.id=r.shot_id
+            WHERE sh.session_id=? AND r.state='available'
+              AND (r.id=sh.current_photo_revision_id OR EXISTS
+                (SELECT 1 FROM trash_items t WHERE t.root_type='photo' AND t.root_id=r.id))
+            ORDER BY sh.capture_index, r.id
+            """, [.text(item.rootID)]).map {
+                PreviewPhoto(id: $0["id"].stringValue, label: "Ảnh \($0["capture_index"]?.intValue ?? 0)")
+            }
+    }
+
+    func validatePreview(_ item: TrashItem) throws {
+        _ = try currentItem(item)
+    }
+
+    func previewPhotos(_ item: TrashItem) throws -> [PreviewPhoto] {
+        try withRootLock(try operationKey(for: item)) {
+            try previewPhotosLocked(currentItem(item))
+        }
+    }
+
+    /// Read verified bytes from the actual active/trash location. Never restore or write caches to disk.
+    func previewImage(_ item: TrashItem, photoID: String? = nil, maxPixel: Int) throws -> CGImage {
+        try withRootLock(try operationKey(for: item)) {
+            let fresh = try currentItem(item)
+            let limit = min(1600, max(1, maxPixel))
+            if fresh.rootType == .frame {
+                let snapshot = try FrameRepository(db: db, assets: assets, layout: layout).createSnapshot(frameID: fresh.rootID, persist: false)
+                guard snapshot.canvasWidth > 0, snapshot.canvasHeight > 0 else { throw AppError.frameUnconfigured }
+                var images: [String: CGImage] = [:]
+                for layer in [snapshot.background, snapshot.foreground].compactMap({ $0 }) {
+                    images[layer.assetID] = try assets.loadVerifiedImage(assetID: layer.assetID)
+                }
+                let scale = min(1, Double(limit) / Double(max(snapshot.canvasWidth, snapshot.canvasHeight)))
+                return try CompositeRenderer.render(model: CompositionModel(snapshot: snapshot, sources: [:],
+                    defaults: SessionDefaultsSnapshot(presetID: nil, presetName: nil, presetResolvedParameters: .neutral, presetIntensity: 0,
+                        color: .neutral, skinSmooth: 0, outputMirror: false), overrides: [:], placements: [:], cropModes: [:], assetImages: images,
+                    options: RenderOptions(targetWidth: max(1, Int(Double(snapshot.canvasWidth) * scale)),
+                        targetHeight: max(1, Int(Double(snapshot.canvasHeight) * scale)), transparentBackground: true)))
+            }
+            let photos = try previewPhotosLocked(fresh)
+            guard let photo = photos.first(where: { photoID == nil || $0.id == photoID }) else {
+                throw AppError.notFound("Ảnh xem trước trong Thùng rác")
+            }
+            let descriptor = TrashItem(rootType: .photo, rootID: photo.id, displayName: photo.label,
+                deletedAtMs: fresh.deletedAtMs, expiresAtMs: fresh.expiresAtMs,
+                originalParentID: fresh.rootType == .session ? fresh.rootID : fresh.originalParentID)
+            let location = try photoLocation(descriptor)
+            try verifyPhotoFile(location)
+            let data = try Data(contentsOf: location.url)
+            guard Hashing.sha256Hex(data) == location.sha256,
+                  let source = CGImageSourceCreateWithData(data as CFData, nil),
+                  let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceThumbnailMaxPixelSize: limit
+                  ] as CFDictionary) else { throw AppError.ioFailure("Không đọc được ảnh xem trước") }
+            return image
+        }
     }
 }

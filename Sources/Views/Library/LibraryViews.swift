@@ -39,7 +39,7 @@ public struct LibraryView: View {
                 }
             }
         }
-        .task { vm.startEventMonitoring() }
+        .task { await vm.startEventMonitoring().value }
         .onDisappear { vm.stopEventMonitoring() }
         .onChange(of: env.route) { r in
             if r == .library {
@@ -151,7 +151,7 @@ public struct LibraryView: View {
         Button("Đổi khung") {
             env.openReview(sessionID: card.id, source: .library, openFramePicker: true)
         }
-        let canShare = card.card.committedCount >= card.card.session.captureCount && card.card.session.pendingSelectionCount == nil
+        let canShare = card.card.committedCount >= card.card.session.captureCount && card.card.session.pendingSelectionCount == nil && !card.card.session.awaitsFrame
         Button("Chia sẻ") { shareSession(card) }
             .disabled(!canShare)
 
@@ -164,23 +164,7 @@ public struct LibraryView: View {
 
     private func shareSession(_ card: SessionCardModel) {
         Task {
-            guard let detail = try? env.sessions.getDetail(sessionID: card.id),
-                  detail.session.status != .trashed && detail.session.status != .purging else {
-                env.showToast("Phiên chụp không còn khả dụng", kind: .warning)
-                vm.reload()
-                return
-            }
-            guard !detail.needsPhotoSelection else {
-                env.showToast("Cần chọn ảnh vào khung", kind: .warning)
-                vm.reload()
-                return
-            }
-            guard detail.hasEnoughPhotos else {
-                env.showToast("Chưa đủ ảnh", kind: .warning)
-                vm.reload()
-                return
-            }
-            if let url = try? await env.shareService.prepareShareFile(detail: detail, filenameBase: card.frameName) {
+            if let url = await vm.prepareShareFile(for: card) {
                 shareItems = [url]
             }
         }
@@ -222,13 +206,17 @@ struct SessionCardView: View {
                     Spacer()
                     let c = card.card
                     if c.session.status != .completed {
-                        Text("Chưa hoàn thành")
+                        Text(c.session.awaitsFrame
+                             ? (c.committedCount == c.session.captureCount ? "Đã chụp đủ · Chưa chọn khung" : "Chụp dở")
+                             : "Chưa hoàn thành")
                             .font(.caption2)
                             .padding(.horizontal, 6).padding(.vertical, 2)
                             .background(.orange.opacity(0.15), in: Capsule())
                             .foregroundStyle(.orange)
                     }
-                    Text("\(c.committedCount)/\(c.session.captureCount)")
+                    Text(c.session.defaults.plannedCaptureCount != nil && !c.session.awaitsFrame
+                         ? "\(c.committedCount)/\(c.session.captureCount) dùng · \(c.totalCapturedCount) ảnh"
+                         : "\(c.committedCount)/\(c.session.captureCount)")
                         .font(.caption).monospacedDigit().foregroundStyle(.secondary)
                 }
             }
@@ -250,20 +238,23 @@ struct SessionCardView: View {
         }
     }
 
+    @ViewBuilder
     private var cardButtons: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 8) {
-                editButton
-                actionButton
-                Spacer()
-                moreMenu
+        if card.card.session.awaitsFrame && card.card.committedCount >= card.card.session.captureCount {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    editButton.fixedSize()
+                    actionButton.fixedSize()
+                    Spacer(minLength: 0)
+                    moreMenu.fixedSize()
+                }
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack { editButton.fixedSize(); Spacer(minLength: 0); moreMenu.fixedSize() }
+                    actionButton.fixedSize()
+                }
             }
-            HStack(spacing: 8) {
-                editButton
-                actionButton
-                Spacer()
-                moreMenu
-            }
+        } else {
+            HStack(spacing: 8) { editButton; actionButton; Spacer(); moreMenu }
         }
     }
 
@@ -283,11 +274,10 @@ struct SessionCardView: View {
             Button("Đổi khung") {
                 vm.env.openReview(sessionID: card.id, source: .library, openFramePicker: true)
             }
-            let canShare = card.card.committedCount >= card.card.session.captureCount && card.card.session.pendingSelectionCount == nil
+            let canShare = card.card.committedCount >= card.card.session.captureCount && card.card.session.pendingSelectionCount == nil && !card.card.session.awaitsFrame
             Button("Chia sẻ") {
                 Task {
-                    guard let detail = try? vm.env.sessions.getDetail(sessionID: card.id) else { return }
-                    if let url = try? await vm.env.shareService.prepareShareFile(detail: detail, filenameBase: card.frameName) {
+                    if let url = await vm.prepareShareFile(for: card) {
                         NSSharingServicePicker(items: [url]).show(relativeTo: .zero, of: NSApp.keyWindow?.contentView ?? NSView(), preferredEdge: .minY)
                     }
                 }
@@ -341,6 +331,15 @@ struct SessionCardView: View {
             .buttonStyle(.bordered)
             .controlSize(.small)
             .accessibilityLabel("Chụp tiếp")
+        } else if card.card.session.awaitsFrame {
+            Button {
+                vm.openSession(card.id)
+            } label: {
+                Label("Chọn khung", systemImage: "rectangle.3.offgrid")
+                    .font(.caption)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
         } else if pendingSelection {
             Button {
                 vm.selectPhotosForSession(card.id)
@@ -370,6 +369,8 @@ public struct TrashView: View {
     @ObservedObject var env: AppEnvironment
     @StateObject private var vm: TrashViewModel
     @State private var showPurgeConfirm = false
+    @State private var previewItem: TrashItem?
+    @State private var showBatchResults = false
 
     public init(env: AppEnvironment) {
         self.env = env
@@ -378,7 +379,7 @@ public struct TrashView: View {
 
     public var body: some View {
         VStack(spacing: 0) {
-            toolbar
+            toolbar.disabled(env.isManualPurging || vm.isPurging)
             if env.isManualPurging || vm.isPurging {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
@@ -389,6 +390,18 @@ public struct TrashView: View {
                 .padding(.vertical, 4)
                 .background(Color.secondary.opacity(0.1))
             }
+            HStack {
+                Button("Chọn tất cả đang hiển thị", action: vm.selectAllVisible)
+                    .disabled(vm.selectableIDs.isEmpty)
+                Button("Bỏ chọn", action: vm.clearSelection).disabled(vm.selection.isEmpty)
+                Text("Đã chọn \(vm.selection.count)/\(vm.items.count) mục").font(.caption)
+                Spacer()
+                if !vm.batchDetails.isEmpty {
+                    Button("Kết quả xóa") { showBatchResults = true }
+                }
+            }
+            .padding(.horizontal, 12).padding(.bottom, 8)
+            .disabled(env.isManualPurging || vm.isPurging)
             Divider()
             if vm.items.isEmpty {
                 if vm.totalRepoCount > 0 {
@@ -403,7 +416,7 @@ public struct TrashView: View {
             } else {
                 List(selection: $vm.selection) {
                     ForEach(vm.items) { item in
-                        TrashRowView(item: item, vm: vm, onRetryPurge: { retryItem in
+                        TrashRowView(item: item, vm: vm, onPreview: { previewItem = item }, onRetryPurge: { retryItem in
                             if let scope = vm.prepareSinglePurgeScope(item: retryItem) {
                                 vm.activePurgeScope = scope
                                 showPurgeConfirm = true
@@ -424,6 +437,7 @@ public struct TrashView: View {
                     }
                 }
                 .listStyle(.inset)
+                .disabled(env.isManualPurging || vm.isPurging)
             }
             Divider()
             footer
@@ -450,6 +464,19 @@ public struct TrashView: View {
                     env.showToast("Tự động dọn rác bị tạm dừng do đồng hồ hệ thống bất thường (E-TRS-04)", kind: .warning)
                 }
             }
+        }
+        .sheet(isPresented: $showBatchResults) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Kết quả xóa").font(.headline)
+                ScrollView { Text(vm.batchDetails).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
+                Button("Đóng") { showBatchResults = false }.keyboardShortcut(.cancelAction)
+            }.padding(20).frame(width: 560, height: 400)
+        }
+        .sheet(item: $previewItem) { item in
+            TrashPreviewSheet(item: item, env: env, onClose: { previewItem = nil })
+        }
+        .onChange(of: vm.items) { _, items in
+            if let previewItem, !items.contains(where: { $0.id == previewItem.id }) { self.previewItem = nil }
         }
         .confirmationDialog("Không thể khôi phục sau thao tác này",
                             isPresented: $showPurgeConfirm,
@@ -487,13 +514,15 @@ public struct TrashView: View {
 
     private func purgeMessage(for scope: TrashViewModel.PurgeConfirmationScope) -> String {
         let bytesText = FileLayout.formattedBytes(scope.estimatedBytes)
+        let children = scope.plan?.includedChildren.count ?? 0
+        let childNotice = children > 0 ? "\nBao gồm \(children) ảnh đã xóa nằm trong phiên được chọn; không tính dung lượng hai lần." : ""
         switch scope.kind {
         case .single:
-            return "Xóa vĩnh viễn '\(scope.displayName ?? "")' (\(bytesText))?\nKhông thể khôi phục sau thao tác này."
+            return "Xóa vĩnh viễn '\(scope.displayName ?? "")' (\(bytesText))?\(childNotice)\nKhông thể khôi phục sau thao tác này."
         case .selection:
-            return "Xóa vĩnh viễn \(scope.itemCount) mục đang chọn (\(bytesText))?\nKhông thể khôi phục sau thao tác này."
+            return "Xóa vĩnh viễn \(scope.itemCount) mục đang chọn (\(bytesText))?\(childNotice)\nKhông thể khôi phục sau thao tác này."
         case .all:
-            return "Dọn sạch toàn bộ \(scope.itemCount) mục trong Thùng rác (\(bytesText))?\nKhông thể khôi phục sau thao tác này."
+            return "Dọn sạch toàn bộ \(scope.itemCount) mục trong Thùng rác (\(bytesText))?\(childNotice)\nKhông thể khôi phục sau thao tác này."
         }
     }
 
@@ -583,12 +612,28 @@ public struct TrashView: View {
 struct TrashRowView: View {
     var item: TrashItem
     var vm: TrashViewModel
+    var onPreview: () -> Void = {}
     var onRetryPurge: ((TrashItem) -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: icon)
-                .frame(width: 28)
+            Toggle("Chọn \(item.displayName)", isOn: Binding(
+                get: { vm.selection.contains(item.id) },
+                set: { selected in
+                    if selected { vm.selection.insert(item.id) } else { vm.selection.remove(item.id) }
+                }))
+                .toggleStyle(.checkbox).labelsHidden()
+                .disabled(!(item.status == .trashed || item.status == .purgeFailed) || vm.env.isManualPurging || vm.isPurging)
+            if [.frame, .session, .photo].contains(item.rootType) {
+                Button(action: onPreview) {
+                    TrashPreviewImage(item: item, env: vm.env, maxPixel: 120)
+                        .frame(width: 60, height: 60)
+                }
+                .buttonStyle(.plain).help("Xem trước \(item.displayName)")
+                .accessibilityLabel("Xem trước \(item.displayName)")
+            } else {
+                Image(systemName: icon).frame(width: 60, height: 60)
+            }
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.displayName).lineLimit(1)
                 Text("\(item.rootType.label) · Đã xóa: \(deletedText) · \(FileLayout.formattedBytes(item.estimatedBytes))")
@@ -751,7 +796,8 @@ public struct SessionPhotosSheet: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Ảnh trong phiên").font(.headline)
                 if let detail {
-                    let frameName = detail.session.frameNameAtCapture ?? "Khung ảnh"
+                    let frameName = detail.session.awaitsFrame ? "Chưa chọn khung"
+                        : detail.session.defaults.appliedFrameName ?? detail.session.frameNameAtCapture ?? "Khung ảnh"
                     Text("\(frameName) · \(entries.count) ảnh hiện hành")
                         .font(.caption)
                         .foregroundStyle(.secondary)

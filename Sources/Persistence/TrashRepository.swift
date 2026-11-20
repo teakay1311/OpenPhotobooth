@@ -129,6 +129,17 @@ public final class TrashRepository: @unchecked Sendable {
         }
     }
 
+    func savePhotoIntent(sessionID: String, requestID: String) throws -> OperationIntentRecord? {
+        let row = try db.query("""
+            SELECT id FROM operation_intents
+            WHERE op_type='savePhoto' AND root_id=?
+              AND json_extract(CASE WHEN json_valid(payload_json) THEN payload_json ELSE '{}' END, '$.requestID')=?
+            ORDER BY created_at_ms LIMIT 1
+            """, [.text(sessionID), .text(requestID)]).first
+        guard let row else { return nil }
+        return try getIntent(id: row["id"].stringValue)
+    }
+
     public func getIntent(id: String) throws -> OperationIntentRecord? {
         let rows = try db.query("SELECT * FROM operation_intents WHERE id=?", [.text(id)])
         guard let r = rows.first else { return nil }

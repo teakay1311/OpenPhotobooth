@@ -12,7 +12,7 @@ public final class LibraryViewModel: ObservableObject {
     @Published public var sortNewest = true
     @Published public private(set) var loadingPreviews = false
 
-    public enum LibraryFilter: String, CaseIterable {
+    public enum LibraryFilter: String, CaseIterable, Sendable {
         case all = "Tất cả"
         case completed = "Đủ ảnh"
         case incomplete = "Chưa đủ ảnh"
@@ -22,73 +22,114 @@ public final class LibraryViewModel: ObservableObject {
 
     public init(env: AppEnvironment) { self.env = env }
 
-    public func reload() {
-        let raw = (try? env.sessions.listSessions()) ?? []
-        var filtered: [SessionRepository.SessionCard]
-        switch filter {
-        case .all:
-            filtered = raw
-        case .completed:
-            filtered = raw.filter { $0.committedCount >= $0.session.captureCount }
-        case .incomplete:
-            filtered = raw.filter { $0.committedCount < $0.session.captureCount }
-        }
-        if !searchText.isEmpty {
-            filtered = filtered.filter { card in
-                let frameName = frameName(for: card)
-                return frameName.localizedCaseInsensitiveContains(searchText) ||
-                       formatDate(card.session.createdAtMs).localizedCaseInsensitiveContains(searchText)
+    /// Both Library share entry points use the same fresh-data checks and error reporting.
+    func prepareShareFile(for card: SessionCardModel) async -> URL? {
+        do {
+            try Task.checkCancellation()
+            guard let detail = try env.sessions.getDetail(sessionID: card.id),
+                  detail.session.status != .trashed && detail.session.status != .purging else {
+                env.showToast("Phiên chụp không còn khả dụng", kind: .warning)
+                reload()
+                return nil
             }
-        }
-        filtered.sort { sortNewest ? $0.session.updatedAtMs > $1.session.updatedAtMs : $0.session.updatedAtMs < $1.session.updatedAtMs }
-        cards = filtered.map { card in
-            SessionCardModel(card: card, frameName: frameName(for: card),
-                             preview: env.thumbnails.cachedData(key: "session-\(card.id)-\(card.session.revisionNo)"),
-                             formattedDate: formatDate(card.session.createdAtMs))
+            guard !detail.session.awaitsFrame else {
+                env.showToast("Cần chọn khung ảnh", kind: .warning)
+                reload()
+                return nil
+            }
+            guard !detail.needsPhotoSelection else {
+                env.showToast("Cần chọn ảnh vào khung", kind: .warning)
+                reload()
+                return nil
+            }
+            guard detail.hasEnoughPhotos else {
+                env.showToast("Chưa đủ ảnh", kind: .warning)
+                reload()
+                return nil
+            }
+            let url = try await env.shareService.prepareShareFile(detail: detail, filenameBase: card.frameName)
+            try Task.checkCancellation()
+            return url
+        } catch is CancellationError {
+            return nil
+        } catch {
+            guard !Task.isCancelled else { return nil }
+            env.showToast("Không chuẩn bị được file chia sẻ: \((error as? AppError)?.message ?? error.localizedDescription)", kind: .warning)
+            return nil
         }
     }
 
-    private static let dateFormatter: DateFormatter = {
-        let df = DateFormatter()
-        df.dateStyle = .medium
-        df.timeStyle = .short
-        return df
-    }()
+    private var reloadTask: Task<Void, Never>?
+    private var reloadGeneration = 0
 
-    private var frameNameCache: [String: String] = [:]
+    @discardableResult
+    public func reload() -> Task<Void, Never> {
+        reloadTask?.cancel()
+        reloadGeneration += 1
+        let generation = reloadGeneration
+        let repository = env.sessions
+        let search = searchText
+        let filter = filter
+        let newest = sortNewest
+        let locale = Locale.current
+        let timeZone = TimeZone.current
+        let worker = Task.detached(priority: .userInitiated) { () throws -> [SessionCardModel] in
+            try Task.checkCancellation()
+            let raw = try repository.listSessions()
+            let dateFormatter = DateFormatter()
+            dateFormatter.locale = locale
+            dateFormatter.timeZone = timeZone
+            dateFormatter.dateStyle = .medium
+            dateFormatter.timeStyle = .short
+            var cards: [SessionCardModel] = []
+            for card in newest ? raw : Array(raw.reversed()) {
+                try Task.checkCancellation()
+                let complete = card.committedCount >= card.session.captureCount
+                if (filter == .completed && !complete) || (filter == .incomplete && complete) { continue }
+                let name = Self.frameName(for: card)
+                let date = dateFormatter.string(from: Time.date(ms: card.session.createdAtMs))
+                if !search.isEmpty &&
+                    name.range(of: search, options: .caseInsensitive, locale: locale) == nil &&
+                    date.range(of: search, options: .caseInsensitive, locale: locale) == nil { continue }
+                // The existing visible-card task loads cached previews by revision.
+                cards.append(SessionCardModel(card: card, frameName: name, preview: nil, formattedDate: date))
+            }
+            return cards
+        }
+        let task = Task { [weak self] in
+            do {
+                let cards = try await withTaskCancellationHandler { try await worker.value } onCancel: { worker.cancel() }
+                guard let self, !Task.isCancelled, self.reloadGeneration == generation else { return }
+                self.cards = cards
+            } catch {
+                guard let self, !Task.isCancelled, self.reloadGeneration == generation else { return }
+                self.env.showToast("Không thể tải thư viện: \((error as? AppError)?.message ?? error.localizedDescription)", kind: .warning)
+            }
+        }
+        reloadTask = task
+        return task
+    }
 
-    func frameName(for card: SessionRepository.SessionCard) -> String {
+    private nonisolated static func frameName(for card: SessionRepository.SessionCard) -> String {
+        if card.session.awaitsFrame { return "Chưa chọn khung" }
+        if let applied = card.session.defaults.appliedFrameName { return applied }
         if let atCapture = card.session.frameNameAtCapture, !atCapture.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return atCapture
         }
-        if let hit = frameNameCache[card.session.activeFrameSnapshotID] {
-            return hit
-        }
-        let name: String
-        if let snapshot = try? (env.db.query("SELECT source_frame_id FROM frame_snapshots WHERE id=?", [.text(card.session.activeFrameSnapshotID)]).first?["source_frame_id"].stringValue),
-           !snapshot.isEmpty,
-           let frame = try? env.frames.getFrame(id: snapshot) {
-            name = frame.name
-        } else {
-            name = "Không rõ tên khung lúc chụp"
-        }
-        frameNameCache[card.session.activeFrameSnapshotID] = name
-        return name
-    }
-
-    func formatDate(_ ms: Int64) -> String {
-        Self.dateFormatter.string(from: Time.date(ms: ms))
+        return card.sourceFrameName ?? "Không rõ tên khung lúc chụp"
     }
 
     // Monitoring & event sync (LIB-06)
     private var eventTask: Task<Void, Never>?
     private var scheduledReloadTask: Task<Void, Never>?
 
-    public func startEventMonitoring() {
+    @discardableResult
+    public func startEventMonitoring() -> Task<Void, Never> {
         stopEventMonitoring()
-        reload()
+        let stream = EventBus.shared.stream
+        let initialLoad = reload()
         eventTask = Task { [weak self] in
-            for await event in EventBus.shared.stream {
+            for await event in stream {
                 guard let self else { return }
                 switch event {
                 case .sessionChanged, .shotCommitted, .photoAdjusted, .frameSnapshotChanged:
@@ -98,9 +139,13 @@ public final class LibraryViewModel: ObservableObject {
                 }
             }
         }
+        return initialLoad
     }
 
     public func stopEventMonitoring() {
+        reloadGeneration += 1
+        reloadTask?.cancel()
+        reloadTask = nil
         eventTask?.cancel()
         eventTask = nil
         scheduledReloadTask?.cancel()
@@ -132,6 +177,10 @@ public final class LibraryViewModel: ObservableObject {
               detail.session.status != .trashed && detail.session.status != .purging else {
             env.showToast("Phiên chụp không còn khả dụng", kind: .warning)
             reload()
+            return
+        }
+        if detail.session.awaitsFrame {
+            env.openReview(sessionID: sessionID, source: .library)
             return
         }
         if requiresMissingPhotos {
@@ -179,6 +228,10 @@ public final class LibraryViewModel: ObservableObject {
             reload()
             return
         }
+        if detail.session.awaitsFrame {
+            env.openReview(sessionID: sessionID, source: .library)
+            return
+        }
         guard !detail.needsPhotoSelection else {
             env.showToast("Cần chọn ảnh vào khung trước", kind: .warning)
             reload()
@@ -198,7 +251,7 @@ public final class LibraryViewModel: ObservableObject {
     public func generatePreview(for card: SessionCardModel) async -> Data? {
         let sessionID = card.id
         let targetRevision = card.card.session.revisionNo
-        let cacheKey = "session-\(sessionID)-\(targetRevision)"
+        let cacheKey = "session-r\(CompositeRenderer.renderCacheVersion)-\(sessionID)-\(targetRevision)"
 
         if let cached = env.thumbnails.cachedData(key: cacheKey) {
             return cached
@@ -209,8 +262,9 @@ public final class LibraryViewModel: ObservableObject {
         guard let detail = try? env.sessions.getDetail(sessionID: sessionID) else { return nil }
         guard detail.session.revisionNo == targetRevision else { return nil }
 
-        if detail.hasEnoughPhotos {
-            guard let img = await env.renderBuilder.renderPreview(detail: detail, maxDimension: 420) else { return nil }
+        if detail.hasEnoughPhotos,
+           let img = await env.renderBuilder.renderPreview(detail: detail, maxDimension: 420,
+                                                           verifiedSources: detail.session.defaults.plannedCaptureCount != nil) {
             guard !Task.isCancelled else { return nil }
             guard activeRenderTokens[sessionID] == targetRevision else { return nil }
             guard let current = try? env.sessions.getSession(id: sessionID), current.revisionNo == targetRevision else { return nil }
@@ -220,7 +274,7 @@ public final class LibraryViewModel: ObservableObject {
             env.thumbnails.store(data: data, key: cacheKey)
             return data
         } else {
-            for entry in detail.currentRevisions().sorted(by: { $0.key < $1.key }) {
+            for entry in detail.currentRevisions(includeUnassigned: detail.session.defaults.plannedCaptureCount != nil).sorted(by: { $0.key < $1.key }) {
                 let rev = entry.value
                 if let cached = env.thumbnails.cachedData(key: "shot-\(rev.id)") {
                     return cached
@@ -442,13 +496,15 @@ public final class TrashViewModel: ObservableObject {
         public let itemCount: Int
         public let estimatedBytes: Int64
         public let displayName: String?
+        public let plan: TrashService.PurgePlan?
 
-        public init(kind: Kind, targetIDs: [String], itemCount: Int, estimatedBytes: Int64, displayName: String?) {
+        public init(kind: Kind, targetIDs: [String], itemCount: Int, estimatedBytes: Int64, displayName: String?, plan: TrashService.PurgePlan? = nil) {
             self.kind = kind
             self.targetIDs = targetIDs
             self.itemCount = itemCount
             self.estimatedBytes = estimatedBytes
             self.displayName = displayName
+            self.plan = plan
         }
     }
 
@@ -484,160 +540,95 @@ public final class TrashViewModel: ObservableObject {
 
     public func typeLabel(for item: TrashItem) -> String { item.rootType.label }
 
+    public var selectableIDs: Set<String> {
+        Set(items.filter { $0.status == .trashed || $0.status == .purgeFailed }.map(\.id))
+    }
+
+    public func selectAllVisible() { selection = selectableIDs }
+    public func clearSelection() { selection.removeAll() }
+    @Published public private(set) var batchDetails = ""
+
+    private func makeScope(kind: PurgeConfirmationScope.Kind, items: [TrashItem], name: String? = nil) -> PurgeConfirmationScope? {
+        let eligible = items.filter { $0.status == .trashed || $0.status == .purgeFailed }
+        guard !eligible.isEmpty, let plan = try? env.trashService.purgePlan(items: eligible) else { return nil }
+        return PurgeConfirmationScope(kind: kind, targetIDs: eligible.map(\.id), itemCount: plan.affectedIDs.count,
+            estimatedBytes: plan.estimatedBytes, displayName: name, plan: plan)
+    }
+
     public func prepareSinglePurgeScope(item: TrashItem) -> PurgeConfirmationScope? {
-        guard item.status == .trashed || item.status == .purgeFailed else { return nil }
-        return PurgeConfirmationScope(
-            kind: .single(item: item),
-            targetIDs: [item.id],
-            itemCount: 1,
-            estimatedBytes: item.estimatedBytes,
-            displayName: item.displayName
-        )
+        makeScope(kind: .single(item: item), items: [item], name: item.displayName)
     }
 
     public func prepareSelectionPurgeScope() -> PurgeConfirmationScope? {
-        let eligible = items.filter { selection.contains($0.id) && ($0.status == .trashed || $0.status == .purgeFailed) }
-        guard !eligible.isEmpty else { return nil }
-        let totalBytes = eligible.reduce(Int64(0)) { $0 + $1.estimatedBytes }
-        return PurgeConfirmationScope(
-            kind: .selection(items: eligible),
-            targetIDs: eligible.map(\.id),
-            itemCount: eligible.count,
-            estimatedBytes: totalBytes,
-            displayName: nil
-        )
+        let chosen = items.filter { selection.contains($0.id) }
+        return makeScope(kind: .selection(items: chosen), items: chosen)
     }
 
     public func prepareAllPurgeScope() -> PurgeConfirmationScope? {
-        let all = (try? env.trashRepo.list()) ?? []
-        let eligible = all.filter { $0.status == .trashed || $0.status == .purgeFailed }
-        guard !eligible.isEmpty else { return nil }
-        let totalBytes = eligible.reduce(Int64(0)) { $0 + $1.estimatedBytes }
-        return PurgeConfirmationScope(
-            kind: .all(items: eligible),
-            targetIDs: eligible.map(\.id),
-            itemCount: eligible.count,
-            estimatedBytes: totalBytes,
-            displayName: nil
-        )
+        guard let all = try? env.trashRepo.list() else { return nil }
+        return makeScope(kind: .all(items: all), items: all)
     }
 
     public func executePurge(scope: PurgeConfirmationScope) {
-        guard !env.isManualPurging && !isPurging else {
+        guard !env.isManualPurging, !isPurging, let taskID = env.beginManualPurge() else {
             env.showToast("Đang có tác vụ dọn khác đang chạy", kind: .warning)
             return
         }
-        guard let taskID = env.beginManualPurge() else {
-            env.showToast("Đang có tác vụ dọn khác đang chạy", kind: .warning)
-            return
-        }
-
-        // Đọc lại danh sách và kiểm tra scope shift trước khi thực thi (§3.2, T02)
-        let freshItems = (try? env.trashRepo.list()) ?? []
-        let validatedItems: [TrashItem]
-
+        let all = (try? env.trashRepo.list()) ?? []
+        let current: PurgeConfirmationScope?
         switch scope.kind {
-        case .single(let orig):
-            guard let fresh = freshItems.first(where: { $0.id == orig.id }) else {
-                env.endManualPurge(taskID: taskID)
-                activePurgeScope = nil
-                env.showToast("Mục đã thay đổi hoặc không còn trong Thùng rác", kind: .warning)
-                reload()
-                return
-            }
-            guard fresh.status == .trashed || fresh.status == .purgeFailed else {
-                env.endManualPurge(taskID: taskID)
-                activePurgeScope = nil
-                env.showToast("Mục đang trong thao tác khác", kind: .warning)
-                reload()
-                return
-            }
-            if fresh.estimatedBytes != orig.estimatedBytes {
-                env.endManualPurge(taskID: taskID)
-                activePurgeScope = PurgeConfirmationScope(
-                    kind: .single(item: fresh),
-                    targetIDs: [fresh.id],
-                    itemCount: 1,
-                    estimatedBytes: fresh.estimatedBytes,
-                    displayName: fresh.displayName
-                )
-                scopeChangedMessage = "Dung lượng mục đã thay đổi (\(FileLayout.formattedBytes(fresh.estimatedBytes)))."
-                showScopeChangedAlert = true
-                return
-            }
-            validatedItems = [fresh]
-
-        case .selection(let originalItems):
-            let freshSelected = freshItems.filter { item in
-                scope.targetIDs.contains(item.id) && (item.status == .trashed || item.status == .purgeFailed)
-            }
-            let freshBytes = freshSelected.reduce(Int64(0)) { $0 + $1.estimatedBytes }
-            let originalBytes = originalItems.reduce(Int64(0)) { $0 + $1.estimatedBytes }
-            if Set(freshSelected.map(\.id)) != Set(scope.targetIDs) || freshBytes != originalBytes {
-                env.endManualPurge(taskID: taskID)
-                if freshSelected.isEmpty {
-                    activePurgeScope = nil
-                    env.showToast("Các mục đã chọn không còn đủ điều kiện xóa", kind: .warning)
-                    reload()
-                    return
-                }
-                activePurgeScope = PurgeConfirmationScope(
-                    kind: .selection(items: freshSelected),
-                    targetIDs: freshSelected.map(\.id),
-                    itemCount: freshSelected.count,
-                    estimatedBytes: freshBytes,
-                    displayName: nil
-                )
-                scopeChangedMessage = "Danh sách mục hoặc dung lượng đã thay đổi (\(freshSelected.count) mục, \(FileLayout.formattedBytes(freshBytes)))."
-                showScopeChangedAlert = true
-                return
-            }
-            validatedItems = freshSelected
-
-        case .all(let originalItems):
-            let freshAll = freshItems.filter { $0.status == .trashed || $0.status == .purgeFailed }
-            let freshBytes = freshAll.reduce(Int64(0)) { $0 + $1.estimatedBytes }
-            let originalBytes = originalItems.reduce(Int64(0)) { $0 + $1.estimatedBytes }
-            if Set(freshAll.map(\.id)) != Set(scope.targetIDs) || freshBytes != originalBytes {
-                env.endManualPurge(taskID: taskID)
-                if freshAll.isEmpty {
-                    activePurgeScope = nil
-                    env.showToast("Thùng rác không còn mục nào đủ điều kiện xóa", kind: .info)
-                    reload()
-                    return
-                }
-                activePurgeScope = PurgeConfirmationScope(
-                    kind: .all(items: freshAll),
-                    targetIDs: freshAll.map(\.id),
-                    itemCount: freshAll.count,
-                    estimatedBytes: freshBytes,
-                    displayName: nil
-                )
-                scopeChangedMessage = "Toàn bộ kho đã thay đổi (\(freshAll.count) mục, \(FileLayout.formattedBytes(freshBytes)))."
-                showScopeChangedAlert = true
-                return
-            }
-            validatedItems = freshAll
+        case .single(let item):
+            current = all.first(where: { $0.id == item.id }).flatMap { prepareSinglePurgeScope(item: $0) }
+        case .selection:
+            let selected = all.filter { scope.targetIDs.contains($0.id) }
+            current = makeScope(kind: .selection(items: selected), items: selected)
+        case .all: current = prepareAllPurgeScope()
         }
-
+        guard let current, let plan = current.plan else {
+            env.endManualPurge(taskID: taskID)
+            activePurgeScope = nil
+            reload()
+            env.showToast("Mục không còn đủ điều kiện xóa", kind: .warning)
+            return
+        }
+        guard scope.plan == plan else {
+            env.endManualPurge(taskID: taskID)
+            activePurgeScope = current
+            scopeChangedMessage = "Phạm vi đã thay đổi: \(current.itemCount) mục, \(FileLayout.formattedBytes(current.estimatedBytes))."
+            showScopeChangedAlert = true
+            return
+        }
         activePurgeScope = nil
         isPurging = true
-        let trashService = env.trashService
-
-        Task.detached(priority: .utility) { [weak self, validatedItems] in
-            let report = trashService.purgeAll(items: validatedItems)
+        batchDetails = ""
+        let service = env.trashService
+        let environment = env
+        Task.detached(priority: .utility) { [weak self] in
+            let result = service.purgeConfirmed(plan)
             await MainActor.run {
+                environment.endManualPurge(taskID: taskID)
                 guard let self else { return }
-                self.env.endManualPurge(taskID: taskID)
                 self.isPurging = false
-                self.selection.subtract(validatedItems.map(\.id))
+                let processed = Set(result.results.compactMap { $0.value == .processed ? $0.key : nil })
+                self.selection.subtract(processed)
+                let names = Dictionary(uniqueKeysWithValues: (plan.targets + plan.includedChildren).map { ($0.id, $0.displayName) })
+                self.batchDetails = plan.affectedIDs.sorted().map { id in
+                    let label = names[id] ?? id
+                    guard let value = result.results[id] else { return "\(label): Chưa xử lý" }
+                    switch value {
+                    case .processed: return "\(label): Đã xóa"
+                    case .failed(let reason): return "\(label): Lỗi — \(reason)"
+                    case .skipped(let reason): return "\(label): Bỏ qua — \(reason)"
+                    }
+                }.joined(separator: "\n")
                 self.reload()
-                if report.failed > 0 {
-                    self.env.showToast("Xóa: \(report.success) thành công / \(report.failed) lỗi / \(report.skipped) bỏ qua", kind: .warning)
-                } else if report.skipped > 0 {
-                    self.env.showToast("Đã xóa \(report.success) mục (\(report.skipped) mục bỏ qua do đã thay đổi)")
-                } else {
-                    self.env.showToast("Đã xóa vĩnh viễn \(report.success) mục")
+                self.env.showToast("Đã xóa \(processed.count)/\(plan.affectedIDs.count) mục", kind: processed.count == plan.affectedIDs.count ? .success : .warning)
+                if result.scopeChanged {
+                    // Keep remaining items selected; never continue after a changed destructive scope.
+                    let remaining = (try? self.env.trashRepo.list())?.filter { scope.targetIDs.contains($0.id) } ?? []
+                    self.activePurgeScope = self.makeScope(kind: .selection(items: remaining), items: remaining)
+                    self.scopeChangedMessage = "Phạm vi đã thay đổi trong khi dọn. Các mục còn lại chưa được xóa."
+                    self.showScopeChangedAlert = self.activePurgeScope != nil
                 }
             }
         }
@@ -662,14 +653,15 @@ public final class TrashViewModel: ObservableObject {
         var ok = 0
         var skipped = 0
         var fail = 0
-        for item in validItems {
+        for item in validItems.sorted(by: { ($0.rootType == .session ? 0 : 1) < ($1.rootType == .session ? 0 : 1) }) {
             switch env.trashService.restoreResult(item) {
-            case .processed: ok += 1
+            case .processed:
+                ok += 1
+                selection.remove(item.id)
             case .skipped: skipped += 1
             case .failed: fail += 1
             }
         }
-        selection.removeAll()
         reload()
 
         let totalSkipped = skipped + expiredOrInvalidCount

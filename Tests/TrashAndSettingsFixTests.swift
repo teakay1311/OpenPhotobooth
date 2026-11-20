@@ -25,6 +25,39 @@ final class TrashAndSettingsFixTests: XCTestCase {
 
     // MARK: - Helper Methods
 
+    func testFrameBatchConfinesFilterAndReportsStaleTargets() throws {
+        let frames = try (0..<50).map {
+            try env.frames.createEmptyFrame(name: $0 < 5 ? "Visible \($0)" : "Hidden \($0)", categoryID: nil)
+        }
+        let vm = FramesViewModel(env: env)
+        vm.searchText = "Visible "
+        vm.reload()
+        vm.selection = Set(vm.frames.map(\.id))
+        let shown = vm.selectedTrashTargets
+        XCTAssertEqual(Set(shown.map(\.id)), Set(frames.prefix(5).map(\.id)))
+        let renamed = try XCTUnwrap(shown.first)
+        let removed = shown[1]
+        try env.frames.renameFrame(id: renamed.id, to: "Visible renamed")
+        try env.trashService.trashFrame(frameID: removed.id)
+        let current = try env.trashService.activeFrameTargets(shown.map(\.id))
+        XCTAssertEqual(current.first?.name, "Visible renamed")
+        XCTAssertFalse(current.contains { $0.id == removed.id })
+
+        let partial = env.trashService.trashFrames(shown + [shown[2]])
+        XCTAssertEqual(Set(partial.moved), Set(shown.dropFirst(2).map(\.id)))
+        XCTAssertEqual(Set(partial.failures.keys), [renamed.id, removed.id])
+        XCTAssertEqual(try env.frames.getFrame(id: renamed.id)?.lifecycle, .active)
+        let retry = try env.trashService.activeFrameTargets([renamed.id])
+        XCTAssertEqual(env.trashService.trashFrames(retry).moved, [renamed.id])
+        for (index, frame) in frames.enumerated() {
+            XCTAssertEqual(try env.frames.getFrame(id: frame.id)?.lifecycle, index < 5 ? .trashed : .active)
+        }
+        let item = try XCTUnwrap(env.trashRepo.find(rootType: .frame, rootID: renamed.id))
+        try env.trashService.restore(item)
+        XCTAssertEqual(try env.frames.getFrame(id: renamed.id)?.name, "Visible renamed")
+        XCTAssertEqual(try env.frames.getFrame(id: renamed.id)?.lifecycle, .active)
+    }
+
     private func createDummyImageData(color: CGColor = CGColor(red: 0.2, green: 0.6, blue: 0.8, alpha: 1.0)) -> Data {
         let width = 200
         let height = 200
@@ -627,5 +660,335 @@ final class TrashAndSettingsFixTests: XCTestCase {
         // 5. Verify completely removed
         XCTAssertFalse(FileManager.default.fileExists(atPath: dir.path))
         XCTAssertNil(try env.trashRepo.find(rootType: .session, rootID: sid))
+    }
+}
+
+extension TrashAndSettingsFixTests {
+    func testTrashPreviewReadsMovedBytesWithoutWritingAndRejectsForeignPhoto() async throws {
+        let (id, item) = try await seedSessionInTrash()
+        let photo = try storedPhoto(id)
+        let changes = try env.db.scalarInt("SELECT total_changes()")
+        let filesBefore = try FileManager.default.subpathsOfDirectory(atPath: env.layout.rootURL.path).sorted()
+        let entries = try env.trashService.previewPhotos(item)
+        XCTAssertEqual(entries.map(\.id), [photo.id])
+        let image = try env.trashService.previewImage(item, photoID: photo.id, maxPixel: 64)
+        XCTAssertEqual(image.width, 64)
+        XCTAssertEqual(image.height, 64)
+        XCTAssertThrowsError(try env.trashService.previewImage(item, photoID: UUID().uuidString, maxPixel: 64))
+        XCTAssertEqual(try env.db.scalarInt("SELECT total_changes()"), changes)
+        XCTAssertEqual(try FileManager.default.subpathsOfDirectory(atPath: env.layout.rootURL.path).sorted(), filesBefore)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: env.layout.sessionDir(id).path))
+        let file = env.layout.trashSessionsDir.appendingPathComponent(id).appendingPathComponent("Originals")
+            .appendingPathComponent(URL(fileURLWithPath: photo.relativePath).lastPathComponent)
+        try Data([0, 1, 2]).write(to: file)
+        XCTAssertThrowsError(try env.trashService.previewImage(item, maxPixel: 64))
+    }
+
+    func testTrashFramePreviewDoesNotPersistSnapshotAndCacheRejectsRestoredItem() async throws {
+        let frame = try XCTUnwrap(env.frames.listReadyFrames().first)
+        try env.trashService.trashFrame(frameID: frame.id)
+        let item = try XCTUnwrap(env.trashRepo.find(rootType: .frame, rootID: frame.id))
+        let changes = try env.db.scalarInt("SELECT total_changes()")
+        let image = try await env.trashPreviews.image(item: item, maxPixel: 120)
+        XCTAssertLessThanOrEqual(max(image.width, image.height), 120)
+        XCTAssertEqual(try env.db.scalarInt("SELECT total_changes()"), changes)
+        try env.trashService.restore(item)
+        do {
+            _ = try await env.trashPreviews.image(item: item, maxPixel: 120)
+            XCTFail("A restored item must not be served from the Trash preview cache")
+        } catch { }
+    }
+
+    private func parentWithDeletedPhoto() async throws -> (TrashItem, TrashItem) {
+        let (id, parent) = try await seedSessionInTrash()
+        let photo = try storedPhoto(id)
+        try env.trashService.restore(parent)
+        let child = try XCTUnwrap(env.sessions.trashPhotos(sessionID: id, pairs: [(photo.shotID, photo.id)]).first)
+        try env.trashService.trashSession(sessionID: id)
+        return (try XCTUnwrap(env.trashRepo.find(rootType: .session, rootID: id)), child)
+    }
+
+    func testTrashBatchNormalizesParentChildrenAndConfirmsImplicitDeletion() async throws {
+        let (parent, child) = try await parentWithDeletedPhoto()
+        let plan = try env.trashService.purgePlan(items: [parent, child])
+        XCTAssertEqual(plan.targets.map(\.id), [parent.id])
+        XCTAssertEqual(plan.includedChildren.map(\.id), [child.id])
+        XCTAssertEqual(plan.estimatedBytes, parent.estimatedBytes)
+        let onlyParent = try env.trashService.purgePlan(items: [parent])
+        XCTAssertEqual(onlyParent.affectedIDs, [parent.id, child.id])
+        XCTAssertEqual(try env.trashService.previewPhotos(parent).map(\.id), [child.rootID])
+        XCTAssertNoThrow(try env.trashService.previewImage(child, maxPixel: 80))
+        let result = env.trashService.purgeConfirmed(plan)
+        XCTAssertEqual(result.results[parent.id], .processed)
+        XCTAssertEqual(result.results[child.id], .processed)
+        XCTAssertNil(try env.sessions.getSession(id: parent.rootID))
+        XCTAssertNil(try env.trashRepo.getItem(id: child.id))
+    }
+
+    func testTrashBatchStopsWhenChildScopeChangesAndKeepsFiles() async throws {
+        let (parent, child) = try await parentWithDeletedPhoto()
+        let plan = try env.trashService.purgePlan(items: [parent])
+        try env.db.run("UPDATE trash_items SET display_name=? WHERE id=?", [.text("Changed child"), .text(child.id)])
+        let result = env.trashService.purgeConfirmed(plan)
+        XCTAssertTrue(result.scopeChanged)
+        XCTAssertNotNil(try env.trashRepo.getItem(id: parent.id))
+        XCTAssertNotNil(try env.trashRepo.getItem(id: child.id))
+        XCTAssertNoThrow(try env.trashService.previewImage(parent, maxPixel: 80))
+    }
+
+    func testTrashSelectAllConfinedToVisibleAndPartialFailureRetainsSelection() async throws {
+        let (_, one) = try await seedSessionInTrash(nameSuffix: "visible")
+        let (_, two) = try await seedSessionInTrash(nameSuffix: "hidden")
+        try env.db.run("UPDATE trash_items SET display_name=? WHERE id=?", [.text("visible"), .text(one.id)])
+        let vm = TrashViewModel(env: env)
+        vm.searchText = "visible"
+        vm.reload()
+        vm.selectAllVisible()
+        XCTAssertEqual(vm.selection, [one.id])
+        vm.searchText = ""
+        vm.reload()
+        vm.selectAllVisible()
+        XCTAssertEqual(vm.selection, [one.id, two.id])
+        let scope = try XCTUnwrap(vm.prepareSelectionPurgeScope())
+        let lock = try env.coordinator.acquire(key: "session:\(two.rootID)", reason: "QA contention")
+        vm.executePurge(scope: scope)
+        let deadline = ContinuousClock.now + .seconds(3)
+        while vm.isPurging && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        lock.release()
+        XCTAssertFalse(vm.isPurging)
+        XCTAssertFalse(env.isManualPurging)
+        XCTAssertEqual(vm.selection, [two.id])
+        XCTAssertNil(try env.trashRepo.getItem(id: one.id))
+        XCTAssertNotNil(try env.trashRepo.getItem(id: two.id))
+        XCTAssertTrue(vm.batchDetails.contains("Bỏ qua"))
+        vm.clearSelection()
+        XCTAssertTrue(vm.selection.isEmpty)
+    }
+}
+
+extension TrashAndSettingsFixTests {
+    func testTrashPreviewCoalescesWaitersWithoutCancellingAnotherViewer() async throws {
+        let frame = try XCTUnwrap(env.frames.listReadyFrames().first)
+        try env.trashService.trashFrame(frameID: frame.id)
+        let item = try XCTUnwrap(env.trashRepo.find(rootType: .frame, rootID: frame.id))
+        let service = env.trashPreviews
+        let lock = try env.coordinator.acquire(key: "frame:\(frame.id)", reason: "QA preview contention")
+        let first = Task { try await service.image(item: item, maxPixel: 120) }
+        let second = Task { try await service.image(item: item, maxPixel: 120) }
+        try await Task.sleep(for: .milliseconds(20))
+        first.cancel()
+        try await Task.sleep(for: .milliseconds(100))
+        lock.release()
+        let image = try await second.value
+        XCTAssertLessThanOrEqual(max(image.width, image.height), 120)
+        do { _ = try await first.value; XCTFail("A cancelled viewer must not publish an image") } catch { }
+        XCTAssertNotNil(try env.trashRepo.getItem(id: item.id))
+    }
+}
+
+extension TrashAndSettingsFixTests {
+    func testTrashBatchReleasesAppLockAfterViewModelIsDismissed() async throws {
+        let (_, item) = try await seedSessionInTrash()
+        var vm: TrashViewModel? = TrashViewModel(env: env)
+        vm!.reload()
+        let scope = try XCTUnwrap(vm!.prepareSinglePurgeScope(item: item))
+        weak var dismissed = vm
+        vm!.executePurge(scope: scope)
+        vm = nil
+        XCTAssertNil(dismissed)
+        let deadline = ContinuousClock.now + .seconds(3)
+        while env.isManualPurging && ContinuousClock.now < deadline { try await Task.sleep(for: .milliseconds(10)) }
+        XCTAssertFalse(env.isManualPurging)
+        XCTAssertNil(try env.trashRepo.getItem(id: item.id))
+    }
+}
+
+private final class PhotoListAttemptProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var reads = 0
+    private var delays: [UInt64] = []
+    func nextRead() -> Int { lock.lock(); defer { lock.unlock() }; reads += 1; return reads }
+    func recordWait(_ delay: UInt64) { lock.lock(); defer { lock.unlock() }; delays.append(delay) }
+    var readCount: Int { lock.lock(); defer { lock.unlock() }; return reads }
+    var waits: [UInt64] { lock.lock(); defer { lock.unlock() }; return delays }
+}
+
+extension TrashAndSettingsFixTests {
+    func testPhotoListRetriesOnlyBusyAndPreservesResult() async throws {
+        let probe = PhotoListAttemptProbe()
+        let expected = [TrashService.PreviewPhoto(id: "photo-1", label: "Ảnh 1")]
+        let actual = try await TrashPreviewLoader.readPhotoListWithRetry(read: {
+            if probe.nextRead() == 1 { throw AppError.busy("Temporary read") }
+            return expected
+        }, wait: { probe.recordWait($0) })
+        XCTAssertEqual(actual, expected)
+        XCTAssertEqual(probe.readCount, 2)
+        XCTAssertEqual(probe.waits, [100_000_000])
+    }
+
+    func testPhotoListBusyBudgetIsFourReadsAndSevenHundredMilliseconds() async throws {
+        let probe = PhotoListAttemptProbe()
+        do {
+            _ = try await TrashPreviewLoader.readPhotoListWithRetry(read: {
+                throw AppError.busy("busy-\(probe.nextRead())")
+            }, wait: { probe.recordWait($0) })
+            XCTFail("A permanently busy list must return its final error")
+        } catch { XCTAssertEqual(error as? AppError, .busy("busy-4")) }
+        XCTAssertEqual(probe.readCount, 4)
+        XCTAssertEqual(probe.waits, [100_000_000, 200_000_000, 400_000_000])
+        XCTAssertEqual(probe.waits.reduce(0, +), 700_000_000)
+    }
+
+    func testPhotoListDoesNotRetryNonBusyErrors() async throws {
+        for expected in [AppError.notFound("gone"), .invalidState("restored"), .ioFailure("database") ] {
+            let probe = PhotoListAttemptProbe()
+            do {
+                _ = try await TrashPreviewLoader.readPhotoListWithRetry(read: {
+                    _ = probe.nextRead()
+                    throw expected
+                }, wait: { probe.recordWait($0) })
+                XCTFail("Required errors must not become an empty success")
+            } catch { XCTAssertEqual(error as? AppError, expected) }
+            XCTAssertEqual(probe.readCount, 1)
+            XCTAssertTrue(probe.waits.isEmpty)
+        }
+    }
+
+    func testPhotoListCancellationBeforeFirstRead() async throws {
+        let probe = PhotoListAttemptProbe()
+        let task = Task {
+            try await TrashPreviewLoader.readPhotoListWithRetry(read: {
+                _ = probe.nextRead()
+                return []
+            }, wait: { probe.recordWait($0) })
+        }
+        task.cancel()
+        do { _ = try await task.value; XCTFail("Cancelled task must not return a list") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertEqual(probe.readCount, 0)
+        XCTAssertTrue(probe.waits.isEmpty)
+    }
+
+    func testPhotoListCancellationDuringBackoffStopsFurtherReads() async throws {
+        let probe = PhotoListAttemptProbe()
+        let waiting = expectation(description: "First busy backoff entered")
+        let task = Task {
+            try await TrashPreviewLoader.readPhotoListWithRetry(read: {
+                _ = probe.nextRead()
+                throw AppError.busy("temporary")
+            }, wait: { delay in
+                probe.recordWait(delay)
+                waiting.fulfill()
+                try await Task.sleep(nanoseconds: 10_000_000_000)
+            })
+        }
+        defer { task.cancel() }
+        await fulfillment(of: [waiting], timeout: 3)
+        task.cancel()
+        do { _ = try await task.value; XCTFail("Backoff cancellation must stop retries") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        XCTAssertEqual(probe.readCount, 1)
+        XCTAssertEqual(probe.waits, [100_000_000])
+    }
+
+    func testPhotoListCancellationDuringReadAndBeforePublication() async throws {
+        for afterRead in [false, true] {
+            let (id, item) = try await seedSessionInTrash()
+            let service = env.trashService
+            let probe = PhotoListAttemptProbe()
+            let reached = expectation(description: afterRead ? "Read finished before publication" : "Read started")
+            let gate = DispatchSemaphore(value: 0)
+            let task = Task {
+                try await TrashPreviewLoader.readPhotoListWithRetry(read: {
+                    _ = probe.nextRead()
+                    if afterRead {
+                        let result = try service.previewPhotos(item)
+                        reached.fulfill()
+                        _ = gate.wait(timeout: .now() + 3)
+                        return result
+                    }
+                    reached.fulfill()
+                    _ = gate.wait(timeout: .now() + 3)
+                    return try service.previewPhotos(item)
+                }, wait: { probe.recordWait($0) })
+            }
+            await fulfillment(of: [reached], timeout: 3)
+            task.cancel()
+            gate.signal()
+            do { _ = try await task.value; XCTFail("A late list must not be published") }
+            catch { XCTAssertTrue(error is CancellationError) }
+            XCTAssertEqual(probe.readCount, 1)
+            XCTAssertTrue(probe.waits.isEmpty)
+            XCTAssertFalse(env.coordinator.isSessionBusy(id).busy)
+            XCTAssertNotNil(try env.trashRepo.getItem(id: item.id))
+        }
+    }
+
+    private func previewDatabaseManifest() throws -> [String: [SQLiteRow]] {
+        var result: [String: [SQLiteRow]] = [:]
+        for table in ["sessions", "session_shots", "photo_revisions", "photo_adjustments", "frames",
+                      "frame_revisions", "frame_snapshots", "asset_references", "trash_items", "assets"] {
+            result[table] = try env.db.query("SELECT * FROM \(table) ORDER BY rowid")
+        }
+        return result
+    }
+
+    private func previewFileManifest() throws -> [String: String] {
+        var result: [String: String] = [:]
+        for path in try FileManager.default.subpathsOfDirectory(atPath: env.layout.rootURL.path) {
+            let url = env.layout.rootURL.appendingPathComponent(path)
+            if try url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true {
+                result[path] = Hashing.sha256Hex(try Data(contentsOf: url))
+            }
+        }
+        return result
+    }
+
+    func testPhotoListRetryAndRepeatedPreviewPreserveDataAndFileHashes() async throws {
+        let (parent, child) = try await parentWithDeletedPhoto()
+        let database = try previewDatabaseManifest()
+        let files = try previewFileManifest()
+        let changes = try env.db.scalarInt("SELECT total_changes()")
+        let expected = try env.trashService.previewPhotos(parent)
+        let probe = PhotoListAttemptProbe()
+        let service = env.trashService
+        let retried = try await TrashPreviewLoader.readPhotoListWithRetry(read: {
+            if probe.nextRead() == 1 { throw AppError.busy("temporary") }
+            return try service.previewPhotos(parent)
+        }, wait: { probe.recordWait($0) })
+        XCTAssertEqual(retried, expected)
+        XCTAssertEqual(retried.map(\.id), [child.rootID])
+        for _ in 0..<2 {
+            let actual = try await env.trashPreviews.photos(item: parent)
+            XCTAssertEqual(actual, expected)
+            _ = try await env.trashPreviews.image(item: parent, maxPixel: 120)
+        }
+        XCTAssertEqual(try previewDatabaseManifest(), database)
+        XCTAssertEqual(try previewFileManifest(), files)
+        XCTAssertEqual(try env.db.scalarInt("SELECT total_changes()"), changes)
+        XCTAssertTrue(try env.db.foreignKeyCheck().isEmpty)
+    }
+
+    func testPhotoListRetryRevalidatesRestoredAndPurgedItems() async throws {
+        for purge in [false, true] {
+            let (_, item) = try await seedSessionInTrash()
+            let service = env.trashService
+            let probe = PhotoListAttemptProbe()
+            do {
+                _ = try await TrashPreviewLoader.readPhotoListWithRetry(read: {
+                    if probe.nextRead() == 1 { throw AppError.busy("temporary") }
+                    return try service.previewPhotos(item)
+                }, wait: { _ in
+                    if purge { XCTAssertEqual(service.purgeResult(item), .processed) }
+                    else { try service.restore(item) }
+                })
+                XCTFail("A restored or purged Trash ID must not return stale photos")
+            } catch {
+                XCTAssertNotNil(error as? AppError)
+                XCTAssertFalse(error is CancellationError)
+            }
+            XCTAssertEqual(probe.readCount, 2)
+            XCTAssertNil(try env.trashRepo.getItem(id: item.id))
+        }
     }
 }
