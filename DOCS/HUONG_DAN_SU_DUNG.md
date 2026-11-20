@@ -15,9 +15,9 @@ Open Photobooth là ứng dụng Photobooth bản địa (native) dành riêng c
 ## 2. Các màn hình và luồng chức năng chính
 
 ### 2.1. Màn hình Chụp ảnh (Capture)
-1. **Chọn khung ảnh** trong dải **Khung ảnh**. Ứng dụng có 9 khung dựng sẵn gồm *Dải 3 ảnh*, *Lưới 4 ảnh*, *Một ảnh lớn*, *Cặp ảnh dọc*, *Cặp ảnh ngang*, *Collage 5 ảnh*, *Lưới 6 ảnh*, *Lưới 8 ảnh* và *Lưới 9 ảnh*.
+1. Chọn **Số ảnh của phiên** ở đầu màn Chụp ảnh. Phiên mới dùng luồng **chụp trước, chọn khung sau**: chụp đủ ảnh, bấm **Chọn khung**, chọn ảnh vào các ô và bấm **Dùng khung này**. Ứng dụng có 9 khung dựng sẵn gồm *Dải 3 ảnh*, *Lưới 4 ảnh*, *Một ảnh lớn*, *Cặp ảnh dọc*, *Cặp ảnh ngang*, *Collage 5 ảnh*, *Lưới 6 ảnh*, *Lưới 8 ảnh* và *Lưới 9 ảnh*.
 2. **Cài đặt nhanh** nằm ở cột bên màn Chụp ảnh. Chọn **Tự động** hoặc **Thủ công**, đặt đếm ngược 0, 3, 5, 10 giây hoặc tùy chỉnh từ 1 đến 30 giây, và đặt thời gian nghỉ giữa lượt từ 0 đến 15 giây.
-3. Bật **Chụp thêm để chọn ảnh** nếu muốn chụp nhiều hơn số ô của khung. Khi xem lại, bấm chọn ảnh theo thứ tự muốn đưa vào các ô và bấm lại để bỏ chọn.
+3. Nếu chụp nhiều ảnh hơn số ô của khung, chọn các ảnh theo thứ tự muốn đưa vào các ô và bấm lại để bỏ chọn. Các phiên cũ đã gắn khung vẫn có thể tiếp tục theo cấu hình được lưu của phiên đó.
 4. Chọn **Preset màu**, **Lật ngang ảnh thành phẩm** và **Âm thanh** ở cùng cột. Các thông số chụp và hướng ảnh thành phẩm được chốt khi bắt đầu phiên. Lật ảnh xem trước được chỉnh riêng trong Cài đặt camera.
 5. Bấm **Chụp** hoặc phím `Space` để bắt đầu. Dùng `Esc` để hủy đếm ngược. Nếu ảnh đã lưu, ứng dụng giữ ảnh để tiếp tục hoặc xem lại.
 
