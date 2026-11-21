@@ -321,9 +321,11 @@ struct CapturePane: View {
                 Stepper("\(interval)s", value: $interval, in: 0...15)
                     .onChange(of: interval) { env.settings.interval = $0 }
             }
-            SettingsRow(label: "Live Frame Preview",
-                        description: "Xem trước trong khung khi chụp (giảm chất lượng để đạt FPS §8.1)") {
-                Toggle("", isOn: $liveFramePreview).onChange(of: liveFramePreview) { env.settings.liveFramePreview = $0 }
+            SettingsRow(label: "Mặc định xem trước trong khung",
+                        description: "Áp dụng trên màn Chụp khi phiên đã có khung, chẳng hạn khi chụp lại. Phiên mới xem trước camera và chọn khung sau khi chụp.") {
+                Toggle("", isOn: $liveFramePreview)
+                    .accessibilityLabel("Mặc định xem trước trong khung")
+                    .onChange(of: liveFramePreview) { env.settings.liveFramePreview = $0 }
             }
             Divider()
             Button("Khôi phục mặc định nhóm này") {

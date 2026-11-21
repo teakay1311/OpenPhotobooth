@@ -783,7 +783,7 @@
 				CODE_SIGN_ENTITLEMENTS = Resources/OpenPhotobooth.entitlements;
 				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 4;
 				DEAD_CODE_STRIPPING = YES;
 				ENABLE_TESTABILITY = YES;
 				INFOPLIST_FILE = Resources/Info.plist;
@@ -791,7 +791,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.2.2;
+				MARKETING_VERSION = 1.2.3;
 				PRODUCT_BUNDLE_IDENTIFIER = vn.openphotobooth.app;
 				PRODUCT_MODULE_NAME = OpenPhotobooth;
 				PRODUCT_NAME = "Open Photobooth";
@@ -893,7 +893,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = Resources/OpenPhotobooth.entitlements;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 4;
 				DEAD_CODE_STRIPPING = YES;
 				ENABLE_TESTABILITY = YES;
 				INFOPLIST_FILE = Resources/Info.plist;
@@ -901,7 +901,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.2.2;
+				MARKETING_VERSION = 1.2.3;
 				PRODUCT_BUNDLE_IDENTIFIER = vn.openphotobooth.app;
 				PRODUCT_MODULE_NAME = OpenPhotobooth;
 				PRODUCT_NAME = "Open Photobooth";
